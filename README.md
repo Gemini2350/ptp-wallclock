@@ -19,6 +19,8 @@ You can Download my Raspberry Pi Image and just Flash the ISO with Rufus<br>
 Install the Demos and Display from here: 
 https://github.com/hzeller/rpi-rgb-led-matrix
 Download my Code (compiled or uncompiled) <br>
-Compile it with "g++ -O2 -std=c++17 ptp-clock.cpp -o ptp-clock     -I./include -I./bindings -L./lib -lrgbmatrix -lpthread
+Compile it with "g++ -O2 -std=c++17 ptp-clock.cpp -o ptp-clock     -I./include -I./bindings -L./lib -lrgbmatrix -lpthread" <br>
+I havent found a better way that the Script can access ports below 1024, in order to do this you need to add "sudo sysctl -w net.ipv4.ip_unprivileged_port_start=319"
+
 
 
