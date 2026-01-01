@@ -1,5 +1,5 @@
 # ptp-wallclock
-<p align="center"> <img src="./clock.png" alt="High-precision LED wall clock showing 19:05:37.23269755" width="800"/> </p>
+<p align="center"> <img src="./clock2.png" alt="High-precision LED wall clock showing 19:05:37.23269755" width="800"/> </p>
 This is a simple PTP 1588 Wallclock for Raspberry Pi with a LED Display.
 I've used it to demonstrate that PTP is really distributing the Time at my Speech at Chaos Computer Club.
 A lot of people asked for it, that's why im distributing the Code here.
