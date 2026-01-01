@@ -2,8 +2,9 @@
 This is a simple Wallclock for Raspberry Pi with a LED Display.
 I've used it to demonstrate that PTP is really distributing the Time at my Speech at Chaos Computer Club.
 A lot of people asked for it, that's why im distributing the Code here.
-I'm a rellay bad Coder and most of it is based on ChatGpt.<br>
+I'm a realy bad Coder and most of it is based on ChatGpt.<br>
 It ready the PTPv2 Sync and Follow Up Messages. It's not doing Delay Requests and not doing BMCA. <br>
+It shows TAI (= 37s off to UTC). I will make this adjustable as a setting <br>
 I did not expect this interes in it, i will update it as soon as possible.<br>
 What you need:<br>
 --Raspberry 1 to 4 (5 not working at the moment) <br>
@@ -13,7 +14,7 @@ What you need:<br>
 
 # Installation: 
 ### Easyway: <br>
-You can Download my Raspberry Pi Image and just Flash the ISO with Rufus<br>
+You can Download my Raspberry Pi Image and just Flash the ISO with Rufus --> Releases<br>
 <br>
 ### Other way: <br>
 Install the Demos and Display from here: 
