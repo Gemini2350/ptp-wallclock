@@ -1,7 +1,7 @@
 # ptp-wallclock
 <p align="center"> <img src="./clock2.png" alt="High-precision LED wall clock showing 19:05:37.23269755" width="800"/> </p>
 This is a simple PTP 1588 Wallclock for Raspberry Pi with a LED Display.
-I've used it to demonstrate that PTP is really distributing the Time at my Speech at Chaos Computer Club.
+I've used it to demonstrate that PTP is really distributing the Time at my Speech at Chaos Computer Club. https://www.youtube.com/watch?v=dOt-zRIG5co
 A lot of people asked for it, that's why im distributing the Code here.
 I'm a realy bad Coder and most of it is based on ChatGpt.<br>
 It reads the PTPv2 Sync and Follow Up Messages. It's not doing Delay Requests and not doing BMCA. <br>
