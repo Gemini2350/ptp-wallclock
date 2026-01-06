@@ -56,5 +56,7 @@ I'm not shure how the clock behaves with PTPv1
 
 Clock does no BMCA, only looks at Sync Messages
 
+Clock is fixed on eth0
+
 
 
