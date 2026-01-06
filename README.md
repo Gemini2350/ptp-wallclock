@@ -45,3 +45,16 @@ I havent found a better way that the Script can access ports below 1024, in orde
 ```
 sudo sysctl -w net.ipv4.ip_unprivileged_port_start=319
 ```
+
+I could't access the font from the library. Font 6xB13 need manually copied in Folder /usr/share/fonts/rpi-rgb-led-matrix/6x13B.bdf
+
+## Open Issues:
+
+I'm not shure if the Clock does IGMP Reports for the PTP Multicast 224.0.1.129
+
+I'm not shure how the clock behaves with PTPv1
+
+Clock does no BMCA, only looks at Sync Messages
+
+
+
