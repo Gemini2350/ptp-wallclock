@@ -46,7 +46,8 @@ I havent found a better way that the Script can access ports below 1024, in orde
 sudo sysctl -w net.ipv4.ip_unprivileged_port_start=319
 ```
 
-I could't access the font from the library. Font 6xB13 need manually copied in Folder /usr/share/fonts/rpi-rgb-led-matrix/6x13B.bdf
+I could't access the font from the library. Font 6xB13 needs manually copied from rpi-rgb-led-matrix
+/fonts/ to /usr/share/fonts/rpi-rgb-led-matrix/6x13B.bdf
 
 ## Open Issues:
 
