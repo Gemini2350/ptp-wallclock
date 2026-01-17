@@ -29,8 +29,8 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
 
 - Raspberry Pi (tested on Raspberry Pi 3/4 - 5 not working at the moment)
 - RGB LED matrix compatible with the `rpi-rgb-led-matrix` library 
--     [Adafruit RGB Matrix HAT](https://www.adafruit.com/product/2345)
--     2 x [HUB75 LED Panel 32x64 Pixel](https://www.waveshare.com/RGB-Matrix-P3-64x32.htm) (32 x 128 total)
+-- [Adafruit RGB Matrix HAT](https://www.adafruit.com/product/2345)
+-- 2 x [HUB75 LED Panel 32x64 Pixel](https://www.waveshare.com/RGB-Matrix-P3-64x32.htm) (32 x 128 total)
 - Network interface receiving PTP packets (typically Ethernet)
 
 ---
