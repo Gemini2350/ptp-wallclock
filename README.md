@@ -2,25 +2,52 @@
 
 <p align="center"><img src="./clock2.png" alt="High-precision LED wall clock showing 19:05:37.23269755" width="800" height="auto"/></p>
 
-This is a simple PTP 1588 Wallclock for Raspberry Pi with a LED Display.
-I've used it to demonstrate that PTP is really distributing the Time at my Speech at Chaos Computer Club, [Excuse me, what precise time is It?](https://media.ccc.de/v/39c3-excuse-me-what-precise-time-is-it).
+# ptp-wallclock
 
-A lot of people asked for it, that's why I'm distributing the code here.
+`ptp-wallclock` is a simple C++ application for Raspberry Pi that listens for
+IEEE 1588 Precision Time Protocol (PTPv2) messages and displays the synchronized
+wall-clock time on an attached LED matrix display.
 
-I'm a really bad coder and most of it is based on chatGPT.
+The project is intended as a lightweight, hardware-based visualization of PTP
+time synchronization, useful for experiments, demos, and educational purposes.
 
-It reads the PTPv2 Sync and Follow Up messages. It's not doing Delay Requests and not doing BMCA.
+---
 
-It shows TAI (= 37s off to UTC). I will make this adjustable as a setting.
+## Features
 
-I did not expect this interest in it, i will update it as soon as possible.
+- Listens for PTPv2 (IEEE 1588) Sync / Follow_Up messages
+- Computes synchronized wall-clock time
+- Displays time on an RGB LED matrix
+- Runs entirely in user space
+- Designed for Raspberry Pi
 
-What you need:
+---
 
-  - Raspberry Pi 1 to 4 (5 not working at the moment)
-  - [Adafruit RGB Matrix HAT](https://www.adafruit.com/product/2345)
-  - 2 x [HUB75 LED Panel 32x64 Pixel](https://www.waveshare.com/RGB-Matrix-P3-64x32.htm) (32 x 128 total)
-  - Power Supply
+## Hardware Requirements
+
+- Raspberry Pi (tested on Raspberry Pi 3/4)
+- RGB LED matrix compatible with the `rpi-rgb-led-matrix` library
+- Network interface receiving PTP packets (typically Ethernet)
+
+---
+
+## Software Requirements
+
+- Linux-based Raspberry Pi OS
+- C++17-compatible compiler (e.g. `g++`)
+- `rpi-rgb-led-matrix` library
+- PTP-capable network environment (PTP grandmaster or PTP-enabled switch)
+
+---
+
+## Build Instructions
+
+Clone the repository:
+
+```bash
+git clone https://github.com/Gemini2350/ptp-wallclock.git
+cd ptp-wallclock
+```
 
 ## Installation:
 
@@ -37,27 +64,54 @@ Download my Code (compiled or uncompiled).
 Compile it:
 
 ```
-g++ -O2 -std=c++17 ptp-clock.cpp -o ptp-clock -I./include -I./bindings -L./lib -lrgbmatrix -lpthread
+g++ -O2 -std=c++17 ptp-clock.cpp -o ptp-clock \
+    -I./include -I./bindings \
+    -L./lib -lrgbmatrix -lpthread
 ```
 
-I havent found a better way that the Script can access ports below 1024, in order to do this you need to add:
+Running the Application
+
+PTP uses UDP ports 319 and 320, which are considered privileged ports on
+Linux systems. By default, binding to these ports requires root privileges.
+
+To allow binding to these ports without running the application as root, adjust
+the unprivileged port range:
 
 ```
 sudo sysctl -w net.ipv4.ip_unprivileged_port_start=319
 ```
 
-I could't access the font from the library. Font 6xB13 needs manually copied from rpi-rgb-led-matrix
-/fonts/ to /usr/share/fonts/rpi-rgb-led-matrix/6x13B.bdf
+You can then run the application as a normal user:
 
-## Open Issues:
+```
+./ptp-clock
+```
 
-I'm not shure if the Clock does IGMP Reports for the PTP Multicast 224.0.1.129
+Note:
+The 6x13B font is not installed by default. To make it available system-wide,
+copy it from the rpi-rgb-led-matrix repository:
 
-I'm not shure how the clock behaves with PTPv1
+```bash
+sudo mkdir -p /usr/share/fonts/rpi-rgb-led-matrix
+sudo cp fonts/6x13B.bdf /usr/share/fonts/rpi-rgb-led-matrix/
+```
 
-Clock does no BMCA, only looks at Sync Messages
+## References
+[Excuse me, what precise time is It?](https://media.ccc.de/v/39c3-excuse-me-what-precise-time-is-it).
 
-Clock is fixed on eth0
+## Open Issues
+
+- IGMP membership reports for the PTP multicast address `224.0.1.129` are not
+  explicitly generated. Operation may depend on network multicast behavior.
+
+- PTPv1 (IEEE 1588-2002) is not supported. The implementation targets PTPv2
+  (IEEE 1588-2008) only.
+
+- Best Master Clock Algorithm (BMCA) is not implemented. The clock passively
+  listens for Sync (and Follow_Up) messages only.
+
+- The network interface is fixed to `eth0`.
+
 
 
 
