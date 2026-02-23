@@ -63,7 +63,11 @@ You can Download my Raspberry Pi Image and just Flash the ISO with Rufus: [Relea
 
 Install the Demos and Display from here: https://github.com/hzeller/rpi-rgb-led-matrix
 
-Download my Code (compiled or uncompiled).
+Download my code into the `rpi-rgb-led-matrix` directory:
+
+```
+curl -LO https://raw.githubusercontent.com/Gemini2350/ptp-wallclock/refs/heads/main/ptp-clock.cpp
+```
 
 Compile it:
 
@@ -78,7 +82,13 @@ Running the Application
 PTP uses UDP ports 319 and 320, which are considered privileged ports on
 Linux systems. By default, binding to these ports requires root privileges.
 
-To allow binding to these ports without running the application as root, adjust
+You can run the script with `sudo` (which is recommended for best RGB Matrix performance):
+
+```
+sudo ./ptp-clock
+```
+
+Or to allow binding to these ports without running the application as root, adjust
 the unprivileged port range:
 
 ```
@@ -91,9 +101,10 @@ You can then run the application as a normal user:
 ./ptp-clock
 ```
 
-Note:
-The 6x13B font is not installed by default. To make it available system-wide,
-copy it from the rpi-rgb-led-matrix repository:
+You might get a warning about RGB Matrix performance when running as a normal user.
+
+Note: The 6x13B font is not installed by default. To make it available system-wide,
+copy it from the `rpi-rgb-led-matrix` repository:
 
 ```bash
 sudo mkdir -p /usr/share/fonts/rpi-rgb-led-matrix
@@ -101,6 +112,7 @@ sudo cp fonts/6x13B.bdf /usr/share/fonts/rpi-rgb-led-matrix/
 ```
 
 ## References
+
 [Excuse me, what precise time is It?](https://media.ccc.de/v/39c3-excuse-me-what-precise-time-is-it).
 
 ## Open Issues
@@ -115,7 +127,3 @@ sudo cp fonts/6x13B.bdf /usr/share/fonts/rpi-rgb-led-matrix/
   listens for Sync (and Follow_Up) messages only.
 
 - The network interface is fixed to `eth0`.
-
-
-
-
