@@ -55,6 +55,25 @@ uint32_t get_eth0_ip() {
 }
 
 int main(int argc, char **argv) {
+    // --- Multicast-Sockets ---
+    int sock_sync = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock_followup = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_sync < 0 || sock_followup < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    sockaddr_in addr_sync{}, addr_followup{};
+    addr_sync.sin_family = AF_INET;
+    addr_sync.sin_port = htons(319);
+    addr_sync.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    addr_followup.sin_family = AF_INET;
+    addr_followup.sin_port = htons(320);
+    addr_followup.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    bind(sock_sync, (struct sockaddr*)&addr_sync, sizeof(addr_sync));
+    bind(sock_followup, (struct sockaddr*)&addr_followup, sizeof(addr_followup));
 
     // --- Matrix Optionen ---
     RGBMatrix::Options matrix_options;
@@ -85,26 +104,6 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, InterruptHandler);
     signal(SIGTERM, InterruptHandler);
-
-    // --- Multicast-Sockets ---
-    int sock_sync = socket(AF_INET, SOCK_DGRAM, 0);
-    int sock_followup = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_sync < 0 || sock_followup < 0) {
-        perror("socket");
-        return 1;
-    }
-
-    sockaddr_in addr_sync{}, addr_followup{};
-    addr_sync.sin_family = AF_INET;
-    addr_sync.sin_port = htons(319);
-    addr_sync.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    addr_followup.sin_family = AF_INET;
-    addr_followup.sin_port = htons(320);
-    addr_followup.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    bind(sock_sync, (struct sockaddr*)&addr_sync, sizeof(addr_sync));
-    bind(sock_followup, (struct sockaddr*)&addr_followup, sizeof(addr_followup));
 
     ip_mreq mreq{};
     mreq.imr_multiaddr.s_addr = inet_addr("224.0.1.129");
