@@ -26,6 +26,7 @@ struct PTPTimestamp {
 
 // ---- PTP Interpolations-Referenz ----
 static uint64_t last_ptp_ns = 0;
+static int16_t current_utc_offset = 0; // Added for UTC handling
 static timespec last_mono{};
 static bool have_ptp_ref = false;
 
@@ -130,12 +131,22 @@ int main(int argc, char **argv) {
         select(std::max(sock_sync, sock_followup) + 1,
                &fds, nullptr, nullptr, &tv);
 
-        // --- FOLLOW_UP ---
+        // --- FOLLOW_UP & ANNOUNCE (both on port 320) ---
         if (FD_ISSET(sock_followup, &fds)) {
             uint8_t buf[128];
-            if (recv(sock_followup, buf, sizeof(buf), 0) > 0) {
+            ssize_t len = recv(sock_followup, buf, sizeof(buf), 0);
+            if (len > 0) {
+                uint8_t msg_type = buf[0] & 0x0F;
 
-                if ((buf[0] & 0x0F) == 8) {
+                // Handle Announce (0x0B) to get UTC offset
+                if (msg_type == 0x0B && len >= 64) {
+                    uint16_t flags = (buf[6] << 8) | buf[7];
+                    if ((flags & 0x0008) && (flags & 0x0004)) {
+                        current_utc_offset = (int16_t)((buf[44] << 8) | buf[45]);
+                    }
+                }
+                // Handle Follow_Up (0x08)
+                else if (msg_type == 8) {
 
                     PTPTimestamp ts{};
                     for (int i = 0; i < 6; ++i)
@@ -147,8 +158,9 @@ int main(int argc, char **argv) {
                         (buf[42] << 8)  |
                         buf[43];
 
+                    // Subtract offset to convert TAI to UTC
                     last_ptp_ns =
-                        ts.seconds * 1000000000ULL +
+                        (ts.seconds - current_utc_offset) * 1000000000ULL +
                         ts.nanoseconds;
 
                     clock_gettime(CLOCK_MONOTONIC_RAW, &last_mono);
@@ -174,7 +186,7 @@ int main(int argc, char **argv) {
         uint32_t nsec = display_ns % 1000000000ULL;
 
         struct tm tm_local;
-        localtime_r(&sec, &tm_local);
+        gmtime_r(&sec, &tm_local); // Using gmtime for UTC display
 
         char time_buffer[64];
         snprintf(time_buffer, sizeof(time_buffer),
