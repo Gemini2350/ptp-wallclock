@@ -34,6 +34,7 @@ static void InterruptHandler(int signo) {
 
 // ---- Settings (served / edited via the web interface) ----
 enum TimeMode { MODE_UTC = 0, MODE_TAI = 1, MODE_LOCAL = 2 };
+enum DateFormat { DATE_DMY = 0, DATE_ISO = 1, DATE_MDY = 2 };
 
 struct Settings {
     uint8_t r = 255, g = 255, b = 0;      // display color
@@ -42,10 +43,12 @@ struct Settings {
     bool show_date = false;               // show the date on the matrix
     int mode = MODE_UTC;                  // UTC / TAI / local time
     std::string timezone = "Europe/Berlin";
+    int time_format = 24;                 // 24 or 12 (AM/PM)
+    int date_format = DATE_DMY;           // DD.MM.YYYY / ISO / MM/DD/YYYY
     bool notify_gm_change = false;        // notify on grandmaster change
     int http_port = 8080;
     int domain = -1;                      // PTP domain, -1 = auto detect
-    std::string iface = "eth0";           // network interface (restart required)
+    std::string iface = "eth0";           // network interface
 };
 
 static Settings g_settings;
@@ -174,6 +177,10 @@ static void save_settings_locked() {
     f << "show_date=" << (g_settings.show_date ? 1 : 0) << "\n";
     f << "mode=" << g_settings.mode << "\n";
     f << "timezone=" << g_settings.timezone << "\n";
+    f << "time_format=" << g_settings.time_format << "\n";
+    f << "date_format=" << (g_settings.date_format == DATE_ISO ? "iso" :
+                            g_settings.date_format == DATE_MDY ? "mdy" :
+                            "dmy") << "\n";
     f << "notify_gm_change=" << (g_settings.notify_gm_change ? 1 : 0) << "\n";
     f << "http_port=" << g_settings.http_port << "\n";
     if (g_settings.domain < 0)
@@ -212,6 +219,13 @@ static void load_settings() {
         } else if (key == "timezone") {
             if (!val.empty())
                 g_settings.timezone = val;
+        } else if (key == "time_format") {
+            if (val == "12" || val == "24")
+                g_settings.time_format = atoi(val.c_str());
+        } else if (key == "date_format") {
+            if (val == "iso") g_settings.date_format = DATE_ISO;
+            else if (val == "mdy") g_settings.date_format = DATE_MDY;
+            else if (val == "dmy") g_settings.date_format = DATE_DMY;
         } else if (key == "notify_gm_change") {
             g_settings.notify_gm_change = (val == "1");
         } else if (key == "http_port") {
@@ -575,6 +589,10 @@ static std::string settings_json() {
       << "\"mode\":\"" << (g_settings.mode == MODE_TAI ? "tai" :
                            g_settings.mode == MODE_LOCAL ? "local" : "utc") << "\","
       << "\"timezone\":\"" << json_escape(g_settings.timezone) << "\","
+      << "\"time_format\":\"" << g_settings.time_format << "\","
+      << "\"date_format\":\"" << (g_settings.date_format == DATE_ISO ? "iso" :
+                                  g_settings.date_format == DATE_MDY ? "mdy" :
+                                  "dmy") << "\","
       << "\"notify_gm_change\":" << (g_settings.notify_gm_change ? "true" : "false") << ","
       << "\"domain\":" << g_settings.domain << ","
       << "\"iface\":\"" << json_escape(g_settings.iface) << "\","
@@ -627,7 +645,7 @@ static std::string status_json() {
 }
 
 static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -656,7 +674,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>PTP Wallclock &ndash; Einstellungen</h1>
+<h1>PTP Wallclock &ndash; Settings</h1>
 <div id="banner"></div>
 
 <fieldset>
@@ -666,41 +684,41 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  <tr><td>Interface</td><td id="s_iface">&ndash;</td></tr>
  <tr><td>Domain</td><td id="s_domain">&ndash;</td></tr>
  <tr><td>Grandmaster</td><td id="s_gm">&ndash;</td></tr>
- <tr><td>Priorit&auml;t 1 / 2</td><td id="s_prio">&ndash;</td></tr>
- <tr><td>Clock Class</td><td id="s_class">&ndash;</td></tr>
- <tr><td>Genauigkeit</td><td id="s_acc">&ndash;</td></tr>
- <tr><td>Varianz</td><td id="s_var">&ndash;</td></tr>
- <tr><td>Steps Removed</td><td id="s_steps">&ndash;</td></tr>
- <tr><td>Time Source</td><td id="s_src">&ndash;</td></tr>
- <tr><td>TAI&minus;UTC Offset</td><td id="s_off">&ndash;</td></tr>
- <tr><td>Pfadverz&ouml;gerung</td><td id="s_delay">&ndash;</td></tr>
- <tr><td>GM-Wechsel</td><td id="s_changes">0</td></tr>
+ <tr><td>Priority 1 / 2</td><td id="s_prio">&ndash;</td></tr>
+ <tr><td>Clock class</td><td id="s_class">&ndash;</td></tr>
+ <tr><td>Accuracy</td><td id="s_acc">&ndash;</td></tr>
+ <tr><td>Variance</td><td id="s_var">&ndash;</td></tr>
+ <tr><td>Steps removed</td><td id="s_steps">&ndash;</td></tr>
+ <tr><td>Time source</td><td id="s_src">&ndash;</td></tr>
+ <tr><td>TAI&minus;UTC offset</td><td id="s_off">&ndash;</td></tr>
+ <tr><td>Path delay</td><td id="s_delay">&ndash;</td></tr>
+ <tr><td>GM changes</td><td id="s_changes">0</td></tr>
 </table>
 </fieldset>
 
 <form id="form">
 <fieldset>
-<legend>Anzeige</legend>
-<label>Farbe der Anzeige:
+<legend>Display</legend>
+<label>Display color:
  <input type="color" id="color" value="#ffff00">
 </label>
 <label>
- <input type="checkbox" id="show_gm"> PTP Grandmaster-ID anzeigen (2. Zeile)
+ <input type="checkbox" id="show_gm"> Show grandmaster ID (2nd line)
 </label>
 <label>
- <input type="checkbox" id="show_gm_details"> Priorit&auml;ten &amp; Clock Quality anzeigen (2. Zeile)
+ <input type="checkbox" id="show_gm_details"> Show priorities &amp; clock quality (2nd line)
 </label>
 <label>
- <input type="checkbox" id="show_date"> Datum anzeigen (2. Zeile)
+ <input type="checkbox" id="show_date"> Show date (2nd line)
 </label>
 </fieldset>
 
 <fieldset>
-<legend>Zeit</legend>
+<legend>Time</legend>
 <label><input type="radio" name="mode" value="utc" checked> UTC</label>
 <label><input type="radio" name="mode" value="tai"> TAI</label>
-<label><input type="radio" name="mode" value="local"> Lokale Zeit (Zeitzone)</label>
-<label>Zeitzone:
+<label><input type="radio" name="mode" value="local"> Local time (time zone)</label>
+<label>Time zone:
  <input type="text" id="timezone" list="tzlist" value="Europe/Berlin">
  <datalist id="tzlist">
   <option value="Europe/Berlin"><option value="Europe/Zurich">
@@ -711,45 +729,58 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
   <option value="Australia/Sydney">
  </datalist>
 </label>
+<label>Time format:
+ <select id="time_format">
+  <option value="24">24-hour</option>
+  <option value="12">12-hour (AM/PM)</option>
+ </select>
+</label>
+<label>Date format:
+ <select id="date_format">
+  <option value="dmy">31.12.2026 (DD.MM.YYYY)</option>
+  <option value="iso">2026-12-31 (ISO 8601)</option>
+  <option value="mdy">12/31/2026 (MM/DD/YYYY)</option>
+ </select>
+</label>
 </fieldset>
 
 <fieldset>
 <legend>PTP</legend>
 <label>
- <input type="checkbox" id="domain_auto" checked> Domain automatisch erkennen
+ <input type="checkbox" id="domain_auto" checked> Detect domain automatically
 </label>
 <label>Domain:
  <input type="number" id="domain" min="0" max="255" value="0" disabled>
 </label>
-<label>Netzwerk-Interface:
+<label>Network interface:
  <input type="text" id="iface" list="iflist" value="eth0">
  <datalist id="iflist"></datalist>
 </label>
 </fieldset>
 
 <fieldset>
-<legend>Benachrichtigung</legend>
+<legend>Notification</legend>
 <label>
- <input type="checkbox" id="notify"> Bei Grandmaster-Wechsel benachrichtigen
+ <input type="checkbox" id="notify"> Notify on grandmaster change
 </label>
 </fieldset>
 
-<button type="submit">Speichern</button><span id="saved">Gespeichert</span>
+<button type="submit">Save</button><span id="saved">Saved</span>
 </form>
 
 <script>
 const ACCURACY = {0x20:'25 ns',0x21:'100 ns',0x22:'250 ns',0x23:'1 µs',
- 0x24:'2,5 µs',0x25:'10 µs',0x26:'25 µs',0x27:'100 µs',
- 0x28:'250 µs',0x29:'1 ms',0x2A:'2,5 ms',0x2B:'10 ms',0x2C:'25 ms',
+ 0x24:'2.5 µs',0x25:'10 µs',0x26:'25 µs',0x27:'100 µs',
+ 0x28:'250 µs',0x29:'1 ms',0x2A:'2.5 ms',0x2B:'10 ms',0x2C:'25 ms',
  0x2D:'100 ms',0x2E:'250 ms',0x2F:'1 s',0x30:'10 s',0x31:'>10 s',
- 0xFE:'unbekannt'};
-const CLOCK_CLASS = {6:'GNSS-synchron',7:'Holdover',13:'applikationsspezifisch',
- 14:'appl. Holdover',52:'degradiert A',58:'degradiert A (Holdover)',
- 187:'degradiert B',193:'degradiert B (Holdover)',248:'Default',
- 255:'Slave-only'};
-const TIME_SOURCE = {0x10:'Atomuhr',0x20:'GPS/GNSS',0x30:'terrestr. Funk',
- 0x40:'PTP',0x50:'NTP',0x60:'Handeingabe',0x90:'andere',
- 0xA0:'interner Oszillator'};
+ 0xFE:'unknown'};
+const CLOCK_CLASS = {6:'GNSS locked',7:'holdover',13:'application specific',
+ 14:'application holdover',52:'degraded A',58:'degraded A (holdover)',
+ 187:'degraded B',193:'degraded B (holdover)',248:'default',
+ 255:'slave-only'};
+const TIME_SOURCE = {0x10:'atomic clock',0x20:'GPS/GNSS',0x30:'terrestrial radio',
+ 0x40:'PTP',0x50:'NTP',0x60:'hand set',0x90:'other',
+ 0xA0:'internal oscillator'};
 const hex = (v, w) => '0x' + v.toString(16).toUpperCase().padStart(w, '0');
 
 function syncDomainInput() {
@@ -772,6 +803,8 @@ async function loadSettings() {
   document.getElementById('iface').value = s.iface;
   document.getElementById('iflist').innerHTML =
       s.ifaces.map(i => '<option value="' + i + '">').join('');
+  document.getElementById('time_format').value = s.time_format;
+  document.getElementById('date_format').value = s.date_format;
   document.querySelector('input[name=mode][value="' + s.mode + '"]').checked = true;
 }
 
@@ -784,6 +817,8 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     show_date: document.getElementById('show_date').checked ? 1 : 0,
     mode: document.querySelector('input[name=mode]:checked').value,
     timezone: document.getElementById('timezone').value,
+    time_format: document.getElementById('time_format').value,
+    date_format: document.getElementById('date_format').value,
     domain: document.getElementById('domain_auto').checked
         ? -1 : document.getElementById('domain').value,
     iface: document.getElementById('iface').value,
@@ -805,36 +840,36 @@ async function poll() {
   try {
     const s = await fetch('/api/status').then(r => r.json());
     set('s_ptp', s.have_ptp
-        ? 'synchronisiert (Sync vor ' + s.sync_age.toFixed(1) + ' s)'
-        : 'warte auf PTP...');
-    set('s_iface', s.iface + (s.iface_up ? '' : ' (nicht verbunden)'));
+        ? 'synchronized (sync ' + s.sync_age.toFixed(1) + ' s ago)'
+        : 'waiting for PTP...');
+    set('s_iface', s.iface + (s.iface_up ? '' : ' (not connected)'));
     set('s_domain', s.domain === -1
         ? (s.active_domain >= 0
-           ? s.active_domain + ' (automatisch erkannt)'
-           : 'suche... (automatisch)')
+           ? s.active_domain + ' (auto-detected)'
+           : 'scanning... (auto)')
         : s.domain);
     const gm = s.gm_id !== '';
-    set('s_gm', gm ? s.gm_id : 'unbekannt');
+    set('s_gm', gm ? s.gm_id : 'unknown');
     set('s_prio', gm ? s.priority1 + ' / ' + s.priority2 : '–');
     set('s_class', gm ? s.clock_class + ' (' +
-        (CLOCK_CLASS[s.clock_class] || 'reserviert') + ')' : '–');
-    set('s_acc', gm ? (ACCURACY[s.clock_accuracy] || 'reserviert') +
+        (CLOCK_CLASS[s.clock_class] || 'reserved') + ')' : '–');
+    set('s_acc', gm ? (ACCURACY[s.clock_accuracy] || 'reserved') +
         ' (' + hex(s.clock_accuracy, 2) + ')' : '–');
     set('s_var', gm ? hex(s.variance, 4) : '–');
     set('s_steps', gm ? s.steps_removed : '–');
-    set('s_src', gm ? (TIME_SOURCE[s.time_source] || 'reserviert') +
+    set('s_src', gm ? (TIME_SOURCE[s.time_source] || 'reserved') +
         ' (' + hex(s.time_source, 2) + ')' : '–');
     set('s_off', s.utc_offset + ' s');
     set('s_delay', s.path_delay_ns > 0
         ? (s.path_delay_ns / 1000).toFixed(1) + ' µs (' +
-          s.dresp_received + '/' + s.dreq_sent + ' Antworten)'
+          s.dresp_received + '/' + s.dreq_sent + ' responses)'
         : s.dreq_sent > 0
-          ? 'keine Antwort (' + s.dreq_sent + ' Anfragen)'
+          ? 'no response (' + s.dreq_sent + ' requests)'
           : '–');
     set('s_changes', s.gm_changes);
     if (lastChanges !== null && s.gm_changes > lastChanges &&
         document.getElementById('notify').checked) {
-      const msg = 'PTP Grandmaster-Wechsel! Neuer GM: ' + s.gm_id;
+      const msg = 'PTP grandmaster change! New GM: ' + s.gm_id;
       const banner = document.getElementById('banner');
       banner.textContent = msg;
       banner.style.display = 'block';
@@ -941,6 +976,18 @@ static void handle_client(int fd) {
                 g_settings.timezone = kv["timezone"];
                 apply_timezone(g_settings.timezone);
             }
+            if (kv.count("time_format")) {
+                if (kv["time_format"] == "12" || kv["time_format"] == "24")
+                    g_settings.time_format = atoi(kv["time_format"].c_str());
+            }
+            if (kv.count("date_format")) {
+                if (kv["date_format"] == "iso")
+                    g_settings.date_format = DATE_ISO;
+                else if (kv["date_format"] == "mdy")
+                    g_settings.date_format = DATE_MDY;
+                else if (kv["date_format"] == "dmy")
+                    g_settings.date_format = DATE_DMY;
+            }
             if (kv.count("domain")) {
                 int d = atoi(kv["domain"].c_str());  // -1 = auto
                 if (d >= -1 && d <= 255 && d != g_settings.domain) {
@@ -1005,7 +1052,7 @@ int main(int argc, char **argv) {
     load_settings();
     apply_timezone(g_settings.timezone);
 
-    // --- Multicast-Sockets ---
+    // --- Multicast sockets ---
     int sock_sync = socket(AF_INET, SOCK_DGRAM, 0);
     int sock_general = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock_sync < 0 || sock_general < 0) {
@@ -1033,7 +1080,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // --- Matrix Optionen ---
+    // --- Matrix options ---
     RGBMatrix::Options matrix_options;
     RuntimeOptions runtime_opt;
 
@@ -1097,7 +1144,7 @@ int main(int argc, char **argv) {
     uint64_t next_join_try_ns = 0;
     bool join_warned = false;
 
-    // --- Hauptloop ---
+    // --- Main loop ---
     while (!interrupt_received) {
 
         if (g_reset_ptp.exchange(false))
@@ -1195,7 +1242,7 @@ int main(int argc, char **argv) {
         if (!have_ptp_ref)
             continue;
 
-        // --- fluessige Zeit: master(TAI) = local(mono) - offset ---
+        // --- Smooth time: master(TAI) = local(mono) - offset ---
         int64_t display_signed = (int64_t)mono_ns() - g_offset_ns;
         if (display_signed < 0)
             display_signed = 0;
@@ -1236,12 +1283,22 @@ int main(int argc, char **argv) {
             gmtime_r(&sec, &tm_disp);
 
         char time_buffer[64];
-        snprintf(time_buffer, sizeof(time_buffer),
-                 "%02d:%02d:%02d.%09u",
-                 tm_disp.tm_hour,
-                 tm_disp.tm_min,
-                 tm_disp.tm_sec,
-                 nsec);
+        if (s.time_format == 12) {
+            // 12-hour: fewer fractional digits to make room for AM/PM
+            int h12 = tm_disp.tm_hour % 12;
+            if (h12 == 0)
+                h12 = 12;
+            snprintf(time_buffer, sizeof(time_buffer),
+                     "%02d:%02d:%02d.%06u %cM",
+                     h12, tm_disp.tm_min, tm_disp.tm_sec,
+                     nsec / 1000,
+                     tm_disp.tm_hour < 12 ? 'A' : 'P');
+        } else {
+            snprintf(time_buffer, sizeof(time_buffer),
+                     "%02d:%02d:%02d.%09u",
+                     tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec,
+                     nsec);
+        }
 
         offscreen->Fill(0,0,0);
 
@@ -1253,11 +1310,20 @@ int main(int argc, char **argv) {
             std::vector<std::string> lines;
             if (s.show_date) {
                 static const char *kDays[7] =
-                    {"SO", "MO", "DI", "MI", "DO", "FR", "SA"};
+                    {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
                 char date_buf[24];
-                snprintf(date_buf, sizeof(date_buf), "%s %02d.%02d.%04d",
-                         kDays[tm_disp.tm_wday], tm_disp.tm_mday,
-                         tm_disp.tm_mon + 1, tm_disp.tm_year + 1900);
+                if (s.date_format == DATE_ISO)
+                    snprintf(date_buf, sizeof(date_buf), "%s %04d-%02d-%02d",
+                             kDays[tm_disp.tm_wday], tm_disp.tm_year + 1900,
+                             tm_disp.tm_mon + 1, tm_disp.tm_mday);
+                else if (s.date_format == DATE_MDY)
+                    snprintf(date_buf, sizeof(date_buf), "%s %02d/%02d/%04d",
+                             kDays[tm_disp.tm_wday], tm_disp.tm_mon + 1,
+                             tm_disp.tm_mday, tm_disp.tm_year + 1900);
+                else
+                    snprintf(date_buf, sizeof(date_buf), "%s %02d.%02d.%04d",
+                             kDays[tm_disp.tm_wday], tm_disp.tm_mday,
+                             tm_disp.tm_mon + 1, tm_disp.tm_year + 1900);
                 lines.push_back(date_buf);
             }
             if (s.show_gm && !id_line.empty())
@@ -1267,7 +1333,7 @@ int main(int argc, char **argv) {
             if (!lines.empty())
                 line2 = lines[(now_ns / 4000000000ULL) % lines.size()];
             if (gm_recent_change && s.notify_gm_change) {
-                line2 = "! NEUER GM !";
+                line2 = "! NEW GM !";
                 line2_alert = true;
             }
         }

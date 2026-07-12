@@ -27,7 +27,7 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
 - Displays time on an RGB LED matrix (UTC, TAI, or local time zone)
 - Optional second display line: date, grandmaster ID and/or priorities &
   clock quality (alternating every 4 seconds)
-- Grandmaster changes are shown on the display itself ("! NEUER GM !")
+- Grandmaster changes are shown on the display itself ("! NEW GM !")
 - Built-in web interface (port 8080) for settings and live status —
   grandmaster identity, priority 1/2, clock class, clock accuracy, variance,
   steps removed, time source, TAI−UTC offset, and measured path delay
@@ -100,13 +100,14 @@ The clock serves a settings page on `http://<pi-address>:8080` with:
 - **Date** — show the date on the matrix (if several second-line options are
   enabled, the line alternates every 4 seconds)
 - **Time display** — UTC, TAI, or local time with a configurable time zone
-  (IANA names such as `Europe/Berlin`)
+  (IANA names such as `Europe/Berlin`), 24-hour or 12-hour (AM/PM) format
+- **Date format** — `DD.MM.YYYY`, ISO 8601 (`YYYY-MM-DD`), or `MM/DD/YYYY`
 - **PTP domain** — automatic detection (default) or a fixed domain number
   (0–255); the detected domain is shown in the status panel
 - **Network interface** — selectable from the interfaces present on the
   system, applied without restart
 - **Grandmaster change notification** — when enabled, a grandmaster change
-  shows `! NEUER GM !` in red on the matrix for 10 seconds and triggers a
+  shows `! NEW GM !` in red on the matrix for 10 seconds and triggers a
   browser notification / banner on the settings page
 
 The status panel shows live data decoded from the Announce messages
