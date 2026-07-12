@@ -1,0 +1,16 @@
+[Unit]
+Description=PTP Wallclock (LED matrix PTP client)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# Starts as root: the privileged PTP ports (319/320) are bound and the GPIO
+# is initialized first, then the rpi-rgb-led-matrix library drops privileges
+# to daemon on its own.
+ExecStart=/usr/local/bin/ptp-clock
+WorkingDirectory=/var/lib/ptp-wallclock
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

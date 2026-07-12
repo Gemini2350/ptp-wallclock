@@ -4,112 +4,162 @@
 
 # ptp-wallclock
 
-`ptp-wallclock` is a simple C++ application for Raspberry Pi that listens for
-IEEE 1588 Precision Time Protocol (PTPv2) messages and displays the synchronized
-wall-clock time on an attached LED matrix display. 
+`ptp-wallclock` is a C++ application for Raspberry Pi that acts as a PTP
+(IEEE 1588 Precision Time Protocol, PTPv2) client and displays the
+synchronized wall-clock time on an attached LED matrix display.
 
 The project is intended as a lightweight, hardware-based visualization of PTP
 time synchronization, useful for experiments, demos, and educational purposes.
-I've used it to demonstrate that PTP is really distributing the Time at my Speech at Chaos Computer Club, 
+I've used it to demonstrate that PTP is really distributing the Time at my Speech at Chaos Computer Club,
 [Excuse me, what precise time is It?](https://media.ccc.de/v/39c3-excuse-me-what-precise-time-is-it).
 
 ---
 
 ## Features
 
-- Listens for PTPv2 (IEEE 1588) Sync / Follow_Up messages
-- Computes synchronized wall-clock time
-- Displays time on an RGB LED matrix
-- Runs entirely in user space
-- Designed for Raspberry Pi
+- Real PTPv2 (IEEE 1588) client with the end-to-end delay mechanism:
+  Sync / Follow_Up are correlated with their local arrival time, Delay_Req /
+  Delay_Resp measure the network path delay, and the displayed time is
+  corrected accordingly (correction fields included, one-step and two-step
+  masters supported)
+- Automatic PTP domain detection (locks onto the first domain with Announce
+  traffic, rescans on timeout), or a fixed domain 0–255
+- Displays time on an RGB LED matrix (UTC, TAI, or local time zone)
+- Optional second display line: date, grandmaster ID and/or priorities &
+  clock quality (alternating every 4 seconds)
+- Grandmaster changes are shown on the display itself ("! NEUER GM !")
+- Built-in web interface (port 8080) for settings and live status —
+  grandmaster identity, priority 1/2, clock class, clock accuracy, variance,
+  steps removed, time source, TAI−UTC offset, and measured path delay
+- Grandmaster change notification (web + red highlight on the matrix)
+- One-step installation with systemd service
+- Runs entirely in user space, no kernel PTP support needed
 
 ---
 
 ## Hardware Requirements
 
 - Raspberry Pi (tested on Raspberry Pi 3/4 - 5 not working at the moment)
-- RGB LED matrix compatible with the `rpi-rgb-led-matrix` library 
+- RGB LED matrix compatible with the `rpi-rgb-led-matrix` library
 -- [Adafruit RGB Matrix HAT](https://www.adafruit.com/product/2345)
 -- 2 x [HUB75 LED Panel 32x64 Pixel](https://www.waveshare.com/RGB-Matrix-P3-64x32.htm) (32 x 128 total)
 - Network interface receiving PTP packets (typically Ethernet)
-
----
-
-## Software Requirements
-
-- Linux-based Raspberry Pi OS
-- C++17-compatible compiler (e.g. `g++`)
-- `rpi-rgb-led-matrix` library
 - PTP-capable network environment (PTP grandmaster or PTP-enabled switch)
 
 ---
 
-## Build Instructions
+## Installation
 
-Clone the repository:
+### Easy way: Raspberry Pi image
+
+You can download my Raspberry Pi image and just flash the ISO with Rufus:
+[Releases](https://github.com/Gemini2350/ptp-wallclock/releases)
+
+### Recommended: installer script
+
+On a Raspberry Pi OS system, one command does everything (fetches and builds
+the `rpi-rgb-led-matrix` library, compiles the clock, installs fonts and a
+systemd service that starts on boot):
 
 ```bash
 git clone https://github.com/Gemini2350/ptp-wallclock.git
 cd ptp-wallclock
+sudo ./install.sh
 ```
 
-## Installation:
+Afterwards:
 
-### Easy way:
-
-You can Download my Raspberry Pi Image and just Flash the ISO with Rufus: [Releases](https://github.com/Gemini2350/ptp-wallclock/releases)
-
-### Other way:
-
-Install the Demos and Display from here: https://github.com/hzeller/rpi-rgb-led-matrix
-
-Download my code into the `rpi-rgb-led-matrix` directory:
-
-```
-curl -LO https://raw.githubusercontent.com/Gemini2350/ptp-wallclock/refs/heads/main/ptp-clock.cpp
+```bash
+systemctl status ptp-wallclock     # service status
+journalctl -u ptp-wallclock -f     # logs
 ```
 
-Compile it:
+The settings page is served on `http://<pi-address>:8080`.
 
-```
-g++ -O2 -std=c++17 ptp-clock.cpp -o ptp-clock \
-    -I./include -I./bindings \
-    -L./lib -lrgbmatrix -lpthread
-```
+### Manual build
 
-Running the Application
+If you prefer to build by hand (with the matrix library in
+`/opt/rpi-rgb-led-matrix`, or pass `MATRIX_DIR=`):
 
-PTP uses UDP ports 319 and 320, which are considered privileged ports on
-Linux systems. By default, binding to these ports requires root privileges.
-
-You can run the script with `sudo` (which is recommended for best RGB Matrix performance):
-
-```
+```bash
+make
 sudo ./ptp-clock
 ```
 
-Or to allow binding to these ports without running the application as root, adjust
-the unprivileged port range:
+---
 
-```
-sudo sysctl -w net.ipv4.ip_unprivileged_port_start=319
-```
+## Web Interface
 
-You can then run the application as a normal user:
+The clock serves a settings page on `http://<pi-address>:8080` with:
 
-```
+- **Display color** — color picker for the LED matrix text
+- **Grandmaster ID** — show the current PTP grandmaster identity as a second
+  line on the matrix
+- **Priorities & clock quality** — show priority 1/2, clock class and clock
+  accuracy on the matrix
+- **Date** — show the date on the matrix (if several second-line options are
+  enabled, the line alternates every 4 seconds)
+- **Time display** — UTC, TAI, or local time with a configurable time zone
+  (IANA names such as `Europe/Berlin`)
+- **PTP domain** — automatic detection (default) or a fixed domain number
+  (0–255); the detected domain is shown in the status panel
+- **Network interface** — selectable from the interfaces present on the
+  system, applied without restart
+- **Grandmaster change notification** — when enabled, a grandmaster change
+  shows `! NEUER GM !` in red on the matrix for 10 seconds and triggers a
+  browser notification / banner on the settings page
+
+The status panel shows live data decoded from the Announce messages
+(grandmaster identity, priorities, clock class/accuracy/variance, steps
+removed, time source), the TAI−UTC offset, and the measured mean path delay
+with a Delay_Req/Delay_Resp counter.
+
+> Note: browser push notifications require the page to be allowed to notify;
+> on plain HTTP some browsers only show the in-page banner.
+
+## Configuration file
+
+Settings are persisted as simple `key=value` pairs. The file is
+`/var/lib/ptp-wallclock/ptp-wallclock.conf` when installed via `install.sh`,
+otherwise `ptp-wallclock.conf` in the working directory (override with the
+`PTP_WALLCLOCK_CONF` environment variable). One setting is only available
+in the file (restart required):
+
+| Key         | Default | Meaning                              |
+|-------------|---------|--------------------------------------|
+| `http_port` | `8080`  | Port of the web interface            |
+
+The network interface (`iface`, default `eth0`) can be changed in the web
+interface — the clock leaves the multicast group on the old interface and
+joins on the new one without a restart. If the interface has no IPv4 address
+yet (e.g. DHCP still running at boot), the clock keeps retrying every 5
+seconds instead of exiting.
+
+## Privileged ports (why sudo?)
+
+PTP uses UDP ports 319 and 320, which are privileged ports on Linux. The
+systemd service handles this cleanly: it starts as root, binds the PTP ports
+and initializes the GPIO, and then the `rpi-rgb-led-matrix` library drops
+privileges to the `daemon` user by itself. No `sysctl` tweaking is needed.
+
+For manual runs you can either use `sudo ./ptp-clock` (recommended for best
+matrix performance) or grant the binary the bind capability once:
+
+```bash
+sudo setcap cap_net_bind_service+ep ./ptp-clock
 ./ptp-clock
 ```
 
-You might get a warning about RGB Matrix performance when running as a normal user.
+If binding fails, the program now exits with exactly this hint instead of
+silently misbehaving.
 
-Note: The 6x13B font is not installed by default. To make it available system-wide,
-copy it from the `rpi-rgb-led-matrix` repository:
+## Accuracy
 
-```bash
-sudo mkdir -p /usr/share/fonts/rpi-rgb-led-matrix
-sudo cp fonts/6x13B.bdf /usr/share/fonts/rpi-rgb-led-matrix/
-```
+Packets are timestamped in user space (no hardware timestamping), so the
+achievable accuracy is in the sub-millisecond range on a Raspberry Pi —
+plenty for a wall clock display, but this is a visualization tool, not a
+reference clock. Sync/Follow_Up and Delay_Resp measurements are smoothed
+with a small exponential filter.
 
 ## References
 
@@ -117,13 +167,10 @@ sudo cp fonts/6x13B.bdf /usr/share/fonts/rpi-rgb-led-matrix/
 
 ## Open Issues
 
-- IGMP membership reports for the PTP multicast address `224.0.1.129` are not
-  explicitly generated. Operation may depend on network multicast behavior.
+- Best Master Clock Algorithm (BMCA) is not implemented. The clock passively
+  follows whichever master is sending Sync in the configured domain.
 
 - PTPv1 (IEEE 1588-2002) is not supported. The implementation targets PTPv2
   (IEEE 1588-2008) only.
 
-- Best Master Clock Algorithm (BMCA) is not implemented. The clock passively
-  listens for Sync (and Follow_Up) messages only.
-
-- The network interface is fixed to `eth0`.
+- Only software timestamps are used (see Accuracy above).
