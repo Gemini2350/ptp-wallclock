@@ -50,12 +50,7 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
 
 ## Installation
 
-### Easy way: Raspberry Pi image
-
-You can download my Raspberry Pi image and just flash the ISO with Rufus:
-[Releases](https://github.com/Gemini2350/ptp-wallclock/releases)
-
-### Recommended: installer script
+### Installer script (recommended)
 
 On a Raspberry Pi OS system, one command does everything (fetches and builds
 the `rpi-rgb-led-matrix` library, compiles the clock, installs fonts and a
