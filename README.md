@@ -6,7 +6,8 @@
 
 `ptp-wallclock` is a C++ application for Raspberry Pi that acts as a PTP
 (IEEE 1588 Precision Time Protocol, PTPv2) client and displays the
-synchronized wall-clock time on an attached LED matrix display.
+synchronized wall-clock time on an attached LED matrix display — or, in
+headless/Docker mode, as a fullscreen clock in the browser.
 
 The project is intended as a lightweight, hardware-based visualization of PTP
 time synchronization, useful for experiments, demos, and educational purposes.
@@ -97,6 +98,8 @@ configured color with all nine fractional digits, date, grandmaster status
 line, and the GM change alert. Brightness and blackout from the settings
 page apply to it too. Click the page to go fullscreen.
 
+<p align="center"><img src="./browser-clock.png" alt="Fullscreen browser clock showing 20:53:54.812497625 with grandmaster status line" width="800" height="auto"/></p>
+
 ```bash
 docker compose up -d --build
 ```
@@ -163,6 +166,8 @@ watching a failover happen.
 
 > Note: browser push notifications require the page to be allowed to notify;
 > on plain HTTP some browsers only show the in-page banner.
+
+<p align="center"><img src="./web-settings.png" alt="Web interface with live PTP time, status panel, BMCA master list, and settings" width="560" height="auto"/></p>
 
 ## Configuration file
 
