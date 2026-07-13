@@ -1,0 +1,13 @@
+services:
+  ptp-wallclock:
+    build: .
+    network_mode: host          # required: PTP multicast on ports 319/320
+    restart: unless-stopped
+    volumes:
+      - ptp-wallclock:/var/lib/ptp-wallclock
+    environment:
+      # Host interface that receives PTP (changeable later in the web UI)
+      - PTP_WALLCLOCK_IFACE=eth0
+
+volumes:
+  ptp-wallclock:

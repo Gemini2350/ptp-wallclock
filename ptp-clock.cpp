@@ -1,5 +1,9 @@
+// Build with -DNO_MATRIX for a headless PTP clock (e.g. in Docker) that
+// serves only the web interface and the /clock browser display.
+#ifndef NO_MATRIX
 #include "led-matrix.h"
 #include "graphics.h"
+#endif
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -25,7 +29,9 @@
 #include <vector>
 #include <cmath>
 
+#ifndef NO_MATRIX
 using namespace rgb_matrix;
+#endif
 
 volatile bool interrupt_received = false;
 static void InterruptHandler(int signo) {
@@ -772,6 +778,7 @@ static std::string status_json() {
       << "\"tai_sec\":" << tai_sec << ","
       << "\"tai_nsec\":" << tai_nsec << ","
       << "\"blackout\":" << (g_settings.blackout ? "true" : "false") << ","
+      << "\"brightness\":" << g_settings.brightness << ","
       << "\"sync_age\":" << sync_age << ","
       << "\"domain\":" << g_domain.load() << ","
       << "\"active_domain\":" << g_active_domain.load() << ","
@@ -845,6 +852,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  #saved { color: #6c6; visibility: hidden; margin-left: 1em; }
  #clock { font-family: monospace; text-align: center; color: #fd0;
         font-size: clamp(1em, 4.4vw, 1.8em); white-space: nowrap; }
+ a { color: #7ab; }
  #clockdate { font-family: monospace; text-align: center; color: #aaa;
         margin-top: 0.2em; }
 </style>
@@ -854,7 +862,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <div id="banner"></div>
 
 <fieldset>
-<legend>PTP time</legend>
+<legend>PTP time &nbsp;<a href="/clock">fullscreen clock &rarr;</a></legend>
 <div id="clock">--:--:--</div>
 <div id="clockdate"></div>
 </fieldset>
@@ -1195,6 +1203,176 @@ setInterval(poll, 2000);
 </html>
 )HTML";
 
+// Fullscreen browser clock ("the display" for headless installations)
+static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PTP Clock</title>
+<style>
+ :root { --c: #ffff00; }
+ html, body { height: 100%; margin: 0; background: #000; }
+ body { display: flex; align-items: center; justify-content: center;
+        overflow: hidden; cursor: pointer; user-select: none;
+        -webkit-user-select: none;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas,
+                     "DejaVu Sans Mono", monospace; }
+ #main { text-align: center; transition: opacity 0.6s; }
+ #time { font-size: 8.4vw; font-weight: 700; line-height: 1.1;
+         white-space: nowrap; color: var(--c);
+         text-shadow: 0 0 0.08em var(--c), 0 0 0.45em var(--c); }
+ #time .sup { font-size: 0.3em; vertical-align: 0.4em; margin-left: 0.4em;
+         opacity: 0.85; }
+ #date { margin-top: 1.4vw; font-size: 2.4vw; letter-spacing: 0.25em;
+         color: var(--c); opacity: 0.55; }
+ #alert { display: none; margin-top: 2.2vw; font-size: 2.8vw;
+         font-weight: 700; color: #f43;
+         text-shadow: 0 0 0.5em #f43; animation: pulse 1s infinite; }
+ @keyframes pulse { 50% { opacity: 0.35; } }
+ #footer { position: fixed; bottom: 2.5vh; left: 0; right: 0;
+         text-align: center; font-size: 1.5vw; letter-spacing: 0.08em;
+         color: #555; }
+ #bo { display: none; position: fixed; bottom: 2.5vh; right: 2vw;
+         color: #222; font-size: 1.4vw; }
+</style>
+</head>
+<body>
+<div id="main">
+ <div id="time">--:--:--</div>
+ <div id="date"></div>
+ <div id="alert"></div>
+</div>
+<div id="footer"></div>
+<div id="bo">blackout</div>
+
+<script>
+const CLS = {6:'GNSS locked',7:'holdover',13:'application specific',
+ 52:'degraded A',187:'degraded B',248:'default',255:'slave-only'};
+
+let S = null;          // settings (mode, formats, color, notify)
+let st = null;         // last status
+let base = null;       // extrapolation base
+
+async function loadSettings() {
+  try {
+    S = await fetch('/api/settings').then(r => r.json());
+    document.documentElement.style.setProperty('--c', S.color);
+  } catch (e) {}
+}
+
+function updateFooter(s) {
+  const a = document.getElementById('alert');
+  const showAlert = S && S.notify_gm_change &&
+      s.seconds_since_change >= 0 && s.seconds_since_change < 10;
+  a.style.display = showAlert ? 'block' : 'none';
+  if (showAlert) a.textContent = '! NEW GM !  ' + s.gm_id;
+
+  const f = document.getElementById('footer');
+  if (!s.gm_id) {
+    f.textContent = 'waiting for a PTP master...';
+    return;
+  }
+  const delay = s.path_delay_ns > 0
+      ? (s.path_delay_ns / 1000).toFixed(1) + ' µs' : '–';
+  const dom = s.domain === -1
+      ? (s.active_domain >= 0 ? s.active_domain + ' (auto)' : 'auto')
+      : s.domain;
+  f.textContent = 'GM ' + s.gm_id +
+      '   ·   class ' + s.clock_class +
+      (CLS[s.clock_class] ? ' (' + CLS[s.clock_class] + ')' : '') +
+      '   ·   path delay ' + delay +
+      '   ·   domain ' + dom;
+}
+
+async function poll() {
+  try {
+    const s = await fetch('/api/status').then(r => r.json());
+    st = s;
+    if (s.tai_sec < 0) {
+      base = null;
+    } else {
+      const perf = performance.now();
+      const cand = { sec: s.tai_sec, nsec: s.tai_nsec, perf,
+                     off: s.utc_offset,
+                     val: s.tai_sec * 1000 + s.tai_nsec / 1e6 - perf };
+      if (!base || cand.val > base.val || perf - base.perf > 30000) {
+        base = cand;
+      } else {
+        base.off = s.utc_offset;
+      }
+    }
+    updateFooter(s);
+  } catch (e) {}
+}
+
+function render() {
+  const el = document.getElementById('time');
+  const ed = document.getElementById('date');
+  const bl = st && st.blackout;
+  document.getElementById('main').style.opacity =
+      bl ? 0 : st ? 0.12 + 0.88 * st.brightness / 100 : 1;
+  document.getElementById('footer').style.opacity = bl ? 0 : 1;
+  document.getElementById('bo').style.display = bl ? 'block' : 'none';
+  if (!base || !S) {
+    el.textContent = '--:--:--';
+    ed.textContent = st && !st.have_ptp ? 'WAITING FOR PTP' : '';
+    return;
+  }
+  const mode = S.mode, h12 = S.time_format === '12', df = S.date_format;
+  const tz = mode === 'local' ? S.timezone : 'UTC';
+
+  const elapsed = performance.now() - base.perf;
+  const totalNs = base.nsec + elapsed * 1e6;
+  let sec = base.sec + Math.floor(totalNs / 1e9);
+  const frac = Math.floor(totalNs % 1e9);
+  if (mode !== 'tai') sec -= base.off;
+  const d = new Date(sec * 1000);
+  let p;
+  try {
+    p = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hourCycle: 'h23',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric'
+      }).formatToParts(d).reduce((a, x) => (a[x.type] = x.value, a), {});
+  } catch (e) {
+    el.textContent = '--:--:--';
+    ed.textContent = 'UNKNOWN TIME ZONE';
+    return;
+  }
+  let hh = p.hour, sup = '';
+  if (h12) {
+    let h = parseInt(hh, 10);
+    sup = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    hh = String(h).padStart(2, '0');
+  }
+  if (mode === 'tai') sup += (sup ? ' ' : '') + 'TAI';
+  el.innerHTML = hh + ':' + p.minute + ':' + p.second + '.' +
+      String(frac).padStart(9, '0') +
+      (sup ? '<span class="sup">' + sup + '</span>' : '');
+  const wd = p.weekday.toUpperCase();
+  ed.textContent = df === 'iso'
+      ? wd + ' ' + p.year + '-' + p.month + '-' + p.day
+      : df === 'mdy'
+        ? wd + ' ' + p.month + '/' + p.day + '/' + p.year
+        : wd + ' ' + p.day + '.' + p.month + '.' + p.year;
+}
+
+document.body.addEventListener('click', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+});
+
+(function tick() { render(); requestAnimationFrame(tick); })();
+loadSettings();
+poll();
+setInterval(poll, 2000);
+setInterval(loadSettings, 10000);
+</script>
+</body>
+</html>
+)CLOCK";
+
 static void send_response(int fd, const char *status,
                           const char *content_type, const std::string &body) {
     std::ostringstream resp;
@@ -1253,6 +1431,8 @@ static void handle_client(int fd) {
 
     if (method == "GET" && (path == "/" || path == "/index.html")) {
         send_response(fd, "200 OK", "text/html; charset=utf-8", kIndexHtml);
+    } else if (method == "GET" && path == "/clock") {
+        send_response(fd, "200 OK", "text/html; charset=utf-8", kClockHtml);
     } else if (method == "GET" && path == "/api/settings") {
         send_response(fd, "200 OK", "application/json", settings_json());
     } else if (method == "GET" && path == "/api/status") {
@@ -1362,6 +1542,11 @@ static void http_server_thread(int port) {
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     resolve_config_path();
+    // Container/first-run convenience: PTP_WALLCLOCK_IFACE sets the default
+    // interface; a saved setting from the web UI still wins.
+    const char *env_iface = getenv("PTP_WALLCLOCK_IFACE");
+    if (env_iface && *env_iface)
+        g_settings.iface = env_iface;
     load_settings();
     apply_timezone(g_settings.timezone);
 
@@ -1393,6 +1578,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+#ifndef NO_MATRIX
     // --- Matrix options ---
     RGBMatrix::Options matrix_options;
     RuntimeOptions runtime_opt;
@@ -1427,6 +1613,10 @@ int main(int argc, char **argv) {
         "/usr/share/fonts/rpi-rgb-led-matrix/4x6.bdf");
     if (!have_small_font)
         std::cerr << "4x6.bdf not found, second display line disabled\n";
+#else
+    std::cout << "Headless mode: the clock display is at /clock "
+                 "on the web interface\n";
+#endif
 
     signal(SIGINT, InterruptHandler);
     signal(SIGTERM, InterruptHandler);
@@ -1561,6 +1751,7 @@ int main(int argc, char **argv) {
             last_dreq_ns = now_ns;
         }
 
+#ifndef NO_MATRIX
         // Snapshot the settings + GM info for this frame
         Settings s;
         std::string id_line, detail_line;
@@ -1698,11 +1889,14 @@ int main(int argc, char **argv) {
         }
 
         offscreen = matrix->SwapOnVSync(offscreen);
+#endif  // NO_MATRIX
     }
 
     http_thread.join();
     close(sock_sync);
     close(sock_general);
+#ifndef NO_MATRIX
     delete matrix;
+#endif
     return 0;
 }

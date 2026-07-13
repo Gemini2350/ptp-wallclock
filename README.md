@@ -38,6 +38,8 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
   steps removed, time source, TAI−UTC offset, and measured path delay
 - Grandmaster change notification (web + red highlight on the matrix)
 - One-step installation with systemd service
+- Headless mode for Docker: a fullscreen browser clock (`/clock`) replaces
+  the LED panel
 - Runs entirely in user space, no kernel PTP support needed
 
 ---
@@ -85,6 +87,38 @@ If you prefer to build by hand (with the matrix library in
 make
 sudo ./ptp-clock
 ```
+
+### Docker — no LED hardware needed
+
+The clock also runs headless in a container: the PTP client and web
+interface are identical, and the LED panel is replaced by a fullscreen
+browser clock at `http://<host>:8080/clock` — glowing digits in the
+configured color with all nine fractional digits, date, grandmaster status
+line, and the GM change alert. Brightness and blackout from the settings
+page apply to it too. Click the page to go fullscreen.
+
+```bash
+docker compose up -d --build
+```
+
+or manually:
+
+```bash
+docker build -t ptp-wallclock .
+docker run -d --network host \
+    -v ptp-wallclock:/var/lib/ptp-wallclock \
+    -e PTP_WALLCLOCK_IFACE=eth0 \
+    --name ptp-wallclock ptp-wallclock
+```
+
+Notes:
+
+- `--network host` is required so the container receives the PTP multicast
+  on UDP 319/320 — this works on Linux hosts (Docker Desktop on
+  macOS/Windows does not pass host multicast through).
+- `PTP_WALLCLOCK_IFACE` sets the initial network interface; it can be
+  changed later in the web UI (the volume keeps the settings).
+- The same headless binary can be built without Docker: `make headless`.
 
 ---
 
