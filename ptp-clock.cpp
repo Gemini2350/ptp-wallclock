@@ -843,8 +843,8 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  #banner { display: none; background: #b33; color: #fff; padding: 0.6em;
         border-radius: 4px; margin-bottom: 1em; }
  #saved { color: #6c6; visibility: hidden; margin-left: 1em; }
- #clock { font-family: monospace; font-size: 2.2em; text-align: center;
-        color: #fd0; }
+ #clock { font-family: monospace; text-align: center; color: #fd0;
+        font-size: clamp(1em, 4.4vw, 1.8em); white-space: nowrap; }
  #clockdate { font-family: monospace; text-align: center; color: #aaa;
         margin-top: 0.2em; }
 </style>
@@ -1073,9 +1073,9 @@ function renderClock() {
       ? document.getElementById('timezone').value : 'UTC';
 
   const elapsed = performance.now() - clockBase.perf;
-  const totalMs = clockBase.nsec / 1e6 + elapsed;
-  let sec = clockBase.sec + Math.floor(totalMs / 1000);
-  const ms = Math.floor(totalMs % 1000);
+  const totalNs = clockBase.nsec + elapsed * 1e6;
+  let sec = clockBase.sec + Math.floor(totalNs / 1e9);
+  const frac = Math.floor(totalNs % 1e9);
   if (mode !== 'tai') sec -= clockBase.off;      // TAI -> UTC
 
   const d = new Date(sec * 1000);
@@ -1098,7 +1098,7 @@ function renderClock() {
     hh = String(h).padStart(2, '0');
   }
   el.textContent = hh + ':' + p.minute + ':' + p.second + '.' +
-      String(ms).padStart(3, '0') + suffix + (mode === 'tai' ? ' TAI' : '');
+      String(frac).padStart(9, '0') + suffix + (mode === 'tai' ? ' TAI' : '');
   const wd = p.weekday.toUpperCase();
   ed.textContent = df === 'iso'
       ? wd + ' ' + p.year + '-' + p.month + '-' + p.day
@@ -1106,7 +1106,10 @@ function renderClock() {
         ? wd + ' ' + p.month + '/' + p.day + '/' + p.year
         : wd + ' ' + p.day + '.' + p.month + '.' + p.year;
 }
-setInterval(renderClock, 50);
+(function clockTick() {
+  renderClock();
+  requestAnimationFrame(clockTick);
+})();
 
 const set = (id, text) => document.getElementById(id).textContent = text;
 let lastChanges = null;
