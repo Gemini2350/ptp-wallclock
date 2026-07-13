@@ -1,5 +1,8 @@
 # ptp-wallclock
 
+[![Docker](https://github.com/Gemini2350/ptp-wallclock/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/Gemini2350/ptp-wallclock/actions/workflows/docker-publish.yml)
+[![Docker Hub](https://img.shields.io/docker/pulls/gemini2350/ptp-wallclock)](https://hub.docker.com/r/gemini2350/ptp-wallclock)
+
 <p align="center"><img src="./clock2.png" alt="High-precision LED wall clock showing 19:05:37.23269755" width="800" height="auto"/></p>
 
 # ptp-wallclock
@@ -100,19 +103,24 @@ page apply to it too. Click the page to go fullscreen.
 
 <p align="center"><img src="./browser-clock.png" alt="Fullscreen browser clock showing 20:53:54.812497625 with grandmaster status line" width="800" height="auto"/></p>
 
+Prebuilt multi-arch images (amd64, arm64, arm/v7) are on Docker Hub as
+[`gemini2350/ptp-wallclock`](https://hub.docker.com/r/gemini2350/ptp-wallclock),
+built by CI from this repository:
+
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
 or manually:
 
 ```bash
-docker build -t ptp-wallclock .
 docker run -d --network host \
     -v ptp-wallclock:/var/lib/ptp-wallclock \
     -e PTP_WALLCLOCK_IFACE=eth0 \
-    --name ptp-wallclock ptp-wallclock
+    --name ptp-wallclock gemini2350/ptp-wallclock
 ```
+
+To build the image yourself instead: `docker build -t ptp-wallclock .`
 
 Notes:
 

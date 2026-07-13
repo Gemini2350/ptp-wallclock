@@ -1,6 +1,7 @@
 services:
   ptp-wallclock:
-    build: .
+    image: gemini2350/ptp-wallclock:latest
+    # build: .                  # uncomment to build locally instead
     network_mode: host          # required: PTP multicast on ports 319/320
     restart: unless-stopped
     volumes:
