@@ -90,7 +90,12 @@ sudo ./ptp-clock
 
 ## Web Interface
 
-The clock serves a settings page on `http://<pi-address>:8080` with:
+The clock serves a settings page on `http://<pi-address>:8080`. At the top
+it shows the current PTP time as a live, smoothly ticking clock (the server
+sends its TAI time with every status poll and the browser extrapolates in
+between; expect a few milliseconds of network offset). The clock follows the
+configured time mode and formats, so it mirrors what the LED matrix shows.
+Settings:
 
 - **Display color** — color picker for the LED matrix text
 - **Brightness** — 1–100 % slider, applied immediately

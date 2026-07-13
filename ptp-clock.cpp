@@ -116,6 +116,7 @@ static uint8_t g_clock_id[8] = {0};       // our clockIdentity (EUI-64 from MAC)
 // ---- Shared with the HTTP thread ----
 static std::atomic<bool> have_ptp_ref{false};
 static std::atomic<int16_t> current_utc_offset{0};
+static std::atomic<long long> g_offset_atomic{0};  // mirror of g_offset_ns
 static std::atomic<long long> g_path_delay_ns{0};
 static std::atomic<unsigned long long> g_last_sync_mono_ns{0};
 static std::atomic<uint32_t> g_dreq_sent{0};
@@ -413,6 +414,7 @@ static void complete_sync_pair(int64_t t1, int64_t t2) {
     } else {
         g_offset_ns += (sample - g_offset_ns) / 8;
     }
+    g_offset_atomic = g_offset_ns;
     g_last_sync_mono_ns = (uint64_t)t2;
     have_ptp_ref = true;
 }
@@ -756,7 +758,19 @@ static std::string status_json() {
         sync_age = (double)(now_ns - last_sync) / 1e9;
     }
 
+    // Current PTP time (TAI), split so the values stay exact in JS doubles
+    long long tai_sec = -1, tai_nsec = 0;
+    if (have_ptp_ref) {
+        long long tai = (long long)mono_ns() - g_offset_atomic.load();
+        if (tai > 0) {
+            tai_sec = tai / 1000000000LL;
+            tai_nsec = tai % 1000000000LL;
+        }
+    }
+
     j << "{\"have_ptp\":" << (have_ptp_ref ? "true" : "false") << ","
+      << "\"tai_sec\":" << tai_sec << ","
+      << "\"tai_nsec\":" << tai_nsec << ","
       << "\"blackout\":" << (g_settings.blackout ? "true" : "false") << ","
       << "\"sync_age\":" << sync_age << ","
       << "\"domain\":" << g_domain.load() << ","
@@ -829,11 +843,21 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  #banner { display: none; background: #b33; color: #fff; padding: 0.6em;
         border-radius: 4px; margin-bottom: 1em; }
  #saved { color: #6c6; visibility: hidden; margin-left: 1em; }
+ #clock { font-family: monospace; font-size: 2.2em; text-align: center;
+        color: #fd0; }
+ #clockdate { font-family: monospace; text-align: center; color: #aaa;
+        margin-top: 0.2em; }
 </style>
 </head>
 <body>
 <h1>PTP Wallclock &ndash; Settings</h1>
 <div id="banner"></div>
+
+<fieldset>
+<legend>PTP time</legend>
+<div id="clock">--:--:--</div>
+<div id="clockdate"></div>
+</fieldset>
 
 <fieldset>
 <legend>Status</legend>
@@ -1031,11 +1055,80 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   }
 });
 
+// Live PTP clock: the server sends TAI at poll time, the browser
+// extrapolates in between and renders in the configured mode/format.
+let clockBase = null;   // {sec, nsec, perf, off}
+function renderClock() {
+  const el = document.getElementById('clock');
+  const ed = document.getElementById('clockdate');
+  if (!clockBase) {
+    el.textContent = '--:--:--';
+    ed.textContent = '';
+    return;
+  }
+  const mode = document.querySelector('input[name=mode]:checked').value;
+  const h12 = document.getElementById('time_format').value === '12';
+  const df = document.getElementById('date_format').value;
+  let tz = mode === 'local'
+      ? document.getElementById('timezone').value : 'UTC';
+
+  const elapsed = performance.now() - clockBase.perf;
+  const totalMs = clockBase.nsec / 1e6 + elapsed;
+  let sec = clockBase.sec + Math.floor(totalMs / 1000);
+  const ms = Math.floor(totalMs % 1000);
+  if (mode !== 'tai') sec -= clockBase.off;      // TAI -> UTC
+
+  const d = new Date(sec * 1000);
+  let p;
+  try {
+    p = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hourCycle: 'h23',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric'
+      }).formatToParts(d).reduce((a, x) => (a[x.type] = x.value, a), {});
+  } catch (e) {                                  // unknown time zone
+    el.textContent = '--:--:--';
+    ed.textContent = 'unknown time zone: ' + tz;
+    return;
+  }
+  let hh = p.hour, suffix = '';
+  if (h12) {
+    let h = parseInt(hh, 10);
+    suffix = h >= 12 ? ' PM' : ' AM';
+    h = h % 12 || 12;
+    hh = String(h).padStart(2, '0');
+  }
+  el.textContent = hh + ':' + p.minute + ':' + p.second + '.' +
+      String(ms).padStart(3, '0') + suffix + (mode === 'tai' ? ' TAI' : '');
+  const wd = p.weekday.toUpperCase();
+  ed.textContent = df === 'iso'
+      ? wd + ' ' + p.year + '-' + p.month + '-' + p.day
+      : df === 'mdy'
+        ? wd + ' ' + p.month + '/' + p.day + '/' + p.year
+        : wd + ' ' + p.day + '.' + p.month + '.' + p.year;
+}
+setInterval(renderClock, 50);
+
 const set = (id, text) => document.getElementById(id).textContent = text;
 let lastChanges = null;
 async function poll() {
   try {
     const s = await fetch('/api/status').then(r => r.json());
+    if (s.tai_sec < 0) {
+      clockBase = null;
+    } else {
+      // Client-side delays only make the clock late, never early: keep
+      // the base implying the latest time, force-refresh every 30 s.
+      const perf = performance.now();
+      const cand = { sec: s.tai_sec, nsec: s.tai_nsec, perf,
+                     off: s.utc_offset,
+                     val: s.tai_sec * 1000 + s.tai_nsec / 1e6 - perf };
+      if (!clockBase || cand.val > clockBase.val ||
+          perf - clockBase.perf > 30000) {
+        clockBase = cand;
+      } else {
+        clockBase.off = s.utc_offset;
+      }
+    }
     set('s_ptp', s.have_ptp
         ? 'synchronized (sync ' + s.sync_age.toFixed(1) + ' s ago)'
         : 'waiting for PTP...');
