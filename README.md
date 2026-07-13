@@ -154,8 +154,11 @@ Settings:
 - **Network interface** — selectable from the interfaces present on the
   system, applied without restart
 - **Grandmaster change notification** — when enabled, a grandmaster change
-  shows `! NEW GM !` in red on the matrix for 10 seconds and triggers a
-  browser notification / banner on the settings page
+  shows `! NEW GM !` in red on the matrix (and on the browser clock) for
+  10 seconds and triggers a browser notification / banner on the settings
+  page:
+
+<p align="center"><img src="./browser-clock2.png" alt="Browser clock showing the red NEW GM alert after a grandmaster change" width="800" height="auto"/></p>
 
 The status panel shows live data decoded from the Announce messages
 (grandmaster identity, priorities, clock class/accuracy/variance, steps
