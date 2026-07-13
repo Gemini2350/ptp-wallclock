@@ -22,6 +22,11 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
   Delay_Resp measure the network path delay, and the displayed time is
   corrected accordingly (correction fields included, one-step and two-step
   masters supported)
+- Best Master Clock Algorithm (BMCA): every master announcing in the domain
+  is tracked, the best one is elected via the IEEE 1588 dataset comparison
+  (priority 1, clock class, accuracy, variance, priority 2, identity — and
+  steps removed for redundant paths to the same grandmaster). Announce
+  receipt timeouts are honored, so the clock fails over automatically
 - Automatic PTP domain detection (locks onto the first domain with Announce
   traffic, rescans on timeout), or a fixed domain 0–255
 - Displays time on an RGB LED matrix (UTC, TAI, or local time zone)
@@ -108,7 +113,9 @@ The clock serves a settings page on `http://<pi-address>:8080` with:
 The status panel shows live data decoded from the Announce messages
 (grandmaster identity, priorities, clock class/accuracy/variance, steps
 removed, time source), the TAI−UTC offset, and the measured mean path delay
-with a Delay_Req/Delay_Resp counter.
+with a Delay_Req/Delay_Resp counter. A separate table lists all masters
+currently visible in the domain with the BMCA-elected one marked — handy for
+watching a failover happen.
 
 > Note: browser push notifications require the page to be allowed to notify;
 > on plain HTTP some browsers only show the in-page banner.
@@ -162,9 +169,6 @@ with a small exponential filter.
 [Excuse me, what precise time is It?](https://media.ccc.de/v/39c3-excuse-me-what-precise-time-is-it).
 
 ## Open Issues
-
-- Best Master Clock Algorithm (BMCA) is not implemented. The clock passively
-  follows whichever master is sending Sync in the configured domain.
 
 - PTPv1 (IEEE 1588-2002) is not supported. The implementation targets PTPv2
   (IEEE 1588-2008) only.

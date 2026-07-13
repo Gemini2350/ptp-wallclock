@@ -23,6 +23,7 @@
 #include <fstream>
 #include <map>
 #include <vector>
+#include <cmath>
 
 using namespace rgb_matrix;
 
@@ -64,10 +65,22 @@ struct GMInfo {
     uint16_t steps_removed = 0;
     uint8_t time_source = 0;
 };
-static GMInfo g_gm;                       // guarded by g_mutex
+static GMInfo g_gm;                       // elected master, guarded by g_mutex
 static bool g_have_gm = false;
 static uint32_t g_gm_changes = 0;
 static timespec g_last_gm_change{};       // CLOCK_MONOTONIC_RAW
+
+// ---- BMCA: all masters seen announcing in the domain ----
+struct ForeignMaster {
+    uint8_t sender[10];                   // sourcePortIdentity of the Announce
+    GMInfo gm;                            // advertised grandmaster dataset
+    uint64_t last_seen = 0;               // mono ns
+    uint64_t timeout_ns = 3000000000ULL;  // 3 x announce interval
+    bool elected = false;
+};
+static std::vector<ForeignMaster> g_masters;   // guarded by g_mutex
+static bool g_have_master = false;             // main thread
+static uint8_t g_elected_sender[10] = {0};     // main thread
 
 // ---- PTP client state (main thread only) ----
 struct PendingSync {
@@ -263,6 +276,8 @@ static void reset_ptp_state() {
     g_last_announce_mono_ns = 0;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_have_gm = false;
+    g_masters.clear();
+    g_have_master = false;
 }
 
 // Domain filter. In auto mode (-1) the first Announce locks the domain.
@@ -289,6 +304,89 @@ static uint8_t effective_domain() {
         return (uint8_t)cfg;
     int active = g_active_domain.load();
     return active >= 0 ? (uint8_t)active : 0;
+}
+
+// BMCA dataset comparison (IEEE 1588-2008 9.3.4, single-port slave).
+// Negative: a is better. Zero: tie (caller breaks it by sender identity).
+static int compare_datasets(const GMInfo &a, const GMInfo &b) {
+    if (memcmp(a.id, b.id, 8) != 0) {
+        if (a.priority1 != b.priority1)
+            return (int)a.priority1 - (int)b.priority1;
+        if (a.clock_class != b.clock_class)
+            return (int)a.clock_class - (int)b.clock_class;
+        if (a.clock_accuracy != b.clock_accuracy)
+            return (int)a.clock_accuracy - (int)b.clock_accuracy;
+        if (a.variance != b.variance)
+            return (int)a.variance - (int)b.variance;
+        if (a.priority2 != b.priority2)
+            return (int)a.priority2 - (int)b.priority2;
+        return memcmp(a.id, b.id, 8);
+    }
+    // Same grandmaster via different paths: prefer fewer hops
+    return (int)a.steps_removed - (int)b.steps_removed;
+}
+
+// Prune masters whose announces timed out, elect the best remaining one,
+// and handle the bookkeeping when the election result changes.
+// Call with g_mutex held, from the main thread only.
+static void bmca_elect_locked(uint64_t now) {
+    for (auto it = g_masters.begin(); it != g_masters.end();) {
+        if (now - it->last_seen > it->timeout_ns)
+            it = g_masters.erase(it);
+        else
+            ++it;
+    }
+
+    int best = -1;
+    for (size_t i = 0; i < g_masters.size(); ++i) {
+        if (best < 0) {
+            best = (int)i;
+            continue;
+        }
+        int c = compare_datasets(g_masters[i].gm, g_masters[best].gm);
+        if (c < 0 || (c == 0 && memcmp(g_masters[i].sender,
+                                       g_masters[best].sender, 10) < 0))
+            best = (int)i;
+    }
+    for (size_t i = 0; i < g_masters.size(); ++i)
+        g_masters[i].elected = ((int)i == best);
+
+    if (best < 0) {
+        if (g_have_master) {
+            g_have_master = false;
+            g_have_gm = false;
+            g_pending_sync.valid = false;
+            std::cout << "PTP master lost (announce timeout)\n";
+        }
+        return;
+    }
+
+    const ForeignMaster &m = g_masters[best];
+    if (g_have_master && memcmp(g_elected_sender, m.sender, 10) == 0)
+        return;                           // no change
+
+    bool gm_changed = g_have_gm && memcmp(g_gm.id, m.gm.id, 8) != 0;
+    memcpy(g_elected_sender, m.sender, 10);
+    g_have_master = true;
+    if (gm_changed) {
+        std::string old_gm = format_gm(g_gm.id);
+        g_gm_changes++;
+        clock_gettime(CLOCK_MONOTONIC_RAW, &g_last_gm_change);
+        std::cout << "Grandmaster change: " << old_gm
+                  << " -> " << format_gm(m.gm.id) << "\n";
+    } else if (!g_have_gm) {
+        std::cout << "Grandmaster: " << format_gm(m.gm.id) << "\n";
+    } else {
+        std::cout << "PTP parent changed (same grandmaster)\n";
+    }
+    g_gm = m.gm;
+    g_have_gm = true;
+
+    // New sync path: restart pending state and re-measure the path delay
+    g_pending_sync.valid = false;
+    g_pending_dreq.valid = false;
+    g_have_mpd = false;
+    g_path_delay_ns = 0;
 }
 
 // A (t1, t2) pair is complete: update the offset estimate.
@@ -318,6 +416,10 @@ static void process_event_packet(const uint8_t *buf, ssize_t len,
     if (msg_type != 0x00)                 // only Sync
         return;
 
+    // BMCA: only accept Sync from the elected master
+    if (!g_have_master || memcmp(buf + 20, g_elected_sender, 10) != 0)
+        return;
+
     uint16_t seq = (buf[30] << 8) | buf[31];
     bool two_step = buf[6] & 0x02;
     int64_t corr = corr_to_ns(buf + 8);
@@ -343,33 +445,55 @@ static void process_general_packet(const uint8_t *buf, ssize_t len,
     if (!domain_ok(buf[4], msg_type == 0x0B))
         return;
 
-    // --- Announce (0x0B): UTC offset, grandmaster identity + quality ---
+    // --- Announce (0x0B): feed the BMCA master list ---
     if (msg_type == 0x0B && len >= 64) {
         g_last_announce_mono_ns = now_mono;
-        uint16_t flags = (buf[6] << 8) | buf[7];
-        if ((flags & 0x0008) && (flags & 0x0004)) {
-            current_utc_offset = (int16_t)((buf[44] << 8) | buf[45]);
-        }
+
+        GMInfo gm;
+        memcpy(gm.id, buf + 53, 8);
+        gm.priority1 = buf[47];
+        gm.clock_class = buf[48];
+        gm.clock_accuracy = buf[49];
+        gm.variance = (buf[50] << 8) | buf[51];
+        gm.priority2 = buf[52];
+        gm.steps_removed = (buf[61] << 8) | buf[62];
+        gm.time_source = buf[63];
+
+        // Announce receipt timeout: 3 x announce interval (from the
+        // logMessageInterval field), clamped to [1 s, 30 s]
+        int8_t log_itv = (int8_t)buf[33];
+        if (log_itv < -4) log_itv = -4;
+        if (log_itv > 6) log_itv = 6;
+        uint64_t timeout = (uint64_t)(3e9 * ldexp(1.0, log_itv));
+        if (timeout < 1000000000ULL) timeout = 1000000000ULL;
+        if (timeout > 30000000000ULL) timeout = 30000000000ULL;
 
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_have_gm && memcmp(g_gm.id, buf + 53, 8) != 0) {
-            std::string old_gm = format_gm(g_gm.id);
-            g_gm_changes++;
-            clock_gettime(CLOCK_MONOTONIC_RAW, &g_last_gm_change);
-            std::cout << "Grandmaster change: " << old_gm
-                      << " -> " << format_gm(buf + 53) << "\n";
-        } else if (!g_have_gm) {
-            std::cout << "Grandmaster: " << format_gm(buf + 53) << "\n";
+        ForeignMaster *fm = nullptr;
+        for (auto &m : g_masters) {
+            if (memcmp(m.sender, buf + 20, 10) == 0) {
+                fm = &m;
+                break;
+            }
         }
-        memcpy(g_gm.id, buf + 53, 8);
-        g_gm.priority1 = buf[47];
-        g_gm.clock_class = buf[48];
-        g_gm.clock_accuracy = buf[49];
-        g_gm.variance = (buf[50] << 8) | buf[51];
-        g_gm.priority2 = buf[52];
-        g_gm.steps_removed = (buf[61] << 8) | buf[62];
-        g_gm.time_source = buf[63];
-        g_have_gm = true;
+        if (!fm) {
+            g_masters.push_back(ForeignMaster{});
+            fm = &g_masters.back();
+            memcpy(fm->sender, buf + 20, 10);
+        }
+        fm->gm = gm;
+        fm->last_seen = now_mono;
+        fm->timeout_ns = timeout;
+
+        bmca_elect_locked(now_mono);
+
+        // Data from the elected master only
+        if (g_have_master && memcmp(g_elected_sender, buf + 20, 10) == 0) {
+            g_gm = gm;
+            uint16_t flags = (buf[6] << 8) | buf[7];
+            if ((flags & 0x0008) && (flags & 0x0004))
+                current_utc_offset = (int16_t)((buf[44] << 8) | buf[45]);
+        }
     }
     // --- Follow_Up (0x08): precise origin timestamp (t1) ---
     else if (msg_type == 0x08) {
@@ -639,8 +763,19 @@ static std::string status_json() {
       << "\"dreq_sent\":" << g_dreq_sent.load() << ","
       << "\"dresp_received\":" << g_dresp_received.load() << ","
       << "\"gm_changes\":" << g_gm_changes << ","
-      << "\"seconds_since_change\":" << since_change
-      << "}";
+      << "\"seconds_since_change\":" << since_change << ","
+      << "\"masters\":[";
+    for (size_t i = 0; i < g_masters.size(); ++i) {
+        const ForeignMaster &m = g_masters[i];
+        j << (i ? "," : "")
+          << "{\"gm_id\":\"" << format_gm(m.gm.id) << "\","
+          << "\"priority1\":" << (int)m.gm.priority1 << ","
+          << "\"priority2\":" << (int)m.gm.priority2 << ","
+          << "\"clock_class\":" << (int)m.gm.clock_class << ","
+          << "\"steps_removed\":" << m.gm.steps_removed << ","
+          << "\"elected\":" << (m.elected ? "true" : "false") << "}";
+    }
+    j << "]}";
     return j.str();
 }
 
@@ -668,6 +803,13 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  table.status { width: 100%; font-size: 0.9em; border-collapse: collapse; }
  table.status td { padding: 0.15em 0.3em; color: #aaa; }
  table.status td + td { color: #eee; text-align: right; font-family: monospace; }
+ table.masters { width: 100%; font-size: 0.85em; border-collapse: collapse;
+        font-family: monospace; }
+ table.masters th { color: #888; font-weight: normal; text-align: right;
+        padding: 0.15em 0.3em; }
+ table.masters td { color: #eee; text-align: right; padding: 0.15em 0.3em; }
+ table.masters th:first-child, table.masters td:first-child { text-align: left; }
+ table.masters tr.elected td { color: #6c6; }
  #banner { display: none; background: #b33; color: #fff; padding: 0.6em;
         border-radius: 4px; margin-bottom: 1em; }
  #saved { color: #6c6; visibility: hidden; margin-left: 1em; }
@@ -694,6 +836,11 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  <tr><td>Path delay</td><td id="s_delay">&ndash;</td></tr>
  <tr><td>GM changes</td><td id="s_changes">0</td></tr>
 </table>
+</fieldset>
+
+<fieldset>
+<legend>Visible masters (BMCA)</legend>
+<table class="masters" id="masters"><tr><td>none</td></tr></table>
 </fieldset>
 
 <form id="form">
@@ -867,6 +1014,15 @@ async function poll() {
           ? 'no response (' + s.dreq_sent + ' requests)'
           : '–');
     set('s_changes', s.gm_changes);
+    document.getElementById('masters').innerHTML = s.masters.length
+      ? '<tr><th>Grandmaster</th><th>P1</th><th>P2</th><th>Class</th>' +
+        '<th>Steps</th><th></th></tr>' +
+        s.masters.map(m =>
+          '<tr' + (m.elected ? ' class="elected"' : '') + '><td>' + m.gm_id +
+          '</td><td>' + m.priority1 + '</td><td>' + m.priority2 +
+          '</td><td>' + m.clock_class + '</td><td>' + m.steps_removed +
+          '</td><td>' + (m.elected ? '&#9733;' : '') + '</td></tr>').join('')
+      : '<tr><td>none</td></tr>';
     if (lastChanges !== null && s.gm_changes > lastChanges &&
         document.getElementById('notify').checked) {
       const msg = 'PTP grandmaster change! New GM: ' + s.gm_id;
@@ -1140,6 +1296,7 @@ int main(int argc, char **argv) {
     std::thread http_thread(http_server_thread, g_settings.http_port);
 
     uint64_t last_dreq_ns = 0;
+    uint64_t last_bmca_ns = 0;
     uint32_t joined_ip = 0;               // iface IP we joined multicast on
     uint64_t next_join_try_ns = 0;
     bool join_warned = false;
@@ -1219,6 +1376,13 @@ int main(int argc, char **argv) {
                 std::cout << "PTP domain lost, rescanning...\n";
                 reset_ptp_state();
             }
+        }
+
+        // --- BMCA housekeeping: drop masters that stopped announcing ---
+        if (now_ns - last_bmca_ns >= 1000000000ULL) {
+            last_bmca_ns = now_ns;
+            std::lock_guard<std::mutex> lock(g_mutex);
+            bmca_elect_locked(now_ns);
         }
 
         // --- Delay_Req once per second ---
