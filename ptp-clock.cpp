@@ -726,6 +726,24 @@ static std::string settings_json() {
     return j.str();
 }
 
+// Favicon: an LED-style clock face (served at /favicon.svg)
+static const char *kFaviconSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+ <rect width="64" height="64" rx="14" fill="#0b0b0b"/>
+ <circle cx="32" cy="32" r="23" fill="none" stroke="#ffc400" stroke-width="4"/>
+ <g stroke="#ffc400" stroke-width="3" stroke-linecap="round" opacity="0.55">
+  <line x1="32" y1="13" x2="32" y2="17"/>
+  <line x1="32" y1="47" x2="32" y2="51"/>
+  <line x1="13" y1="32" x2="17" y2="32"/>
+  <line x1="47" y1="32" x2="51" y2="32"/>
+ </g>
+ <g stroke="#ffc400" stroke-linecap="round" stroke-width="4.5">
+  <line x1="32" y1="32" x2="24" y2="24"/>
+  <line x1="32" y1="32" x2="42" y2="21"/>
+ </g>
+ <circle cx="32" cy="32" r="3.2" fill="#ffc400"/>
+</svg>
+)SVG";
+
 static std::string status_json() {
     std::lock_guard<std::mutex> lock(g_mutex);
     std::ostringstream j;
@@ -798,6 +816,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PTP Wallclock</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
  body { font-family: sans-serif; background: #1a1a1a; color: #eee;
         max-width: 520px; margin: 2em auto; padding: 0 1em; }
@@ -829,6 +848,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  #banner { display: none; background: #b33; color: #fff; padding: 0.6em;
         border-radius: 4px; margin-bottom: 1em; }
  #saved { color: #6c6; visibility: hidden; margin-left: 1em; }
+ .hint { color: #888; font-size: 0.85em; margin: 0.8em 0 0.2em; }
  #clock { font-family: monospace; text-align: center; color: #fd0;
         font-size: clamp(1em, 4.4vw, 1.8em); white-space: nowrap; }
  a { color: #7ab; }
@@ -882,6 +902,9 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <label>Brightness: <span id="bval">100</span> %
  <input type="range" id="brightness" min="1" max="100" value="100">
 </label>
+<p class="hint">The 2nd-line options below only affect the physical LED
+matrix &mdash; the <a href="/clock">browser clock</a> always shows its own
+date and status line:</p>
 <label>
  <input type="checkbox" id="show_gm"> Show grandmaster ID (2nd line)
 </label>
@@ -1210,6 +1233,7 @@ static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PTP Clock</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
  :root { --c: #ffff00; }
  html, body { height: 100%; margin: 0; background: #000; }
@@ -1219,7 +1243,7 @@ static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
         font-family: ui-monospace, "SF Mono", Menlo, Consolas,
                      "DejaVu Sans Mono", monospace; }
  #main { text-align: center; transition: opacity 0.6s; }
- #time { font-size: min(8.4vw, 24vh); font-weight: 700; line-height: 1.1;
+ #time { font-size: min(8.5vw, 55vh); font-weight: 700; line-height: 1.1;
          white-space: nowrap; color: var(--c);
          text-shadow: 0 0 0.08em var(--c), 0 0 0.45em var(--c); }
  #time .sup { font-size: 0.3em; vertical-align: 0.4em; margin-left: 0.4em;
@@ -1231,16 +1255,17 @@ static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
          text-shadow: 0 0 0.5em #f43; animation: pulse 1s infinite; }
  @keyframes pulse { 50% { opacity: 0.35; } }
  #footer { position: fixed; bottom: 2.5vh; left: 0; right: 0;
-         text-align: center; font-size: min(1.5vw, 4.5vh);
-         letter-spacing: 0.08em; color: #555; }
+         text-align: center; font-size: min(1.3vw, 4vh);
+         letter-spacing: 0.05em; color: #555; }
  #bo { display: none; position: fixed; bottom: 2.5vh; right: 2vw;
          color: #222; font-size: 1.4vw; }
  #cfg { position: fixed; top: 2.5vh; right: 2vw; color: #2a2a2a;
          font-size: 1.6em; text-decoration: none; }
  #cfg:hover { color: #9ab; }
- /* Small windows: only the time fits comfortably */
+ /* Small windows: hide date + status line and let the time take the room */
  @media (max-width: 480px), (max-height: 300px) {
    #date, #footer { display: none; }
+   #time { font-size: min(8.5vw, 72vh); }
  }
 </style>
 </head>
@@ -1257,6 +1282,10 @@ static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
 <script>
 const CLS = {6:'GNSS locked',7:'holdover',13:'application specific',
  52:'degraded A',187:'degraded B',248:'default',255:'slave-only'};
+const ACC = {0x20:'25 ns',0x21:'100 ns',0x22:'250 ns',0x23:'1 µs',
+ 0x24:'2.5 µs',0x25:'10 µs',0x26:'25 µs',0x27:'100 µs',0x28:'250 µs',
+ 0x29:'1 ms',0x2A:'2.5 ms',0x2B:'10 ms',0x2C:'25 ms',0x2D:'100 ms',
+ 0x2E:'250 ms',0x2F:'1 s',0x30:'10 s',0x31:'>10 s'};
 
 // Digits finer than the browser timer resolution are dithered every frame
 // (see the settings page clock for the same trick)
@@ -1298,15 +1327,14 @@ function updateFooter(s) {
     f.textContent = 'waiting for a PTP master...';
     return;
   }
-  const delay = s.path_delay_ns > 0
-      ? (s.path_delay_ns / 1000).toFixed(1) + ' µs' : '–';
   const dom = s.domain === -1
       ? (s.active_domain >= 0 ? s.active_domain + ' (auto)' : 'auto')
       : s.domain;
   f.textContent = 'GM ' + s.gm_id +
+      '   ·   priority ' + s.priority1 + '/' + s.priority2 +
       '   ·   class ' + s.clock_class +
       (CLS[s.clock_class] ? ' (' + CLS[s.clock_class] + ')' : '') +
-      '   ·   path delay ' + delay +
+      '   ·   accuracy ' + (ACC[s.clock_accuracy] || 'unknown') +
       '   ·   domain ' + dom;
 }
 
@@ -1461,6 +1489,9 @@ static void handle_client(int fd) {
         send_response(fd, "200 OK", "text/html; charset=utf-8", kIndexHtml);
     } else if (method == "GET" && path == "/clock") {
         send_response(fd, "200 OK", "text/html; charset=utf-8", kClockHtml);
+    } else if (method == "GET" &&
+               (path == "/favicon.svg" || path == "/favicon.ico")) {
+        send_response(fd, "200 OK", "image/svg+xml", kFaviconSvg);
     } else if (method == "GET" && path == "/api/settings") {
         send_response(fd, "200 OK", "application/json", settings_json());
     } else if (method == "GET" && path == "/api/status") {
