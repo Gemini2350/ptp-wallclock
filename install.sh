@@ -54,4 +54,4 @@ echo
 echo "Done. The clock starts automatically on boot."
 echo "  Status:   systemctl status ptp-wallclock"
 echo "  Logs:     journalctl -u ptp-wallclock -f"
-echo "  Settings: http://${IP:-<pi-address>}:8080"
+echo "  Settings: http://${IP:-<pi-address>}:8319"

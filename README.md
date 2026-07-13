@@ -37,7 +37,7 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
 - Optional second display line: date, grandmaster ID and/or priorities &
   clock quality (alternating every 4 seconds)
 - Grandmaster changes are shown on the display itself ("! NEW GM !")
-- Built-in web interface (port 8080) for settings and live status —
+- Built-in web interface (port 8319) for settings and live status —
   grandmaster identity, priority 1/2, clock class, clock accuracy, variance,
   steps removed, time source, TAI−UTC offset, and measured path delay
 - Grandmaster change notification (web + red highlight on the matrix)
@@ -85,7 +85,7 @@ systemctl status ptp-wallclock     # service status
 journalctl -u ptp-wallclock -f     # logs
 ```
 
-The settings page is served on `http://<pi-address>:8080`.
+The settings page is served on `http://<pi-address>:8319`.
 
 ### Manual build
 
@@ -101,7 +101,7 @@ sudo ./ptp-clock
 
 The clock also runs headless in a container: the PTP client and web
 interface are identical, and the LED panel is replaced by a fullscreen
-browser clock at `http://<host>:8080/clock` — glowing digits in the
+browser clock at `http://<host>:8319/clock` — glowing digits in the
 configured color with all nine fractional digits, date, grandmaster status
 line, and the GM change alert. Brightness and blackout from the settings
 page apply to it too. Click the page to go fullscreen.
@@ -140,7 +140,7 @@ Notes:
 
 ## Web Interface
 
-The clock serves a settings page on `http://<pi-address>:8080`. At the top
+The clock serves a settings page on `http://<pi-address>:8319`. At the top
 it shows the current PTP time as a live, smoothly ticking clock with all
 nine fractional digits, just like the matrix (the server sends its TAI time
 with every status poll and the browser extrapolates in between; expect a few
@@ -195,7 +195,7 @@ in the file (restart required):
 
 | Key         | Default | Meaning                              |
 |-------------|---------|--------------------------------------|
-| `http_port` | `8080`  | Port of the web interface            |
+| `http_port` | `8319`  | Port of the web interface            |
 
 The network interface (`iface`, default `eth0`) can be changed in the web
 interface — the clock leaves the multicast group on the old interface and

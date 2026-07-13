@@ -1,5 +1,5 @@
 # Headless PTP wallclock: no LED hardware, the clock display is served
-# in the browser at http://<host>:8080/clock
+# in the browser at http://<host>:8319/clock
 #
 # PTP multicast needs the host network stack:
 #   docker build -t ptp-wallclock .
@@ -24,5 +24,5 @@ RUN apt-get update \
  && mkdir -p /var/lib/ptp-wallclock
 COPY --from=build /src/ptp-clock /usr/local/bin/ptp-clock
 WORKDIR /var/lib/ptp-wallclock
-EXPOSE 8080
+EXPOSE 8319
 CMD ["ptp-clock"]

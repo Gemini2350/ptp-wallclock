@@ -55,7 +55,7 @@ struct Settings {
     int time_format = 24;                 // 24 or 12 (AM/PM)
     int date_format = DATE_DMY;           // DD.MM.YYYY / ISO / MM/DD/YYYY
     bool notify_gm_change = false;        // notify on grandmaster change
-    int http_port = 8080;
+    int http_port = 8319;
     int domain = -1;                      // PTP domain, -1 = auto detect
     std::string iface = "eth0";           // network interface
 };
