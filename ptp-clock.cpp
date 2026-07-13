@@ -57,12 +57,13 @@ struct Settings {
     bool notify_gm_change = false;        // notify on grandmaster change
     int http_port = 8319;
     int domain = -1;                      // PTP domain, -1 = auto detect
-    std::string iface = "eth0";           // network interface
+    std::string iface = "auto";           // interface, "auto" = all of them
 };
 
 static Settings g_settings;
 static std::mutex g_mutex;                // guards g_settings and GM state
 static std::string g_config_path = "ptp-wallclock.conf";
+static std::string g_joined_names;        // joined ifaces, guarded by g_mutex
 
 // ---- Grandmaster info from Announce messages ----
 struct GMInfo {
@@ -644,37 +645,14 @@ static void init_clock_identity(int sock, const std::string &iface) {
     g_clock_id[7] = pid & 0xFF;
 }
 
-// Join the PTP multicast group on the given interface (returns its IP,
-// 0 if the interface has no IPv4 address yet). Also (re-)derives our
-// clock identity and sets the outgoing multicast interface.
-static uint32_t join_ptp_multicast(int sock_event, int sock_gen,
-                                   const std::string &ifname) {
-    uint32_t ip = get_iface_ip(ifname);
-    if (ip == 0)
-        return 0;
-
+// Add/drop the PTP multicast membership on one interface (both sockets).
+// op is IP_ADD_MEMBERSHIP or IP_DROP_MEMBERSHIP.
+static void membership(int sock_event, int sock_gen, uint32_t ip, int op) {
     ip_mreq mreq{};
     mreq.imr_multiaddr.s_addr = inet_addr("224.0.1.129");
     mreq.imr_interface.s_addr = ip;
-    setsockopt(sock_event, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
-    setsockopt(sock_gen, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
-
-    in_addr mif{};
-    mif.s_addr = ip;
-    setsockopt(sock_event, IPPROTO_IP, IP_MULTICAST_IF, &mif, sizeof(mif));
-
-    init_clock_identity(sock_event, ifname);
-    std::cout << "PTP multicast joined on " << ifname
-              << ", clock identity " << format_gm(g_clock_id) << "\n";
-    return ip;
-}
-
-static void leave_ptp_multicast(int sock_event, int sock_gen, uint32_t ip) {
-    ip_mreq mreq{};
-    mreq.imr_multiaddr.s_addr = inet_addr("224.0.1.129");
-    mreq.imr_interface.s_addr = ip;
-    setsockopt(sock_event, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
-    setsockopt(sock_gen, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
+    setsockopt(sock_event, IPPROTO_IP, op, &mreq, sizeof(mreq));
+    setsockopt(sock_gen, IPPROTO_IP, op, &mreq, sizeof(mreq));
 }
 
 // ---- Minimal HTTP server ----
@@ -783,6 +761,7 @@ static std::string status_json() {
       << "\"domain\":" << g_domain.load() << ","
       << "\"active_domain\":" << g_active_domain.load() << ","
       << "\"iface\":\"" << json_escape(g_settings.iface) << "\","
+      << "\"iface_active\":\"" << json_escape(g_joined_names) << "\","
       << "\"iface_up\":" << (g_iface_up ? "true" : "false") << ","
       << "\"gm_id\":\"" << (g_have_gm ? format_gm(g_gm.id) : "") << "\","
       << "\"priority1\":" << (int)g_gm.priority1 << ","
@@ -1030,7 +1009,7 @@ async function loadSettings() {
   syncDomainInput();
   document.getElementById('iface').value = s.iface;
   document.getElementById('iflist').innerHTML =
-      s.ifaces.map(i => '<option value="' + i + '">').join('');
+      ['auto'].concat(s.ifaces).map(i => '<option value="' + i + '">').join('');
   document.getElementById('time_format').value = s.time_format;
   document.getElementById('date_format').value = s.date_format;
   document.querySelector('input[name=mode][value="' + s.mode + '"]').checked = true;
@@ -1065,6 +1044,24 @@ document.getElementById('form').addEventListener('submit', async (e) => {
 
 // Live PTP clock: the server sends TAI at poll time, the browser
 // extrapolates in between and renders in the configured mode/format.
+// Digits finer than the browser timer resolution (performance.now() is
+// coarsened to 0.1-1 ms for privacy) would freeze between polls, so they
+// are dithered every frame — like the unreadably fast digits on the LED.
+let quantumNs = 1e6;
+(function () {
+  let last = performance.now(), min = Infinity, seen = 0;
+  for (let i = 0; i < 20000 && seen < 20; i++) {
+    const t = performance.now();
+    if (t > last) { min = Math.min(min, t - last); seen++; }
+    last = t;
+  }
+  if (seen > 0)
+    quantumNs = Math.min(1e6, Math.max(1e3,
+        Math.pow(10, Math.ceil(Math.log10(min * 1e6)))));
+})();
+const dither = (frac) =>
+    frac - (frac % quantumNs) + Math.floor(Math.random() * quantumNs);
+
 let clockBase = null;   // {sec, nsec, perf, off}
 function renderClock() {
   const el = document.getElementById('clock');
@@ -1083,7 +1080,7 @@ function renderClock() {
   const elapsed = performance.now() - clockBase.perf;
   const totalNs = clockBase.nsec + elapsed * 1e6;
   let sec = clockBase.sec + Math.floor(totalNs / 1e9);
-  const frac = Math.floor(totalNs % 1e9);
+  const frac = dither(Math.floor(totalNs % 1e9));
   if (mode !== 'tai') sec -= clockBase.off;      // TAI -> UTC
 
   const d = new Date(sec * 1000);
@@ -1143,7 +1140,10 @@ async function poll() {
     set('s_ptp', s.have_ptp
         ? 'synchronized (sync ' + s.sync_age.toFixed(1) + ' s ago)'
         : 'waiting for PTP...');
-    set('s_iface', s.iface + (s.iface_up ? '' : ' (not connected)'));
+    set('s_iface', s.iface === 'auto'
+        ? (s.iface_active ? 'auto (' + s.iface_active + ')'
+                          : 'auto (searching...)')
+        : s.iface + (s.iface_up ? '' : ' (not connected)'));
     set('s_domain', s.domain === -1
         ? (s.active_domain >= 0
            ? s.active_domain + ' (auto-detected)'
@@ -1219,22 +1219,29 @@ static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
         font-family: ui-monospace, "SF Mono", Menlo, Consolas,
                      "DejaVu Sans Mono", monospace; }
  #main { text-align: center; transition: opacity 0.6s; }
- #time { font-size: 8.4vw; font-weight: 700; line-height: 1.1;
+ #time { font-size: min(8.4vw, 24vh); font-weight: 700; line-height: 1.1;
          white-space: nowrap; color: var(--c);
          text-shadow: 0 0 0.08em var(--c), 0 0 0.45em var(--c); }
  #time .sup { font-size: 0.3em; vertical-align: 0.4em; margin-left: 0.4em;
          opacity: 0.85; }
- #date { margin-top: 1.4vw; font-size: 2.4vw; letter-spacing: 0.25em;
-         color: var(--c); opacity: 0.55; }
- #alert { display: none; margin-top: 2.2vw; font-size: 2.8vw;
+ #date { margin-top: 1.4vw; font-size: min(2.4vw, 7vh);
+         letter-spacing: 0.25em; color: var(--c); opacity: 0.55; }
+ #alert { display: none; margin-top: 2.2vw; font-size: min(2.8vw, 8vh);
          font-weight: 700; color: #f43;
          text-shadow: 0 0 0.5em #f43; animation: pulse 1s infinite; }
  @keyframes pulse { 50% { opacity: 0.35; } }
  #footer { position: fixed; bottom: 2.5vh; left: 0; right: 0;
-         text-align: center; font-size: 1.5vw; letter-spacing: 0.08em;
-         color: #555; }
+         text-align: center; font-size: min(1.5vw, 4.5vh);
+         letter-spacing: 0.08em; color: #555; }
  #bo { display: none; position: fixed; bottom: 2.5vh; right: 2vw;
          color: #222; font-size: 1.4vw; }
+ #cfg { position: fixed; top: 2.5vh; right: 2vw; color: #2a2a2a;
+         font-size: 1.6em; text-decoration: none; }
+ #cfg:hover { color: #9ab; }
+ /* Small windows: only the time fits comfortably */
+ @media (max-width: 480px), (max-height: 300px) {
+   #date, #footer { display: none; }
+ }
 </style>
 </head>
 <body>
@@ -1245,10 +1252,28 @@ static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
 </div>
 <div id="footer"></div>
 <div id="bo">blackout</div>
+<a id="cfg" href="/" title="Settings">&#9881;</a>
 
 <script>
 const CLS = {6:'GNSS locked',7:'holdover',13:'application specific',
  52:'degraded A',187:'degraded B',248:'default',255:'slave-only'};
+
+// Digits finer than the browser timer resolution are dithered every frame
+// (see the settings page clock for the same trick)
+let quantumNs = 1e6;
+(function () {
+  let last = performance.now(), min = Infinity, seen = 0;
+  for (let i = 0; i < 20000 && seen < 20; i++) {
+    const t = performance.now();
+    if (t > last) { min = Math.min(min, t - last); seen++; }
+    last = t;
+  }
+  if (seen > 0)
+    quantumNs = Math.min(1e6, Math.max(1e3,
+        Math.pow(10, Math.ceil(Math.log10(min * 1e6)))));
+})();
+const dither = (frac) =>
+    frac - (frac % quantumNs) + Math.floor(Math.random() * quantumNs);
 
 let S = null;          // settings (mode, formats, color, notify)
 let st = null;         // last status
@@ -1325,7 +1350,7 @@ function render() {
   const elapsed = performance.now() - base.perf;
   const totalNs = base.nsec + elapsed * 1e6;
   let sec = base.sec + Math.floor(totalNs / 1e9);
-  const frac = Math.floor(totalNs % 1e9);
+  const frac = dither(Math.floor(totalNs % 1e9));
   if (mode !== 'tai') sec -= base.off;
   const d = new Date(sec * 1000);
   let p;
@@ -1362,6 +1387,9 @@ document.body.addEventListener('click', () => {
   if (document.fullscreenElement) document.exitFullscreen();
   else document.documentElement.requestFullscreen().catch(() => {});
 });
+// The settings link must not toggle fullscreen
+document.getElementById('cfg').addEventListener('click',
+    (e) => e.stopPropagation());
 
 (function tick() { render(); requestAnimationFrame(tick); })();
 loadSettings();
@@ -1645,8 +1673,10 @@ int main(int argc, char **argv) {
 
     uint64_t last_dreq_ns = 0;
     uint64_t last_bmca_ns = 0;
-    uint32_t joined_ip = 0;               // iface IP we joined multicast on
-    uint64_t next_join_try_ns = 0;
+    struct JoinedIface { std::string name; uint32_t ip; };
+    std::vector<JoinedIface> joined;      // multicast memberships we hold
+    bool identity_set = false;
+    uint64_t next_join_check_ns = 0;
     bool join_warned = false;
 
     // --- Main loop ---
@@ -1656,37 +1686,86 @@ int main(int argc, char **argv) {
             reset_ptp_state();            // e.g. domain changed via web UI
 
         if (g_iface_changed.exchange(false)) {
-            if (joined_ip) {
-                leave_ptp_multicast(sock_sync, sock_general, joined_ip);
-                joined_ip = 0;
-                g_iface_up = false;
-            }
+            for (const auto &j : joined)
+                membership(sock_sync, sock_general, j.ip, IP_DROP_MEMBERSHIP);
+            joined.clear();
+            identity_set = false;
+            g_iface_up = false;
             reset_ptp_state();
-            next_join_try_ns = 0;
+            next_join_check_ns = 0;
             join_warned = false;
         }
 
-        // (Re-)join multicast; retries every 5 s until the interface has
-        // an IPv4 address (e.g. DHCP still running at boot)
-        if (joined_ip == 0) {
-            uint64_t now = mono_ns();
-            if (now >= next_join_try_ns) {
-                next_join_try_ns = now + 5000000000ULL;
-                std::string ifname;
-                {
-                    std::lock_guard<std::mutex> lock(g_mutex);
-                    ifname = g_settings.iface;
+        // Keep the multicast memberships in sync with the configured
+        // interface ("auto" = every interface with an IPv4 address).
+        // Re-checked every 5 s so late interfaces (DHCP at boot, hotplug)
+        // are picked up automatically.
+        if (mono_ns() >= next_join_check_ns) {
+            next_join_check_ns = mono_ns() + 5000000000ULL;
+            std::string want;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                want = g_settings.iface;
+            }
+            std::vector<std::string> targets;
+            if (want == "auto")
+                targets = list_ifaces();
+            else
+                targets.push_back(want);
+
+            // Drop memberships that are gone or no longer wanted
+            for (auto it = joined.begin(); it != joined.end();) {
+                bool keep = false;
+                for (const auto &t : targets)
+                    if (t == it->name && get_iface_ip(t) == it->ip)
+                        keep = true;
+                if (!keep) {
+                    membership(sock_sync, sock_general, it->ip,
+                               IP_DROP_MEMBERSHIP);
+                    std::cout << "PTP multicast left on " << it->name << "\n";
+                    it = joined.erase(it);
+                } else {
+                    ++it;
                 }
-                joined_ip = join_ptp_multicast(sock_sync, sock_general,
-                                               ifname);
-                if (joined_ip) {
-                    g_iface_up = true;
-                    join_warned = false;
-                } else if (!join_warned) {
-                    std::cerr << "No IPv4 address on interface '" << ifname
-                              << "', retrying (configurable in the web UI)\n";
+            }
+            // Join new ones
+            for (const auto &t : targets) {
+                bool have = false;
+                for (const auto &j : joined)
+                    if (j.name == t)
+                        have = true;
+                if (have)
+                    continue;
+                uint32_t ip = get_iface_ip(t);
+                if (ip == 0)
+                    continue;
+                membership(sock_sync, sock_general, ip, IP_ADD_MEMBERSHIP);
+                joined.push_back({t, ip});
+                if (!identity_set) {
+                    init_clock_identity(sock_sync, t);
+                    identity_set = true;
+                }
+                std::cout << "PTP multicast joined on " << t
+                          << ", clock identity " << format_gm(g_clock_id)
+                          << "\n";
+            }
+            g_iface_up = !joined.empty();
+            if (joined.empty()) {
+                if (!join_warned) {
+                    std::cerr << "No usable interface ('" << want
+                              << "'), retrying every 5 s (configurable in "
+                                 "the web UI)\n";
                     join_warned = true;
                 }
+            } else {
+                join_warned = false;
+            }
+            std::string names;
+            for (const auto &j : joined)
+                names += (names.empty() ? "" : ", ") + j.name;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_joined_names = names;
             }
         }
 
@@ -1733,16 +1812,26 @@ int main(int argc, char **argv) {
             bmca_elect_locked(now_ns);
         }
 
-        // --- Delay_Req once per second ---
-        if (g_have_pair && now_ns - last_dreq_ns >= 1000000000ULL) {
+        // --- Delay_Req once per second, out of every joined interface
+        //     (only the elected master answers; matched by our identity) ---
+        if (g_have_pair && !joined.empty() &&
+            now_ns - last_dreq_ns >= 1000000000ULL) {
             uint8_t pkt[44];
             build_delay_req(pkt, ++g_dreq_seq);
             uint64_t t_a = mono_ns();
-            ssize_t sent = sendto(sock_sync, pkt, sizeof(pkt), 0,
-                                  (struct sockaddr*)&dreq_dst,
-                                  sizeof(dreq_dst));
+            int sent_ok = 0;
+            for (const auto &j : joined) {
+                in_addr mif{};
+                mif.s_addr = j.ip;
+                setsockopt(sock_sync, IPPROTO_IP, IP_MULTICAST_IF,
+                           &mif, sizeof(mif));
+                if (sendto(sock_sync, pkt, sizeof(pkt), 0,
+                           (struct sockaddr*)&dreq_dst,
+                           sizeof(dreq_dst)) == (ssize_t)sizeof(pkt))
+                    sent_ok++;
+            }
             uint64_t t_b = mono_ns();
-            if (sent == (ssize_t)sizeof(pkt)) {
+            if (sent_ok > 0) {
                 g_pending_dreq.valid = true;
                 g_pending_dreq.seq = g_dreq_seq;
                 g_pending_dreq.t3_mono = t_a + (t_b - t_a) / 2;

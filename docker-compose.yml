@@ -6,9 +6,10 @@ services:
     restart: unless-stopped
     volumes:
       - ptp-wallclock:/var/lib/ptp-wallclock
-    environment:
-      # Host interface that receives PTP (changeable later in the web UI)
-      - PTP_WALLCLOCK_IFACE=eth0
+    # The PTP interface is auto-detected (all interfaces with IPv4).
+    # To pin it to one interface instead:
+    # environment:
+    #   - PTP_WALLCLOCK_IFACE=eth0
 
 volumes:
   ptp-wallclock:

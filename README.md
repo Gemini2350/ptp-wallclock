@@ -121,7 +121,6 @@ or manually:
 ```bash
 docker run -d --network host \
     -v ptp-wallclock:/var/lib/ptp-wallclock \
-    -e PTP_WALLCLOCK_IFACE=eth0 \
     --name ptp-wallclock gemini2350/ptp-wallclock
 ```
 
@@ -132,8 +131,10 @@ Notes:
 - `--network host` is required so the container receives the PTP multicast
   on UDP 319/320 — this works on Linux hosts (Docker Desktop on
   macOS/Windows does not pass host multicast through).
-- `PTP_WALLCLOCK_IFACE` sets the initial network interface; it can be
-  changed later in the web UI (the volume keeps the settings).
+- The PTP interface is auto-detected by default (the clock joins the
+  multicast group on every interface with an IPv4 address). To pin it, set
+  `-e PTP_WALLCLOCK_IFACE=eth0` or change it in the web UI (the volume
+  keeps the settings).
 - The same headless binary can be built without Docker: `make headless`.
 
 ---
@@ -145,7 +146,9 @@ it shows the current PTP time as a live, smoothly ticking clock with all
 nine fractional digits, just like the matrix (the server sends its TAI time
 with every status poll and the browser extrapolates in between; expect a few
 milliseconds of network offset, so the fast digits are extrapolated rather
-than measured). The clock follows the
+than measured — digits finer than the browser's timer resolution are
+dithered every frame so they spin like on the LED panel instead of
+freezing). The clock follows the
 configured time mode and formats, so it mirrors what the LED matrix shows.
 Settings:
 
@@ -197,11 +200,12 @@ in the file (restart required):
 |-------------|---------|--------------------------------------|
 | `http_port` | `8319`  | Port of the web interface            |
 
-The network interface (`iface`, default `eth0`) can be changed in the web
-interface — the clock leaves the multicast group on the old interface and
-joins on the new one without a restart. If the interface has no IPv4 address
-yet (e.g. DHCP still running at boot), the clock keeps retrying every 5
-seconds instead of exiting.
+The network interface (`iface`, default `auto`) can be changed in the web
+interface without a restart. In `auto` mode the clock joins the PTP
+multicast group on every interface that has an IPv4 address (re-checked
+every 5 seconds, so interfaces that appear late — DHCP at boot, hotplug —
+are picked up automatically). Pinning it to one interface name switches
+the membership over immediately.
 
 ## Privileged ports (why sudo?)
 

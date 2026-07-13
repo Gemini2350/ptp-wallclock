@@ -5,8 +5,8 @@
 #   docker build -t ptp-wallclock .
 #   docker run -d --network host \
 #       -v ptp-wallclock:/var/lib/ptp-wallclock \
-#       -e PTP_WALLCLOCK_IFACE=eth0 \
 #       --name ptp-wallclock ptp-wallclock
+# The PTP interface is auto-detected; pin it with -e PTP_WALLCLOCK_IFACE=eth0
 
 FROM debian:bookworm-slim AS build
 RUN apt-get update \
