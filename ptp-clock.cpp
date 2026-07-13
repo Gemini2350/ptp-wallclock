@@ -39,6 +39,8 @@ enum DateFormat { DATE_DMY = 0, DATE_ISO = 1, DATE_MDY = 2 };
 
 struct Settings {
     uint8_t r = 255, g = 255, b = 0;      // display color
+    int brightness = 100;                 // display brightness in percent
+    bool blackout = false;                // display temporarily off
     bool show_gm = false;                 // show grandmaster ID on the matrix
     bool show_gm_details = false;         // show priorities / clock quality
     bool show_date = false;               // show the date on the matrix
@@ -185,6 +187,8 @@ static void save_settings_locked() {
     }
     f << "color=" << (int)g_settings.r << "," << (int)g_settings.g << ","
       << (int)g_settings.b << "\n";
+    f << "brightness=" << g_settings.brightness << "\n";
+    f << "blackout=" << (g_settings.blackout ? 1 : 0) << "\n";
     f << "show_gm=" << (g_settings.show_gm ? 1 : 0) << "\n";
     f << "show_gm_details=" << (g_settings.show_gm_details ? 1 : 0) << "\n";
     f << "show_date=" << (g_settings.show_date ? 1 : 0) << "\n";
@@ -219,6 +223,12 @@ static void load_settings() {
             if (sscanf(val.c_str(), "%d,%d,%d", &r, &g, &b) == 3) {
                 g_settings.r = r; g_settings.g = g; g_settings.b = b;
             }
+        } else if (key == "brightness") {
+            int v = atoi(val.c_str());
+            if (v >= 1 && v <= 100)
+                g_settings.brightness = v;
+        } else if (key == "blackout") {
+            g_settings.blackout = (val == "1");
         } else if (key == "show_gm") {
             g_settings.show_gm = (val == "1");
         } else if (key == "show_gm_details") {
@@ -707,6 +717,8 @@ static std::string settings_json() {
              g_settings.r, g_settings.g, g_settings.b);
     std::ostringstream j;
     j << "{\"color\":\"" << color << "\","
+      << "\"brightness\":" << g_settings.brightness << ","
+      << "\"blackout\":" << (g_settings.blackout ? "true" : "false") << ","
       << "\"show_gm\":" << (g_settings.show_gm ? "true" : "false") << ","
       << "\"show_gm_details\":" << (g_settings.show_gm_details ? "true" : "false") << ","
       << "\"show_date\":" << (g_settings.show_date ? "true" : "false") << ","
@@ -745,6 +757,7 @@ static std::string status_json() {
     }
 
     j << "{\"have_ptp\":" << (have_ptp_ref ? "true" : "false") << ","
+      << "\"blackout\":" << (g_settings.blackout ? "true" : "false") << ","
       << "\"sync_age\":" << sync_age << ","
       << "\"domain\":" << g_domain.load() << ","
       << "\"active_domain\":" << g_active_domain.load() << ","
@@ -800,6 +813,9 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  button { padding: 0.5em 1.5em; background: #2d6cdf; color: #fff;
         border: none; border-radius: 4px; cursor: pointer; }
  button:hover { background: #3d7cef; }
+ button.blackout-on { background: #b33; }
+ button.blackout-on:hover { background: #c44; }
+ input[type=range] { width: 100%; }
  table.status { width: 100%; font-size: 0.9em; border-collapse: collapse; }
  table.status td { padding: 0.15em 0.3em; color: #aaa; }
  table.status td + td { color: #eee; text-align: right; font-family: monospace; }
@@ -846,8 +862,14 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <form id="form">
 <fieldset>
 <legend>Display</legend>
+<p style="margin: 0.6em 0">
+ <button type="button" id="blackout_btn">Blackout &ndash; turn display off</button>
+</p>
 <label>Display color:
  <input type="color" id="color" value="#ffff00">
+</label>
+<label>Brightness: <span id="bval">100</span> %
+ <input type="range" id="brightness" min="1" max="100" value="100">
 </label>
 <label>
  <input type="checkbox" id="show_gm"> Show grandmaster ID (2nd line)
@@ -936,9 +958,36 @@ function syncDomainInput() {
 }
 document.getElementById('domain_auto').addEventListener('change', syncDomainInput);
 
+// Blackout toggle and brightness slider apply immediately (no Save needed)
+let blackout = false;
+function renderBlackout() {
+  const b = document.getElementById('blackout_btn');
+  b.textContent = blackout
+      ? 'Blackout active – turn display on'
+      : 'Blackout – turn display off';
+  b.className = blackout ? 'blackout-on' : '';
+}
+document.getElementById('blackout_btn').addEventListener('click', async () => {
+  blackout = !blackout;
+  renderBlackout();
+  await fetch('/api/settings', { method: 'POST',
+      body: new URLSearchParams({ blackout: blackout ? 1 : 0 }) });
+});
+document.getElementById('brightness').addEventListener('input', (e) => {
+  document.getElementById('bval').textContent = e.target.value;
+});
+document.getElementById('brightness').addEventListener('change', async (e) => {
+  await fetch('/api/settings', { method: 'POST',
+      body: new URLSearchParams({ brightness: e.target.value }) });
+});
+
 async function loadSettings() {
   const s = await fetch('/api/settings').then(r => r.json());
   document.getElementById('color').value = s.color;
+  document.getElementById('brightness').value = s.brightness;
+  document.getElementById('bval').textContent = s.brightness;
+  blackout = s.blackout;
+  renderBlackout();
   document.getElementById('show_gm').checked = s.show_gm;
   document.getElementById('show_gm_details').checked = s.show_gm_details;
   document.getElementById('show_date').checked = s.show_date;
@@ -959,6 +1008,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const body = new URLSearchParams({
     color: document.getElementById('color').value,
+    brightness: document.getElementById('brightness').value,
     show_gm: document.getElementById('show_gm').checked ? 1 : 0,
     show_gm_details: document.getElementById('show_gm_details').checked ? 1 : 0,
     show_date: document.getElementById('show_date').checked ? 1 : 0,
@@ -1014,6 +1064,10 @@ async function poll() {
           ? 'no response (' + s.dreq_sent + ' requests)'
           : '–');
     set('s_changes', s.gm_changes);
+    if (s.blackout !== blackout) {
+      blackout = s.blackout;             // changed from another browser
+      renderBlackout();
+    }
     document.getElementById('masters').innerHTML = s.masters.length
       ? '<tr><th>Grandmaster</th><th>P1</th><th>P2</th><th>Class</th>' +
         '<th>Steps</th><th></th></tr>' +
@@ -1117,6 +1171,13 @@ static void handle_client(int fd) {
                     g_settings.r = r; g_settings.g = g; g_settings.b = b;
                 }
             }
+            if (kv.count("brightness")) {
+                int v = atoi(kv["brightness"].c_str());
+                if (v >= 1 && v <= 100)
+                    g_settings.brightness = v;
+            }
+            if (kv.count("blackout"))
+                g_settings.blackout = (kv["blackout"] == "1");
             if (kv.count("show_gm"))
                 g_settings.show_gm = (kv["show_gm"] == "1");
             if (kv.count("show_gm_details"))
@@ -1244,6 +1305,7 @@ int main(int argc, char **argv) {
     matrix_options.cols = 128;
     matrix_options.chain_length = 1;
     matrix_options.hardware_mapping = "adafruit-hat";
+    matrix_options.brightness = g_settings.brightness;
     runtime_opt.gpio_slowdown = 2;
 
     RGBMatrix *matrix = RGBMatrix::CreateFromOptions(matrix_options, runtime_opt);
@@ -1403,15 +1465,6 @@ int main(int argc, char **argv) {
             last_dreq_ns = now_ns;
         }
 
-        if (!have_ptp_ref)
-            continue;
-
-        // --- Smooth time: master(TAI) = local(mono) - offset ---
-        int64_t display_signed = (int64_t)mono_ns() - g_offset_ns;
-        if (display_signed < 0)
-            display_signed = 0;
-        uint64_t display_ns = (uint64_t)display_signed;
-
         // Snapshot the settings + GM info for this frame
         Settings s;
         std::string id_line, detail_line;
@@ -1433,6 +1486,21 @@ int main(int argc, char **argv) {
                 (now.tv_sec - g_last_gm_change.tv_sec) < 10)
                 gm_recent_change = true;
         }
+
+        offscreen->SetBrightness((uint8_t)s.brightness);
+
+        // Blackout, or no PTP reference (yet): show a black display
+        if (s.blackout || !have_ptp_ref) {
+            offscreen->Fill(0, 0, 0);
+            offscreen = matrix->SwapOnVSync(offscreen);
+            continue;
+        }
+
+        // --- Smooth time: master(TAI) = local(mono) - offset ---
+        int64_t display_signed = (int64_t)mono_ns() - g_offset_ns;
+        if (display_signed < 0)
+            display_signed = 0;
+        uint64_t display_ns = (uint64_t)display_signed;
 
         time_t sec = display_ns / 1000000000ULL;
         uint32_t nsec = display_ns % 1000000000ULL;

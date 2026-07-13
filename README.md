@@ -93,6 +93,9 @@ sudo ./ptp-clock
 The clock serves a settings page on `http://<pi-address>:8080` with:
 
 - **Display color** — color picker for the LED matrix text
+- **Brightness** — 1–100 % slider, applied immediately
+- **Blackout** — one-click switch to temporarily turn the display off
+  (the clock keeps tracking PTP in the background)
 - **Grandmaster ID** — show the current PTP grandmaster identity as a second
   line on the matrix
 - **Priorities & clock quality** — show priority 1/2, clock class and clock
