@@ -50,6 +50,11 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
 
 ## Hardware Requirements
 
+These are only needed for the physical LED clock — the
+[Docker version](#docker--no-led-hardware-needed) has no hardware
+requirements and runs anywhere Docker runs; all it needs is a network that
+carries PTP.
+
 - Raspberry Pi (tested on Raspberry Pi 3/4 - 5 not working at the moment)
 - RGB LED matrix compatible with the `rpi-rgb-led-matrix` library
 -- [Adafruit RGB Matrix HAT](https://www.adafruit.com/product/2345)
