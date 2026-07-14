@@ -76,7 +76,7 @@ static void InterruptHandler(int signo) {
 }
 
 // ---- Settings (served / edited via the web interface) ----
-enum TimeMode { MODE_UTC = 0, MODE_TAI = 1, MODE_LOCAL = 2 };
+enum TimeMode { MODE_UTC = 0, MODE_TAI = 1, MODE_LOCAL = 2, MODE_CYCLE = 3 };
 enum DateFormat { DATE_DMY = 0, DATE_ISO = 1, DATE_MDY = 2 };
 
 struct Settings {
@@ -288,7 +288,7 @@ static void load_settings() {
             g_settings.show_date = (val == "1");
         } else if (key == "mode") {
             int m = atoi(val.c_str());
-            if (m >= MODE_UTC && m <= MODE_LOCAL)
+            if (m >= MODE_UTC && m <= MODE_CYCLE)
                 g_settings.mode = m;
         } else if (key == "timezone") {
             if (!val.empty())
@@ -798,7 +798,8 @@ static std::string settings_json() {
       << "\"show_gm_details\":" << (g_settings.show_gm_details ? "true" : "false") << ","
       << "\"show_date\":" << (g_settings.show_date ? "true" : "false") << ","
       << "\"mode\":\"" << (g_settings.mode == MODE_TAI ? "tai" :
-                           g_settings.mode == MODE_LOCAL ? "local" : "utc") << "\","
+                           g_settings.mode == MODE_LOCAL ? "local" :
+                           g_settings.mode == MODE_CYCLE ? "cycle" : "utc") << "\","
       << "\"timezone\":\"" << json_escape(g_settings.timezone) << "\","
       << "\"time_format\":\"" << g_settings.time_format << "\","
       << "\"date_format\":\"" << (g_settings.date_format == DATE_ISO ? "iso" :
@@ -1016,6 +1017,7 @@ date and status line:</p>
 <label><input type="radio" name="mode" value="utc" checked> UTC</label>
 <label><input type="radio" name="mode" value="tai"> TAI</label>
 <label><input type="radio" name="mode" value="local"> Local time (time zone)</label>
+<label><input type="radio" name="mode" value="cycle"> Alternating UTC &rarr; TAI &rarr; local (4 s each, labelled)</label>
 <label>Time zone:
  <input type="text" id="timezone" list="tzlist" value="Europe/Berlin">
  <datalist id="tzlist">
@@ -1197,16 +1199,18 @@ function renderClock() {
     ed.textContent = '';
     return;
   }
-  const mode = document.querySelector('input[name=mode]:checked').value;
+  let mode = document.querySelector('input[name=mode]:checked').value;
   const h12 = document.getElementById('time_format').value === '12';
   const df = document.getElementById('date_format').value;
-  let tz = mode === 'local'
-      ? document.getElementById('timezone').value : 'UTC';
 
   const elapsed = performance.now() - clockBase.perf;
   const totalNs = clockBase.nsec + elapsed * 1e6;
   let sec = clockBase.sec + Math.floor(totalNs / 1e9);
   const frac = dither(Math.floor(totalNs % 1e9));
+  const cycling = mode === 'cycle';              // rotate per PTP second
+  if (cycling) mode = ['utc', 'tai', 'local'][Math.floor(sec / 4) % 3];
+  let tz = mode === 'local'
+      ? document.getElementById('timezone').value : 'UTC';
   if (mode !== 'tai') sec -= clockBase.off;      // TAI -> UTC
 
   const d = new Date(sec * 1000);
@@ -1214,7 +1218,8 @@ function renderClock() {
   try {
     p = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hourCycle: 'h23',
         hour: '2-digit', minute: '2-digit', second: '2-digit',
-        weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric'
+        weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric',
+        timeZoneName: 'short'
       }).formatToParts(d).reduce((a, x) => (a[x.type] = x.value, a), {});
   } catch (e) {                                  // unknown time zone
     el.textContent = '--:--:--';
@@ -1228,8 +1233,14 @@ function renderClock() {
     h = h % 12 || 12;
     hh = String(h).padStart(2, '0');
   }
+  let scale = '';
+  if (cycling)
+    scale = ' ' + (mode === 'local'
+        ? (p.timeZoneName || 'LOCAL') : mode.toUpperCase());
+  else if (mode === 'tai')
+    scale = ' TAI';
   el.textContent = hh + ':' + p.minute + ':' + p.second + '.' +
-      String(frac).padStart(9, '0') + suffix + (mode === 'tai' ? ' TAI' : '');
+      String(frac).padStart(9, '0') + suffix + scale;
   const wd = p.weekday.toUpperCase();
   ed.textContent = df === 'iso'
       ? wd + ' ' + p.year + '-' + p.month + '-' + p.day
@@ -1493,20 +1504,24 @@ function render() {
     ed.textContent = st && !st.have_ptp ? 'WAITING FOR PTP' : '';
     return;
   }
-  const mode = S.mode, h12 = S.time_format === '12', df = S.date_format;
-  const tz = mode === 'local' ? S.timezone : 'UTC';
+  let mode = S.mode;
+  const h12 = S.time_format === '12', df = S.date_format;
 
   const elapsed = performance.now() - base.perf;
   const totalNs = base.nsec + elapsed * 1e6;
   let sec = base.sec + Math.floor(totalNs / 1e9);
   const frac = dither(Math.floor(totalNs % 1e9));
+  const cycling = mode === 'cycle';              // rotate per PTP second
+  if (cycling) mode = ['utc', 'tai', 'local'][Math.floor(sec / 4) % 3];
+  const tz = mode === 'local' ? S.timezone : 'UTC';
   if (mode !== 'tai') sec -= base.off;
   const d = new Date(sec * 1000);
   let p;
   try {
     p = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hourCycle: 'h23',
         hour: '2-digit', minute: '2-digit', second: '2-digit',
-        weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric'
+        weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric',
+        timeZoneName: 'short'
       }).formatToParts(d).reduce((a, x) => (a[x.type] = x.value, a), {});
   } catch (e) {
     el.textContent = '--:--:--';
@@ -1520,7 +1535,11 @@ function render() {
     h = h % 12 || 12;
     hh = String(h).padStart(2, '0');
   }
-  if (mode === 'tai') sup += (sup ? ' ' : '') + 'TAI';
+  if (cycling)
+    sup += (sup ? ' ' : '') + (mode === 'local'
+        ? (p.timeZoneName || 'LOCAL') : mode.toUpperCase());
+  else if (mode === 'tai')
+    sup += (sup ? ' ' : '') + 'TAI';
   el.innerHTML = hh + ':' + p.minute + ':' + p.second + '.' +
       String(frac).padStart(9, '0') +
       (sup ? '<span class="sup">' + sup + '</span>' : '');
@@ -1645,6 +1664,7 @@ static void handle_client(int fd) {
             if (kv.count("mode")) {
                 if (kv["mode"] == "tai") g_settings.mode = MODE_TAI;
                 else if (kv["mode"] == "local") g_settings.mode = MODE_LOCAL;
+                else if (kv["mode"] == "cycle") g_settings.mode = MODE_CYCLE;
                 else g_settings.mode = MODE_UTC;
             }
             if (kv.count("timezone") && !kv["timezone"].empty()) {
@@ -2050,14 +2070,36 @@ int main(int argc, char **argv) {
         time_t sec = display_ns / 1000000000ULL;
         uint32_t nsec = display_ns % 1000000000ULL;
 
-        if (s.mode != MODE_TAI)
+        // Cycle mode rotates UTC -> TAI -> local every 4 s. The window is
+        // derived from the PTP second, so LED and browser clocks flip in
+        // sync; the second line labels which scale is shown.
+        static const int kCycle[3] = {MODE_UTC, MODE_TAI, MODE_LOCAL};
+        int eff_mode = (s.mode == MODE_CYCLE)
+            ? kCycle[(sec / 4) % 3] : s.mode;
+
+        if (eff_mode != MODE_TAI)
             sec -= current_utc_offset;   // TAI -> UTC
 
         struct tm tm_disp;
-        if (s.mode == MODE_LOCAL)
+        if (eff_mode == MODE_LOCAL)
             localtime_r(&sec, &tm_disp);
         else
             gmtime_r(&sec, &tm_disp);
+
+        std::string cycle_label;
+        if (s.mode == MODE_CYCLE) {
+            if (eff_mode == MODE_UTC) {
+                cycle_label = "UTC";
+            } else if (eff_mode == MODE_TAI) {
+                cycle_label = "TAI";
+            } else {
+                char zb[24];
+                if (strftime(zb, sizeof(zb), "%Z", &tm_disp) > 0)
+                    cycle_label = zb;    // e.g. CEST
+                else
+                    cycle_label = "LOCAL";
+            }
+        }
 
         char time_buffer[64];
         if (s.time_format == 12) {
@@ -2109,6 +2151,9 @@ int main(int argc, char **argv) {
                 lines.push_back(detail_line);
             if (!lines.empty())
                 line2 = lines[(now_ns / 4000000000ULL) % lines.size()];
+            // Cycle mode: the second line labels the displayed time scale
+            if (!cycle_label.empty())
+                line2 = cycle_label;
             if (gm_recent_change && s.notify_gm_change) {
                 line2 = "! NEW GM !";
                 line2_alert = true;

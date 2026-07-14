@@ -165,7 +165,10 @@ Settings:
 - **Date** — show the date on the matrix (if several second-line options are
   enabled, the line alternates every 4 seconds)
 - **Time display** — UTC, TAI, or local time with a configurable time zone
-  (IANA names such as `Europe/Berlin`), 24-hour or 12-hour (AM/PM) format
+  (IANA names such as `Europe/Berlin`), 24-hour or 12-hour (AM/PM) format —
+  or an alternating mode that cycles UTC → TAI → local every 4 seconds and
+  labels which scale is currently shown (`UTC` / `TAI` / e.g. `CEST`), on
+  the LED matrix and the browser clock alike
 - **Date format** — `DD.MM.YYYY`, ISO 8601 (`YYYY-MM-DD`), or `MM/DD/YYYY`
 - **PTP domain** — automatic detection (default) or a fixed domain number
   (0–255); the detected domain is shown in the status panel
