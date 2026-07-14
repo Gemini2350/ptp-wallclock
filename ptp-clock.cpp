@@ -200,6 +200,53 @@ static int64_t corr_to_ns(const uint8_t *p) {
     return (int64_t)be_bytes(p, 8) >> 16;
 }
 
+// ---- OUI → vendor lookup ----
+// The grandmaster identity is an EUI-64 derived from the MAC address, so
+// its first three bytes are the vendor OUI. Curated offline subset of
+// brands commonly seen as PTP grandmasters (dedicated GMs, NICs running
+// linuxptp, AV gear) — extend here as needed.
+struct OuiEntry { uint8_t o[3]; const char *vendor; };
+static const OuiEntry kOuiTable[] = {
+    {{0xEC, 0x46, 0x70}, "Meinberg"},
+    {{0x00, 0x1D, 0xC1}, "Audinate (Dante)"},
+    {{0x00, 0x15, 0x17}, "Intel"},
+    {{0x00, 0x1B, 0x21}, "Intel"},
+    {{0x68, 0x05, 0xCA}, "Intel"},
+    {{0xA0, 0x36, 0x9F}, "Intel"},
+    {{0x00, 0x02, 0xC9}, "Mellanox/NVIDIA"},
+    {{0xEC, 0x0D, 0x9A}, "Mellanox/NVIDIA"},
+    {{0xB8, 0x59, 0x9F}, "Mellanox/NVIDIA"},
+    {{0x00, 0x0F, 0x53}, "Solarflare/AMD"},
+    {{0x00, 0x0A, 0x35}, "Xilinx/AMD"},
+    {{0x00, 0x1C, 0x73}, "Arista"},
+    {{0x00, 0x00, 0x0C}, "Cisco"},
+    {{0x00, 0x05, 0x85}, "Juniper"},
+    {{0x00, 0x04, 0x96}, "Extreme Networks"},
+    {{0xF0, 0x9F, 0xC2}, "Ubiquiti"},
+    {{0x00, 0x90, 0xE8}, "Moxa"},
+    {{0x08, 0x00, 0x11}, "Tektronix"},
+    {{0x00, 0xA0, 0xDE}, "Yamaha"},
+    {{0x00, 0x04, 0xA3}, "Microchip"},
+    {{0x7C, 0x2E, 0x0D}, "Blackmagic Design"},
+    {{0xB8, 0x27, 0xEB}, "Raspberry Pi"},
+    {{0xDC, 0xA6, 0x32}, "Raspberry Pi"},
+    {{0xE4, 0x5F, 0x01}, "Raspberry Pi"},
+    {{0xD8, 0x3A, 0xDD}, "Raspberry Pi"},
+    {{0x2C, 0xCF, 0x67}, "Raspberry Pi"},
+    {{0x28, 0xCD, 0xC1}, "Raspberry Pi"},
+    {{0x8C, 0x1F, 0x64}, "IEEE RA (shared block)"},
+};
+
+// Vendor for a grandmaster identity, "" when the OUI is not in the table
+static const char *lookup_vendor(const uint8_t id[8]) {
+    for (const auto &e : kOuiTable)
+        if (e.o[0] == id[0] && e.o[1] == id[1] && e.o[2] == id[2])
+            return e.vendor;
+    if (id[0] & 0x02)
+        return "locally administered";   // random/software MAC
+    return "";
+}
+
 static std::string format_gm(const uint8_t id[8]) {
     char buf[32];
     snprintf(buf, sizeof(buf),
@@ -879,6 +926,7 @@ static std::string status_json() {
       << "\"iface_active\":\"" << json_escape(g_joined_names) << "\","
       << "\"iface_up\":" << (g_iface_up ? "true" : "false") << ","
       << "\"gm_id\":\"" << (g_have_gm ? format_gm(g_gm.id) : "") << "\","
+      << "\"gm_vendor\":\"" << (g_have_gm ? lookup_vendor(g_gm.id) : "") << "\","
       << "\"gm_accepted\":" << (gm_acceptable_locked() ? "true" : "false") << ","
       << "\"priority1\":" << (int)g_gm.priority1 << ","
       << "\"priority2\":" << (int)g_gm.priority2 << ","
@@ -898,6 +946,7 @@ static std::string status_json() {
         const ForeignMaster &m = g_masters[i];
         j << (i ? "," : "")
           << "{\"gm_id\":\"" << format_gm(m.gm.id) << "\","
+          << "\"vendor\":\"" << lookup_vendor(m.gm.id) << "\","
           << "\"priority1\":" << (int)m.gm.priority1 << ","
           << "\"priority2\":" << (int)m.gm.priority2 << ","
           << "\"clock_class\":" << (int)m.gm.clock_class << ","
@@ -975,6 +1024,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  <tr><td>Interface</td><td id="s_iface">&ndash;</td></tr>
  <tr><td>Domain</td><td id="s_domain">&ndash;</td></tr>
  <tr><td>Grandmaster</td><td id="s_gm">&ndash;</td></tr>
+ <tr><td>Vendor</td><td id="s_vendor">&ndash;</td></tr>
  <tr><td>Priority 1 / 2</td><td id="s_prio">&ndash;</td></tr>
  <tr><td>Clock class</td><td id="s_class">&ndash;</td></tr>
  <tr><td>Accuracy</td><td id="s_acc">&ndash;</td></tr>
@@ -1311,6 +1361,7 @@ async function poll() {
     const badGm = gm && s.gm_accepted === false;
     set('s_gm', gm ? s.gm_id + (badGm ? ' — NOT ACCEPTED' : '') : 'unknown');
     document.getElementById('s_gm').style.color = badGm ? '#f66' : '';
+    set('s_vendor', gm ? (s.gm_vendor || 'unknown (OUI not in list)') : '–');
     const w = document.getElementById('gmwarn');
     w.style.display = badGm ? 'block' : 'none';
     if (badGm)
@@ -1341,7 +1392,8 @@ async function poll() {
       ? '<tr><th>Grandmaster</th><th>P1</th><th>P2</th><th>Class</th>' +
         '<th>Steps</th><th></th></tr>' +
         s.masters.map(m =>
-          '<tr' + (m.elected ? ' class="elected"' : '') + '><td>' + m.gm_id +
+          '<tr' + (m.elected ? ' class="elected"' : '') + '><td title="' +
+          (m.vendor || '') + '">' + m.gm_id +
           '</td><td>' + m.priority1 + '</td><td>' + m.priority2 +
           '</td><td>' + m.clock_class + '</td><td>' + m.steps_removed +
           '</td><td>' + (m.elected ? '&#9733;' : '') + '</td></tr>').join('')

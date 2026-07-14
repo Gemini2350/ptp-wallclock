@@ -191,8 +191,10 @@ Settings:
 
 The status panel shows live data decoded from the Announce messages
 (grandmaster identity, priorities, clock class/accuracy/variance, steps
-removed, time source), the TAI−UTC offset, and the measured mean path delay
-with a Delay_Req/Delay_Resp counter. A separate table lists all masters
+removed, time source), the grandmaster's vendor — resolved offline from the
+OUI inside its identity via a curated list of common PTP/AV brands — the
+TAI−UTC offset, and the measured mean path delay with a
+Delay_Req/Delay_Resp counter. A separate table lists all masters
 currently visible in the domain with the BMCA-elected one marked — handy for
 watching a failover happen.
 
