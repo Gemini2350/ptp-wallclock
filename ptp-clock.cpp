@@ -950,8 +950,10 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  #clock { font-family: monospace; text-align: center; color: #fd0;
         font-size: clamp(1em, 4.4vw, 1.8em); white-space: nowrap; }
  a { color: #7ab; }
+ #clockzone { font-family: monospace; text-align: center; color: #db0;
+        letter-spacing: 0.2em; margin-top: 0.15em; }
  #clockdate { font-family: monospace; text-align: center; color: #aaa;
-        margin-top: 0.2em; }
+        margin-top: 0.1em; }
 </style>
 </head>
 <body>
@@ -962,6 +964,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <fieldset>
 <legend>PTP time &nbsp;<a href="/clock" target="_blank" rel="noopener">fullscreen clock &rarr;</a></legend>
 <div id="clock">--:--:--</div>
+<div id="clockzone"></div>
 <div id="clockdate"></div>
 </fieldset>
 
@@ -1204,9 +1207,11 @@ const dither = (frac) =>
 let clockBase = null;   // {sec, nsec, perf, off}
 function renderClock() {
   const el = document.getElementById('clock');
+  const ez = document.getElementById('clockzone');
   const ed = document.getElementById('clockdate');
   if (!clockBase) {
     el.textContent = '--:--:--';
+    ez.textContent = '';
     ed.textContent = '';
     return;
   }
@@ -1234,6 +1239,7 @@ function renderClock() {
       }).formatToParts(d).reduce((a, x) => (a[x.type] = x.value, a), {});
   } catch (e) {                                  // unknown time zone
     el.textContent = '--:--:--';
+    ez.textContent = '';
     ed.textContent = 'unknown time zone: ' + tz;
     return;
   }
@@ -1244,7 +1250,7 @@ function renderClock() {
     h = h % 12 || 12;
     hh = String(h).padStart(2, '0');
   }
-  // Cycle mode labels the shown scale on the date line, before the date
+  // Cycle mode: shown scale on line 2, date on line 3
   let cyc = '';
   if (cycling)
     cyc = mode === 'local'
@@ -1255,13 +1261,13 @@ function renderClock() {
     suffix += ' TAI';
   el.textContent = hh + ':' + p.minute + ':' + p.second + '.' +
       String(frac).padStart(9, '0') + suffix;
+  ez.textContent = cyc;
   const wd = p.weekday.toUpperCase();
-  const dateStr = df === 'iso'
+  ed.textContent = df === 'iso'
       ? wd + ' ' + p.year + '-' + p.month + '-' + p.day
       : df === 'mdy'
         ? wd + ' ' + p.month + '/' + p.day + '/' + p.year
         : wd + ' ' + p.day + '.' + p.month + '.' + p.year;
-  ed.textContent = (cyc ? cyc + '  ·  ' : '') + dateStr;
 }
 (function clockTick() {
   renderClock();
@@ -1384,7 +1390,9 @@ static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
          text-shadow: 0 0 0.08em var(--c), 0 0 0.45em var(--c); }
  #time .sup { font-size: 0.3em; vertical-align: 0.4em; margin-left: 0.4em;
          opacity: 0.85; }
- #date { margin-top: 1.4vw; font-size: min(2.4vw, 7vh);
+ #zone { margin-top: 1.2vw; font-size: min(2.6vw, 7.5vh);
+         letter-spacing: 0.3em; color: var(--c); opacity: 0.75; }
+ #date { margin-top: 1vw; font-size: min(2.4vw, 7vh);
          letter-spacing: 0.25em; color: var(--c); opacity: 0.55; }
  #alert { display: none; margin-top: 2.2vw; font-size: min(2.8vw, 8vh);
          font-weight: 700; color: #f43;
@@ -1400,7 +1408,7 @@ static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
  #cfg:hover { color: #9ab; }
  /* Small windows: hide date + status line and let the time take the room */
  @media (max-width: 480px), (max-height: 300px) {
-   #date, #footer { display: none; }
+   #zone, #date, #footer { display: none; }
    #time { font-size: min(8.5vw, 72vh); }
  }
 </style>
@@ -1408,6 +1416,7 @@ static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
 <body>
 <div id="main">
  <div id="time">--:--:--</div>
+ <div id="zone"></div>
  <div id="date"></div>
  <div id="alert"></div>
 </div>
@@ -1508,6 +1517,7 @@ async function poll() {
 
 function render() {
   const el = document.getElementById('time');
+  const ez = document.getElementById('zone');
   const ed = document.getElementById('date');
   const bl = st && st.blackout;
   document.getElementById('main').style.opacity =
@@ -1516,6 +1526,7 @@ function render() {
   document.getElementById('bo').style.display = bl ? 'block' : 'none';
   if (!base || !S) {
     el.textContent = '--:--:--';
+    ez.textContent = '';
     ed.textContent = st && !st.have_ptp ? 'WAITING FOR PTP' : '';
     return;
   }
@@ -1540,6 +1551,7 @@ function render() {
       }).formatToParts(d).reduce((a, x) => (a[x.type] = x.value, a), {});
   } catch (e) {
     el.textContent = '--:--:--';
+    ez.textContent = '';
     ed.textContent = 'UNKNOWN TIME ZONE';
     return;
   }
@@ -1550,7 +1562,7 @@ function render() {
     h = h % 12 || 12;
     hh = String(h).padStart(2, '0');
   }
-  // Cycle mode labels the shown scale on the date line, before the date
+  // Cycle mode: shown scale on line 2, date on line 3
   let cyc = '';
   if (cycling)
     cyc = mode === 'local'
@@ -1560,13 +1572,13 @@ function render() {
   el.innerHTML = hh + ':' + p.minute + ':' + p.second + '.' +
       String(frac).padStart(9, '0') +
       (sup ? '<span class="sup">' + sup + '</span>' : '');
+  ez.textContent = cyc;
   const wd = p.weekday.toUpperCase();
-  const dateStr = df === 'iso'
+  ed.textContent = df === 'iso'
       ? wd + ' ' + p.year + '-' + p.month + '-' + p.day
       : df === 'mdy'
         ? wd + ' ' + p.month + '/' + p.day + '/' + p.year
         : wd + ' ' + p.day + '.' + p.month + '.' + p.year;
-  ed.textContent = (cyc ? cyc + '  ·  ' : '') + dateStr;
 }
 
 document.body.addEventListener('click', () => {
