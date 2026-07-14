@@ -208,6 +208,7 @@ static int64_t corr_to_ns(const uint8_t *p) {
 struct OuiEntry { uint8_t o[3]; const char *vendor; };
 static const OuiEntry kOuiTable[] = {
     {{0xEC, 0x46, 0x70}, "Meinberg"},
+    {{0x20, 0xB0, 0xF7}, "Mobatime (Enclustra SoM)"},
     {{0x00, 0x1D, 0xC1}, "Audinate (Dante)"},
     {{0x00, 0x15, 0x17}, "Intel"},
     {{0x00, 0x1B, 0x21}, "Intel"},
