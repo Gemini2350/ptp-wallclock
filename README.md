@@ -119,7 +119,7 @@ docker compose up -d
 or manually:
 
 ```bash
-docker run -d --network host \
+docker run -d --network host --restart unless-stopped \
     -v ptp-wallclock:/var/lib/ptp-wallclock \
     --name ptp-wallclock gemini2350/ptp-wallclock
 ```

@@ -3,7 +3,7 @@
 #
 # PTP multicast needs the host network stack:
 #   docker build -t ptp-wallclock .
-#   docker run -d --network host \
+#   docker run -d --network host --restart unless-stopped \
 #       -v ptp-wallclock:/var/lib/ptp-wallclock \
 #       --name ptp-wallclock ptp-wallclock
 # The PTP interface is auto-detected; pin it with -e PTP_WALLCLOCK_IFACE=eth0
