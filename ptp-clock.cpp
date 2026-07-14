@@ -89,6 +89,8 @@ struct Settings {
     bool show_date = false;               // show the date on the matrix
     int mode = MODE_UTC;                  // UTC / TAI / local time
     std::string timezone = "Europe/Berlin";
+    std::string tz_label;                 // custom label for the local leg
+                                          // in cycle mode; empty = %Z
     int time_format = 24;                 // 24 or 12 (AM/PM)
     int date_format = DATE_DMY;           // DD.MM.YYYY / ISO / MM/DD/YYYY
     bool notify_gm_change = false;        // notify on grandmaster change
@@ -242,6 +244,7 @@ static void save_settings_locked() {
     f << "show_date=" << (g_settings.show_date ? 1 : 0) << "\n";
     f << "mode=" << g_settings.mode << "\n";
     f << "timezone=" << g_settings.timezone << "\n";
+    f << "tz_label=" << g_settings.tz_label << "\n";
     f << "time_format=" << g_settings.time_format << "\n";
     f << "date_format=" << (g_settings.date_format == DATE_ISO ? "iso" :
                             g_settings.date_format == DATE_MDY ? "mdy" :
@@ -293,6 +296,8 @@ static void load_settings() {
         } else if (key == "timezone") {
             if (!val.empty())
                 g_settings.timezone = val;
+        } else if (key == "tz_label") {
+            g_settings.tz_label = val;
         } else if (key == "time_format") {
             if (val == "12" || val == "24")
                 g_settings.time_format = atoi(val.c_str());
@@ -801,6 +806,7 @@ static std::string settings_json() {
                            g_settings.mode == MODE_LOCAL ? "local" :
                            g_settings.mode == MODE_CYCLE ? "cycle" : "utc") << "\","
       << "\"timezone\":\"" << json_escape(g_settings.timezone) << "\","
+      << "\"tz_label\":\"" << json_escape(g_settings.tz_label) << "\","
       << "\"time_format\":\"" << g_settings.time_format << "\","
       << "\"date_format\":\"" << (g_settings.date_format == DATE_ISO ? "iso" :
                                   g_settings.date_format == DATE_MDY ? "mdy" :
@@ -1029,6 +1035,9 @@ date and status line:</p>
   <option value="Australia/Sydney">
  </datalist>
 </label>
+<label>Local time label (optional, shown in alternating mode):
+ <input type="text" id="tz_label" placeholder="e.g. ZURICH — empty = zone abbreviation (CEST)">
+</label>
 <label>Time format:
  <select id="time_format">
   <option value="24">24-hour</option>
@@ -1128,6 +1137,7 @@ async function loadSettings() {
   document.getElementById('show_gm_details').checked = s.show_gm_details;
   document.getElementById('show_date').checked = s.show_date;
   document.getElementById('timezone').value = s.timezone;
+  document.getElementById('tz_label').value = s.tz_label;
   document.getElementById('notify').checked = s.notify_gm_change;
   document.getElementById('domain_auto').checked = (s.domain === -1);
   document.getElementById('domain').value = (s.domain === -1) ? 0 : s.domain;
@@ -1152,6 +1162,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     show_date: document.getElementById('show_date').checked ? 1 : 0,
     mode: document.querySelector('input[name=mode]:checked').value,
     timezone: document.getElementById('timezone').value,
+    tz_label: document.getElementById('tz_label').value,
     time_format: document.getElementById('time_format').value,
     date_format: document.getElementById('date_format').value,
     domain: document.getElementById('domain_auto').checked
@@ -1236,7 +1247,9 @@ function renderClock() {
   let scale = '';
   if (cycling)
     scale = ' ' + (mode === 'local'
-        ? (p.timeZoneName || 'LOCAL') : mode.toUpperCase());
+        ? (document.getElementById('tz_label').value ||
+           p.timeZoneName || 'LOCAL')
+        : mode.toUpperCase());
   else if (mode === 'tai')
     scale = ' TAI';
   el.textContent = hh + ':' + p.minute + ':' + p.second + '.' +
@@ -1537,7 +1550,7 @@ function render() {
   }
   if (cycling)
     sup += (sup ? ' ' : '') + (mode === 'local'
-        ? (p.timeZoneName || 'LOCAL') : mode.toUpperCase());
+        ? (S.tz_label || p.timeZoneName || 'LOCAL') : mode.toUpperCase());
   else if (mode === 'tai')
     sup += (sup ? ' ' : '') + 'TAI';
   el.innerHTML = hh + ':' + p.minute + ':' + p.second + '.' +
@@ -1671,6 +1684,8 @@ static void handle_client(int fd) {
                 g_settings.timezone = kv["timezone"];
                 apply_timezone(g_settings.timezone);
             }
+            if (kv.count("tz_label") && kv["tz_label"].size() < 64)
+                g_settings.tz_label = kv["tz_label"];
             if (kv.count("time_format")) {
                 if (kv["time_format"] == "12" || kv["time_format"] == "24")
                     g_settings.time_format = atoi(kv["time_format"].c_str());
@@ -2092,6 +2107,8 @@ int main(int argc, char **argv) {
                 cycle_label = "UTC";
             } else if (eff_mode == MODE_TAI) {
                 cycle_label = "TAI";
+            } else if (!s.tz_label.empty()) {
+                cycle_label = s.tz_label;   // user-defined name
             } else {
                 char zb[24];
                 if (strftime(zb, sizeof(zb), "%Z", &tm_disp) > 0)
@@ -2123,7 +2140,7 @@ int main(int argc, char **argv) {
 
         // Second line: date, GM ID, details — alternating every 4 s.
         // A recent grandmaster change overrides everything with "! NEUER GM !".
-        std::string line2;
+        std::string line2, mid_line;
         bool line2_alert = false;
         if (have_small_font) {
             std::vector<std::string> lines;
@@ -2151,9 +2168,6 @@ int main(int argc, char **argv) {
                 lines.push_back(detail_line);
             if (!lines.empty())
                 line2 = lines[(now_ns / 4000000000ULL) % lines.size()];
-            // Cycle mode: the second line labels the displayed time scale
-            if (!cycle_label.empty())
-                line2 = cycle_label;
             if (gm_recent_change && s.notify_gm_change) {
                 line2 = "! NEW GM !";
                 line2_alert = true;
@@ -2162,6 +2176,15 @@ int main(int argc, char **argv) {
             if (gm_unaccepted) {
                 line2 = "! UNACCEPTED GM !";
                 line2_alert = true;
+            }
+            // Cycle mode: label the displayed scale — in a small line of
+            // its own between time and second line when the latter is in
+            // use, otherwise as the second line
+            if (!cycle_label.empty()) {
+                if (line2.empty())
+                    line2 = cycle_label;
+                else
+                    mid_line = cycle_label;
             }
         }
 
@@ -2197,6 +2220,17 @@ int main(int argc, char **argv) {
             DrawText(&flip_canvas, small_font,
                      x2, matrix_options.rows - 2,
                      c2, nullptr, line2.c_str(), 1);
+        }
+
+        // Time-scale label between the time and the second line
+        // (time rows 1..14, label rows 17..22, second line rows 25..30)
+        if (!mid_line.empty()) {
+            int xm = (matrix_options.cols -
+                      ((small_font.CharacterWidth('0') + 1) *
+                       (int)mid_line.size() - 1)) / 2;
+            DrawText(&flip_canvas, small_font, xm, 22,
+                     Color(s.r / 2, s.g / 2, s.b / 2),
+                     nullptr, mid_line.c_str(), 1);
         }
 
         offscreen = matrix->SwapOnVSync(offscreen);
