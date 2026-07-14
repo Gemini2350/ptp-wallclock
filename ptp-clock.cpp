@@ -953,7 +953,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <div id="gmwarn"></div>
 
 <fieldset>
-<legend>PTP time &nbsp;<a href="/clock">fullscreen clock &rarr;</a></legend>
+<legend>PTP time &nbsp;<a href="/clock" target="_blank" rel="noopener">fullscreen clock &rarr;</a></legend>
 <div id="clock">--:--:--</div>
 <div id="clockdate"></div>
 </fieldset>
@@ -1365,8 +1365,8 @@ static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
          text-shadow: 0 0 0.5em #f43; animation: pulse 1s infinite; }
  @keyframes pulse { 50% { opacity: 0.35; } }
  #footer { position: fixed; bottom: 2.5vh; left: 0; right: 0;
-         text-align: center; font-size: min(1.3vw, 4vh);
-         letter-spacing: 0.05em; color: #555; }
+         text-align: center; font-size: min(1.15vw, 3.6vh);
+         letter-spacing: 0.03em; color: #555; }
  #bo { display: none; position: fixed; bottom: 2.5vh; right: 2vw;
          color: #222; font-size: 1.4vw; }
  #cfg { position: fixed; top: 2.5vh; right: 2vw; color: #2a2a2a;
@@ -1396,6 +1396,9 @@ const ACC = {0x20:'25 ns',0x21:'100 ns',0x22:'250 ns',0x23:'1 µs',
  0x24:'2.5 µs',0x25:'10 µs',0x26:'25 µs',0x27:'100 µs',0x28:'250 µs',
  0x29:'1 ms',0x2A:'2.5 ms',0x2B:'10 ms',0x2C:'25 ms',0x2D:'100 ms',
  0x2E:'250 ms',0x2F:'1 s',0x30:'10 s',0x31:'>10 s'};
+const TSRC = {0x10:'atomic clock',0x20:'GPS/GNSS',0x30:'terrestrial radio',
+ 0x40:'PTP',0x50:'NTP',0x60:'hand set',0x90:'other',
+ 0xA0:'internal oscillator'};
 
 // Digits finer than the browser timer resolution are dithered every frame
 // (see the settings page clock for the same trick)
@@ -1448,11 +1451,12 @@ function updateFooter(s) {
       ? (s.active_domain >= 0 ? s.active_domain + ' (auto)' : 'auto')
       : s.domain;
   f.textContent = 'GM ' + s.gm_id +
-      '   ·   priority ' + s.priority1 + '/' + s.priority2 +
-      '   ·   class ' + s.clock_class +
+      ' · priority ' + s.priority1 + '/' + s.priority2 +
+      ' · class ' + s.clock_class +
       (CLS[s.clock_class] ? ' (' + CLS[s.clock_class] + ')' : '') +
-      '   ·   accuracy ' + (ACC[s.clock_accuracy] || 'unknown') +
-      '   ·   domain ' + dom;
+      ' · accuracy ' + (ACC[s.clock_accuracy] || 'unknown') +
+      ' · source ' + (TSRC[s.time_source] || 'unknown') +
+      ' · domain ' + dom;
 }
 
 async function poll() {
@@ -2014,9 +2018,9 @@ int main(int argc, char **argv) {
                     ts = tsbuf;
                 }
                 char det[48];
-                snprintf(det, sizeof(det), "P%u/%u CL%u AC%02X %s",
+                snprintf(det, sizeof(det), "P%u/%u CL%u %s",
                          g_gm.priority1, g_gm.priority2,
-                         g_gm.clock_class, g_gm.clock_accuracy, ts);
+                         g_gm.clock_class, ts);
                 detail_line = det;
             }
             timespec now;

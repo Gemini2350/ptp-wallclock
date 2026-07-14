@@ -160,8 +160,8 @@ Settings:
   live without a restart
 - **Grandmaster ID** — show the current PTP grandmaster identity as a second
   line on the matrix
-- **Priorities & clock quality** — show priority 1/2, clock class, clock
-  accuracy, and the time source (e.g. `GNSS`) on the matrix
+- **Priorities & clock quality** — show priority 1/2, clock class, and the
+  time source (e.g. `GNSS`) on the matrix
 - **Date** — show the date on the matrix (if several second-line options are
   enabled, the line alternates every 4 seconds)
 - **Time display** — UTC, TAI, or local time with a configurable time zone
