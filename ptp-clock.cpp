@@ -2094,10 +2094,12 @@ int main(int argc, char **argv) {
             }
         }
 
+        // Drawn width of N monospace chars with DrawText extra_spacing 1:
+        // N * (charwidth + 1) - 1  — the trailing spacing is not visible.
+        int time_len = (int)strlen(time_buffer);
         int x_center =
             (matrix_options.cols -
-             font.CharacterWidth('0') * strlen(time_buffer)) / 2
-            - 9;
+             ((font.CharacterWidth('0') + 1) * time_len - 1)) / 2;
 
         // With a second line active, move the time up to make room
         int y_center = !line2.empty()
@@ -2116,8 +2118,8 @@ int main(int argc, char **argv) {
 
         if (!line2.empty()) {
             int x2 = (matrix_options.cols -
-                      small_font.CharacterWidth('0') *
-                      (int)line2.size()) / 2;
+                      ((small_font.CharacterWidth('0') + 1) *
+                       (int)line2.size() - 1)) / 2;
             Color c2 = line2_alert
                 ? Color(255, 0, 0)
                 : Color(s.r / 2, s.g / 2, s.b / 2);
