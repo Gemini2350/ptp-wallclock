@@ -47,7 +47,9 @@ install -d -o daemon -g daemon "$STATE_DIR"
 echo "==> Installing systemd service"
 install -m 644 "$SCRIPT_DIR/ptp-wallclock.service" /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now ptp-wallclock.service
+systemctl enable ptp-wallclock.service
+# restart (not just start) so re-running install.sh picks up the new binary
+systemctl restart ptp-wallclock.service
 
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 echo
