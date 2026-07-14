@@ -52,6 +52,21 @@ public:
     void Clear() override { inner->Clear(); }
     void Fill(uint8_t r, uint8_t g, uint8_t b) override { inner->Fill(r, g, b); }
 };
+
+// Short time-source label for the matrix details line (IEEE 1588 table 7)
+static const char *time_source_short(uint8_t ts) {
+    switch (ts) {
+        case 0x10: return "ATOM";
+        case 0x20: return "GNSS";
+        case 0x30: return "RADIO";
+        case 0x40: return "PTP";
+        case 0x50: return "NTP";
+        case 0x60: return "HAND";
+        case 0x90: return "OTHER";
+        case 0xA0: return "OSC";
+    }
+    return nullptr;
+}
 #endif
 
 volatile bool interrupt_received = false;
@@ -1991,10 +2006,17 @@ int main(int argc, char **argv) {
             gm_unaccepted = g_have_gm && !gm_acceptable_locked();
             if (g_have_gm) {
                 id_line = format_gm(g_gm.id);
-                char det[40];
-                snprintf(det, sizeof(det), "P%u/%u CL%u AC%02X",
+                char tsbuf[8];
+                const char *ts = time_source_short(g_gm.time_source);
+                if (!ts) {
+                    snprintf(tsbuf, sizeof(tsbuf), "TS%02X",
+                             g_gm.time_source);
+                    ts = tsbuf;
+                }
+                char det[48];
+                snprintf(det, sizeof(det), "P%u/%u CL%u AC%02X %s",
                          g_gm.priority1, g_gm.priority2,
-                         g_gm.clock_class, g_gm.clock_accuracy);
+                         g_gm.clock_class, g_gm.clock_accuracy, ts);
                 detail_line = det;
             }
             timespec now;
