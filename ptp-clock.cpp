@@ -58,6 +58,8 @@ struct Settings {
     int http_port = 8319;
     int domain = -1;                      // PTP domain, -1 = auto detect
     std::string iface = "auto";           // interface, "auto" = all of them
+    std::string acceptable_gms;           // comma-separated GM identities;
+                                          // empty = any GM is acceptable
 };
 
 static Settings g_settings;
@@ -213,6 +215,7 @@ static void save_settings_locked() {
     else
         f << "domain=" << g_settings.domain << "\n";
     f << "iface=" << g_settings.iface << "\n";
+    f << "acceptable_gms=" << g_settings.acceptable_gms << "\n";
 }
 
 static void load_settings() {
@@ -274,6 +277,8 @@ static void load_settings() {
         } else if (key == "iface") {
             if (!val.empty())
                 g_settings.iface = val;
+        } else if (key == "acceptable_gms") {
+            g_settings.acceptable_gms = val;
         }
     }
     g_domain = g_settings.domain;
@@ -322,6 +327,46 @@ static uint8_t effective_domain() {
         return (uint8_t)cfg;
     int active = g_active_domain.load();
     return active >= 0 ? (uint8_t)active : 0;
+}
+
+// Normalize a user-entered grandmaster identity to the canonical
+// "aa:bb:cc:ff:fe:dd:ee:ff" form. Accepts any separator style and case;
+// returns "" when the input does not contain exactly 16 hex digits.
+static std::string normalize_gm_str(const std::string &in) {
+    std::string hex;
+    for (char c : in)
+        if (isxdigit((unsigned char)c))
+            hex += (char)tolower(c);
+    if (hex.size() != 16)
+        return "";
+    std::string out;
+    for (int i = 0; i < 8; ++i) {
+        if (i)
+            out += ":";
+        out += hex.substr(i * 2, 2);
+    }
+    return out;
+}
+
+// True when the elected grandmaster is on the acceptable list — or when
+// the list is empty/has no valid entries, or no grandmaster is elected.
+// Call with g_mutex held.
+static bool gm_acceptable_locked() {
+    if (!g_have_gm)
+        return true;
+    std::string cur = format_gm(g_gm.id);
+    bool any_valid = false;
+    std::stringstream ss(g_settings.acceptable_gms);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        std::string n = normalize_gm_str(item);
+        if (n.empty())
+            continue;
+        any_valid = true;
+        if (n == cur)
+            return true;
+    }
+    return !any_valid;
 }
 
 // BMCA dataset comparison (IEEE 1588-2008 9.3.4, single-port slave).
@@ -399,6 +444,9 @@ static void bmca_elect_locked(uint64_t now) {
     }
     g_gm = m.gm;
     g_have_gm = true;
+    if (!gm_acceptable_locked())
+        std::cout << "WARNING: grandmaster " << format_gm(m.gm.id)
+                  << " is not on the acceptable list!\n";
 
     // New sync path: restart pending state and re-measure the path delay
     g_pending_sync.valid = false;
@@ -717,6 +765,7 @@ static std::string settings_json() {
                                   "dmy") << "\","
       << "\"notify_gm_change\":" << (g_settings.notify_gm_change ? "true" : "false") << ","
       << "\"domain\":" << g_settings.domain << ","
+      << "\"acceptable_gms\":\"" << json_escape(g_settings.acceptable_gms) << "\","
       << "\"iface\":\"" << json_escape(g_settings.iface) << "\","
       << "\"ifaces\":[";
     std::vector<std::string> ifs = list_ifaces();
@@ -782,6 +831,7 @@ static std::string status_json() {
       << "\"iface_active\":\"" << json_escape(g_joined_names) << "\","
       << "\"iface_up\":" << (g_iface_up ? "true" : "false") << ","
       << "\"gm_id\":\"" << (g_have_gm ? format_gm(g_gm.id) : "") << "\","
+      << "\"gm_accepted\":" << (gm_acceptable_locked() ? "true" : "false") << ","
       << "\"priority1\":" << (int)g_gm.priority1 << ","
       << "\"priority2\":" << (int)g_gm.priority2 << ","
       << "\"clock_class\":" << (int)g_gm.clock_class << ","
@@ -845,8 +895,8 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  table.masters td { color: #eee; text-align: right; padding: 0.15em 0.3em; }
  table.masters th:first-child, table.masters td:first-child { text-align: left; }
  table.masters tr.elected td { color: #6c6; }
- #banner { display: none; background: #b33; color: #fff; padding: 0.6em;
-        border-radius: 4px; margin-bottom: 1em; }
+ #banner, #gmwarn { display: none; background: #b33; color: #fff;
+        padding: 0.6em; border-radius: 4px; margin-bottom: 1em; }
  #saved { color: #6c6; visibility: hidden; margin-left: 1em; }
  .hint { color: #888; font-size: 0.85em; margin: 0.8em 0 0.2em; }
  #clock { font-family: monospace; text-align: center; color: #fd0;
@@ -859,6 +909,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <body>
 <h1>PTP Wallclock &ndash; Settings</h1>
 <div id="banner"></div>
+<div id="gmwarn"></div>
 
 <fieldset>
 <legend>PTP time &nbsp;<a href="/clock">fullscreen clock &rarr;</a></legend>
@@ -959,6 +1010,10 @@ date and status line:</p>
  <input type="text" id="iface" list="iflist" value="eth0">
  <datalist id="iflist"></datalist>
 </label>
+<label>Acceptable grandmasters (comma-separated, empty = any):
+ <input type="text" id="acceptable_gms"
+        placeholder="00:1d:c1:ff:fe:12:34:56, 00:1d:c1:ff:fe:aa:bb:cc">
+</label>
 </fieldset>
 
 <fieldset>
@@ -1030,6 +1085,7 @@ async function loadSettings() {
   document.getElementById('domain_auto').checked = (s.domain === -1);
   document.getElementById('domain').value = (s.domain === -1) ? 0 : s.domain;
   syncDomainInput();
+  document.getElementById('acceptable_gms').value = s.acceptable_gms;
   document.getElementById('iface').value = s.iface;
   document.getElementById('iflist').innerHTML =
       ['auto'].concat(s.ifaces).map(i => '<option value="' + i + '">').join('');
@@ -1052,6 +1108,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     date_format: document.getElementById('date_format').value,
     domain: document.getElementById('domain_auto').checked
         ? -1 : document.getElementById('domain').value,
+    acceptable_gms: document.getElementById('acceptable_gms').value,
     iface: document.getElementById('iface').value,
     notify: document.getElementById('notify').checked ? 1 : 0
   });
@@ -1173,7 +1230,14 @@ async function poll() {
            : 'scanning... (auto)')
         : s.domain);
     const gm = s.gm_id !== '';
-    set('s_gm', gm ? s.gm_id : 'unknown');
+    const badGm = gm && s.gm_accepted === false;
+    set('s_gm', gm ? s.gm_id + (badGm ? ' — NOT ACCEPTED' : '') : 'unknown');
+    document.getElementById('s_gm').style.color = badGm ? '#f66' : '';
+    const w = document.getElementById('gmwarn');
+    w.style.display = badGm ? 'block' : 'none';
+    if (badGm)
+      w.textContent = 'Unaccepted grandmaster: ' + s.gm_id +
+          ' is not on the acceptable list!';
     set('s_prio', gm ? s.priority1 + ' / ' + s.priority2 : '–');
     set('s_class', gm ? s.clock_class + ' (' +
         (CLOCK_CLASS[s.clock_class] || 'reserved') + ')' : '–');
@@ -1317,10 +1381,17 @@ async function loadSettings() {
 
 function updateFooter(s) {
   const a = document.getElementById('alert');
-  const showAlert = S && S.notify_gm_change &&
-      s.seconds_since_change >= 0 && s.seconds_since_change < 10;
-  a.style.display = showAlert ? 'block' : 'none';
-  if (showAlert) a.textContent = '! NEW GM !  ' + s.gm_id;
+  // Persistent error when the elected GM is not on the acceptable list;
+  // the transient NEW GM alert comes second.
+  if (s.gm_id && s.gm_accepted === false) {
+    a.style.display = 'block';
+    a.textContent = '! UNACCEPTED GM !  ' + s.gm_id;
+  } else {
+    const showAlert = S && S.notify_gm_change &&
+        s.seconds_since_change >= 0 && s.seconds_since_change < 10;
+    a.style.display = showAlert ? 'block' : 'none';
+    if (showAlert) a.textContent = '! NEW GM !  ' + s.gm_id;
+  }
 
   const f = document.getElementById('footer');
   if (!s.gm_id) {
@@ -1554,6 +1625,9 @@ static void handle_client(int fd) {
                 g_settings.iface = kv["iface"];
                 g_iface_changed = true;   // main loop rejoins multicast
             }
+            if (kv.count("acceptable_gms") &&
+                kv["acceptable_gms"].size() < 4096)
+                g_settings.acceptable_gms = kv["acceptable_gms"];
             if (kv.count("notify"))
                 g_settings.notify_gm_change = (kv["notify"] == "1");
             save_settings_locked();
@@ -1876,9 +1950,11 @@ int main(int argc, char **argv) {
         Settings s;
         std::string id_line, detail_line;
         bool gm_recent_change = false;
+        bool gm_unaccepted = false;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             s = g_settings;
+            gm_unaccepted = g_have_gm && !gm_acceptable_locked();
             if (g_have_gm) {
                 id_line = format_gm(g_gm.id);
                 char det[40];
@@ -1975,6 +2051,11 @@ int main(int argc, char **argv) {
                 line2 = "! NEW GM !";
                 line2_alert = true;
             }
+            // Persistent error state beats the transient change alert
+            if (gm_unaccepted) {
+                line2 = "! UNACCEPTED GM !";
+                line2_alert = true;
+            }
         }
 
         int x_center =
@@ -1987,10 +2068,11 @@ int main(int argc, char **argv) {
             ? font.baseline() + 3
             : (matrix_options.rows + font.baseline()) / 2;
 
-        // Without a small font the GM change indicator falls back to
-        // coloring the time itself red for 10 seconds.
-        bool time_alert = gm_recent_change && s.notify_gm_change &&
-                          !have_small_font;
+        // Without a small font the alerts fall back to coloring the time
+        // itself red (10 s on a GM change; while an unaccepted GM is elected).
+        bool time_alert = !have_small_font &&
+                          ((gm_recent_change && s.notify_gm_change) ||
+                           gm_unaccepted);
         DrawText(offscreen, font,
                  x_center, y_center,
                  time_alert ? Color(255, 0, 0) : Color(s.r, s.g, s.b),

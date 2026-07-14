@@ -169,6 +169,11 @@ Settings:
   (0–255); the detected domain is shown in the status panel
 - **Network interface** — selectable from the interfaces present on the
   system, applied without restart
+- **Acceptable grandmasters** — optional comma-separated list of grandmaster
+  identities (any separator style). If BMCA elects a grandmaster that is not
+  on the list, a red `! UNACCEPTED GM !` error appears on the LED matrix and
+  the browser clock, and the settings page shows a warning banner. Empty
+  list = any grandmaster is fine
 - **Grandmaster change notification** — when enabled, a grandmaster change
   shows `! NEW GM !` in red on the matrix (and on the browser clock) for
   10 seconds and triggers a browser notification / banner on the settings
