@@ -1244,22 +1244,24 @@ function renderClock() {
     h = h % 12 || 12;
     hh = String(h).padStart(2, '0');
   }
-  let scale = '';
+  // Cycle mode labels the shown scale on the date line, before the date
+  let cyc = '';
   if (cycling)
-    scale = ' ' + (mode === 'local'
+    cyc = mode === 'local'
         ? (document.getElementById('tz_label').value ||
            p.timeZoneName || 'LOCAL')
-        : mode.toUpperCase());
+        : mode.toUpperCase();
   else if (mode === 'tai')
-    scale = ' TAI';
+    suffix += ' TAI';
   el.textContent = hh + ':' + p.minute + ':' + p.second + '.' +
-      String(frac).padStart(9, '0') + suffix + scale;
+      String(frac).padStart(9, '0') + suffix;
   const wd = p.weekday.toUpperCase();
-  ed.textContent = df === 'iso'
+  const dateStr = df === 'iso'
       ? wd + ' ' + p.year + '-' + p.month + '-' + p.day
       : df === 'mdy'
         ? wd + ' ' + p.month + '/' + p.day + '/' + p.year
         : wd + ' ' + p.day + '.' + p.month + '.' + p.year;
+  ed.textContent = (cyc ? cyc + '  ·  ' : '') + dateStr;
 }
 (function clockTick() {
   renderClock();
@@ -1548,20 +1550,23 @@ function render() {
     h = h % 12 || 12;
     hh = String(h).padStart(2, '0');
   }
+  // Cycle mode labels the shown scale on the date line, before the date
+  let cyc = '';
   if (cycling)
-    sup += (sup ? ' ' : '') + (mode === 'local'
-        ? (S.tz_label || p.timeZoneName || 'LOCAL') : mode.toUpperCase());
+    cyc = mode === 'local'
+        ? (S.tz_label || p.timeZoneName || 'LOCAL') : mode.toUpperCase();
   else if (mode === 'tai')
     sup += (sup ? ' ' : '') + 'TAI';
   el.innerHTML = hh + ':' + p.minute + ':' + p.second + '.' +
       String(frac).padStart(9, '0') +
       (sup ? '<span class="sup">' + sup + '</span>' : '');
   const wd = p.weekday.toUpperCase();
-  ed.textContent = df === 'iso'
+  const dateStr = df === 'iso'
       ? wd + ' ' + p.year + '-' + p.month + '-' + p.day
       : df === 'mdy'
         ? wd + ' ' + p.month + '/' + p.day + '/' + p.year
         : wd + ' ' + p.day + '.' + p.month + '.' + p.year;
+  ed.textContent = (cyc ? cyc + '  ·  ' : '') + dateStr;
 }
 
 document.body.addEventListener('click', () => {
