@@ -156,6 +156,8 @@ Settings:
 - **Brightness** — 1–100 % slider, applied immediately
 - **Blackout** — one-click switch to temporarily turn the display off
   (the clock keeps tracking PTP in the background)
+- **Rotate 180°** — for LED panels that are mounted upside down, applied
+  live without a restart
 - **Grandmaster ID** — show the current PTP grandmaster identity as a second
   line on the matrix
 - **Priorities & clock quality** — show priority 1/2, clock class and clock

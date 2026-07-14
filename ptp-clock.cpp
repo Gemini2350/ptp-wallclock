@@ -31,6 +31,27 @@
 
 #ifndef NO_MATRIX
 using namespace rgb_matrix;
+
+// Draws through to the real canvas, optionally rotated by 180 degrees —
+// for LED panels that are mounted upside down. A live web setting, so the
+// rotation happens here at draw time instead of in a pixel mapper, which
+// the library only applies at matrix-creation time.
+class FlipCanvas : public Canvas {
+public:
+    Canvas *inner = nullptr;
+    bool flip = false;
+    int width() const override { return inner->width(); }
+    int height() const override { return inner->height(); }
+    void SetPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) override {
+        if (flip)
+            inner->SetPixel(inner->width() - 1 - x,
+                            inner->height() - 1 - y, r, g, b);
+        else
+            inner->SetPixel(x, y, r, g, b);
+    }
+    void Clear() override { inner->Clear(); }
+    void Fill(uint8_t r, uint8_t g, uint8_t b) override { inner->Fill(r, g, b); }
+};
 #endif
 
 volatile bool interrupt_received = false;
@@ -47,6 +68,7 @@ struct Settings {
     uint8_t r = 255, g = 255, b = 0;      // display color
     int brightness = 100;                 // display brightness in percent
     bool blackout = false;                // display temporarily off
+    bool rotate180 = false;               // LED matrix mounted upside down
     bool show_gm = false;                 // show grandmaster ID on the matrix
     bool show_gm_details = false;         // show priorities / clock quality
     bool show_date = false;               // show the date on the matrix
@@ -199,6 +221,7 @@ static void save_settings_locked() {
       << (int)g_settings.b << "\n";
     f << "brightness=" << g_settings.brightness << "\n";
     f << "blackout=" << (g_settings.blackout ? 1 : 0) << "\n";
+    f << "rotate180=" << (g_settings.rotate180 ? 1 : 0) << "\n";
     f << "show_gm=" << (g_settings.show_gm ? 1 : 0) << "\n";
     f << "show_gm_details=" << (g_settings.show_gm_details ? 1 : 0) << "\n";
     f << "show_date=" << (g_settings.show_date ? 1 : 0) << "\n";
@@ -240,6 +263,8 @@ static void load_settings() {
                 g_settings.brightness = v;
         } else if (key == "blackout") {
             g_settings.blackout = (val == "1");
+        } else if (key == "rotate180") {
+            g_settings.rotate180 = (val == "1");
         } else if (key == "show_gm") {
             g_settings.show_gm = (val == "1");
         } else if (key == "show_gm_details") {
@@ -753,6 +778,7 @@ static std::string settings_json() {
     j << "{\"color\":\"" << color << "\","
       << "\"brightness\":" << g_settings.brightness << ","
       << "\"blackout\":" << (g_settings.blackout ? "true" : "false") << ","
+      << "\"rotate180\":" << (g_settings.rotate180 ? "true" : "false") << ","
       << "\"show_gm\":" << (g_settings.show_gm ? "true" : "false") << ","
       << "\"show_gm_details\":" << (g_settings.show_gm_details ? "true" : "false") << ","
       << "\"show_date\":" << (g_settings.show_date ? "true" : "false") << ","
@@ -953,6 +979,9 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <label>Brightness: <span id="bval">100</span> %
  <input type="range" id="brightness" min="1" max="100" value="100">
 </label>
+<label>
+ <input type="checkbox" id="rotate180"> Rotate display 180&deg; (LED matrix mounted upside down)
+</label>
 <p class="hint">The 2nd-line options below only affect the physical LED
 matrix &mdash; the <a href="/clock">browser clock</a> always shows its own
 date and status line:</p>
@@ -1075,6 +1104,7 @@ async function loadSettings() {
   document.getElementById('color').value = s.color;
   document.getElementById('brightness').value = s.brightness;
   document.getElementById('bval').textContent = s.brightness;
+  document.getElementById('rotate180').checked = s.rotate180;
   blackout = s.blackout;
   renderBlackout();
   document.getElementById('show_gm').checked = s.show_gm;
@@ -1099,6 +1129,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   const body = new URLSearchParams({
     color: document.getElementById('color').value,
     brightness: document.getElementById('brightness').value,
+    rotate180: document.getElementById('rotate180').checked ? 1 : 0,
     show_gm: document.getElementById('show_gm').checked ? 1 : 0,
     show_gm_details: document.getElementById('show_gm_details').checked ? 1 : 0,
     show_date: document.getElementById('show_date').checked ? 1 : 0,
@@ -1584,6 +1615,8 @@ static void handle_client(int fd) {
             }
             if (kv.count("blackout"))
                 g_settings.blackout = (kv["blackout"] == "1");
+            if (kv.count("rotate180"))
+                g_settings.rotate180 = (kv["rotate180"] == "1");
             if (kv.count("show_gm"))
                 g_settings.show_gm = (kv["show_gm"] == "1");
             if (kv.count("show_gm_details"))
@@ -1730,6 +1763,7 @@ int main(int argc, char **argv) {
     }
 
     FrameCanvas *offscreen = matrix->CreateFrameCanvas();
+    FlipCanvas flip_canvas;               // optional 180-degree rotation
 
     // --- Fonts ---
     Font font;
@@ -1971,6 +2005,8 @@ int main(int argc, char **argv) {
         }
 
         offscreen->SetBrightness((uint8_t)s.brightness);
+        flip_canvas.inner = offscreen;
+        flip_canvas.flip = s.rotate180;
 
         // Blackout, or no PTP reference (yet): show a black display
         if (s.blackout || !have_ptp_ref) {
@@ -2073,7 +2109,7 @@ int main(int argc, char **argv) {
         bool time_alert = !have_small_font &&
                           ((gm_recent_change && s.notify_gm_change) ||
                            gm_unaccepted);
-        DrawText(offscreen, font,
+        DrawText(&flip_canvas, font,
                  x_center, y_center,
                  time_alert ? Color(255, 0, 0) : Color(s.r, s.g, s.b),
                  nullptr, time_buffer, 1);
@@ -2085,7 +2121,7 @@ int main(int argc, char **argv) {
             Color c2 = line2_alert
                 ? Color(255, 0, 0)
                 : Color(s.r / 2, s.g / 2, s.b / 2);
-            DrawText(offscreen, small_font,
+            DrawText(&flip_canvas, small_font,
                      x2, matrix_options.rows - 2,
                      c2, nullptr, line2.c_str(), 1);
         }
