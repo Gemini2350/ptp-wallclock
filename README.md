@@ -165,22 +165,21 @@ Settings:
 - **Rotate 180°** — for LED panels that are mounted upside down, applied
   live without a restart
 - **Clock lines** — the list of clocks shown on the LED matrix. Per line:
-  time scale (UTC / TAI / local), style (digital 24h/12h, Unix timestamp,
-  binary BCD, flip clock, DCF77 telegram, pendulum, hourglass, German word
-  clock), and an optional label (blank = none, `%Z` = zone abbreviation).
-  One line is shown statically, several alternate every 4 seconds —
-  PTP-second aligned, like everything else
+  time zone (UTC, TAI, or any IANA zone — so a world clock like
+  `New York / Zurich / Tokyo` is just three lines), style (digital 24h/12h,
+  Unix timestamp, binary BCD, flip clock, DCF77 telegram, pendulum,
+  hourglass, German word clock), and an optional label (blank = none,
+  `%Z` = zone abbreviation). One line is shown statically, several
+  alternate every 4 seconds — PTP-second aligned, like everything else
 - **Grandmaster ID** — show the current PTP grandmaster identity as a second
   line on the matrix
 - **Priorities & clock quality** — show priority 1/2, clock class, and the
   time source (e.g. `GNSS`) on the matrix
 - **Date** — show the date on the matrix (if several second-line options are
   enabled, the line alternates every 4 seconds)
-- **Time zone & date format** — the IANA time zone used by local clock
-  lines (e.g. `Europe/Berlin`) and the date format (`DD.MM.YYYY`, ISO 8601,
-  or `MM/DD/YYYY`). The browser clock follows the same clock lines as the
-  LED matrix — labels appear between time and date, and pixel styles fall
-  back to a digital rendering
+- **Date format** — `DD.MM.YYYY`, ISO 8601, or `MM/DD/YYYY`. The browser
+  clock follows the same clock lines as the LED matrix — labels appear
+  between time and date, and pixel styles fall back to a digital rendering
 - **PTP domain** — automatic detection (default) or a fixed domain number
   (0–255); the detected domain is shown in the status panel
 - **Network interface** — selectable from the interfaces present on the

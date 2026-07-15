@@ -98,7 +98,8 @@ enum DateFormat { DATE_DMY = 0, DATE_ISO = 1, DATE_MDY = 2 };
 // One clock line on the LED display. The display shows a configurable
 // list of these: a single entry is static, several alternate every 4 s.
 struct ClockEntry {
-    int scale = MODE_UTC;                 // MODE_UTC / MODE_TAI / MODE_LOCAL
+    std::string zone = "UTC";             // "UTC", "TAI", or an IANA zone
+                                          // name like "Europe/Zurich"
     std::string style = "24h";            // rendering style, see kStyles
     std::string name;                     // label; "" = none, "%Z" = zone
 };
@@ -113,15 +114,16 @@ static bool style_valid(const std::string &st) {
     return false;
 }
 
-// Serialized form: "scale,style,name;scale,style,name" — the name is
+// Serialized form: "zone,style,name;zone,style,name" — the name is
 // everything after the second comma, so commas inside names are fine.
+// The legacy scale tokens utc/tai/local are still understood; "local"
+// maps to the configured legacy time zone (see clocks_parse's caller).
 static std::string clocks_serialize(const std::vector<ClockEntry> &v) {
     std::string out;
     for (const auto &e : v) {
         if (!out.empty())
             out += ";";
-        out += (e.scale == MODE_TAI ? "tai" :
-                e.scale == MODE_LOCAL ? "local" : "utc");
+        out += e.zone;
         out += ",";
         out += e.style;
         out += ",";
@@ -130,7 +132,8 @@ static std::string clocks_serialize(const std::vector<ClockEntry> &v) {
     return out;
 }
 
-static std::vector<ClockEntry> clocks_parse(const std::string &in) {
+static std::vector<ClockEntry> clocks_parse(const std::string &in,
+                                            const std::string &legacy_tz) {
     std::vector<ClockEntry> out;
     std::stringstream ss(in);
     std::string item;
@@ -142,9 +145,15 @@ static std::vector<ClockEntry> clocks_parse(const std::string &in) {
         if (c2 == std::string::npos)
             continue;
         ClockEntry e;
-        std::string sc = item.substr(0, c1);
-        e.scale = sc == "tai" ? MODE_TAI :
-                  sc == "local" ? MODE_LOCAL : MODE_UTC;
+        e.zone = item.substr(0, c1);
+        if (e.zone == "utc")
+            e.zone = "UTC";
+        else if (e.zone == "tai")
+            e.zone = "TAI";
+        else if (e.zone == "local")
+            e.zone = legacy_tz.empty() ? "UTC" : legacy_tz;
+        if (e.zone.empty() || e.zone.size() > 48)
+            e.zone = "UTC";
         e.style = item.substr(c1 + 1, c2 - c1 - 1);
         if (!style_valid(e.style))
             e.style = "24h";
@@ -345,6 +354,17 @@ static void apply_timezone(const std::string &tz) {
     tzset();
 }
 
+// Per-clock-line zone switching for the LED renderer (main thread only).
+// glibc caches the parsed zone, so this is cheap while the zone is stable.
+static std::string g_render_tz;
+static void ensure_tz(const std::string &tz) {
+    if (tz == g_render_tz)
+        return;
+    setenv("TZ", tz.c_str(), 1);
+    tzset();
+    g_render_tz = tz;
+}
+
 // ---- Config persistence (key=value lines) ----
 static void resolve_config_path() {
     const char *env = getenv("PTP_WALLCLOCK_CONF");
@@ -439,7 +459,7 @@ static void load_settings() {
         } else if (key == "show_zone") {
             g_settings.show_zone = (val == "1");
         } else if (key == "clocks") {
-            g_settings.clocks = clocks_parse(val);
+            g_settings.clocks = clocks_parse(val, g_settings.timezone);
         } else if (key == "time_format") {
             if (val == "12" || val == "24")
                 g_settings.time_format = atoi(val.c_str());
@@ -474,6 +494,13 @@ static void load_settings() {
     // the classic mode/format/label settings so behavior stays the same.
     if (g_settings.clocks.empty()) {
         std::string style = g_settings.time_format == 12 ? "12h" : "24h";
+        std::string local_zone = g_settings.timezone.empty()
+            ? "UTC" : g_settings.timezone;
+        auto zone_for = [&](int scale) -> std::string {
+            if (scale == MODE_UTC) return "UTC";
+            if (scale == MODE_TAI) return "TAI";
+            return local_zone;
+        };
         auto label_for = [&](int scale) -> std::string {
             if (scale == MODE_UTC)
                 return g_settings.utc_label.empty() ? "UTC"
@@ -485,10 +512,11 @@ static void load_settings() {
         };
         if (g_settings.mode == MODE_CYCLE) {
             for (int sc : {MODE_UTC, MODE_TAI, MODE_LOCAL})
-                g_settings.clocks.push_back({sc, style, label_for(sc)});
+                g_settings.clocks.push_back(
+                    {zone_for(sc), style, label_for(sc)});
         } else {
             g_settings.clocks.push_back(
-                {g_settings.mode, style,
+                {zone_for(g_settings.mode), style,
                  g_settings.show_zone ? label_for(g_settings.mode)
                                       : std::string()});
         }
@@ -979,9 +1007,7 @@ static std::string settings_json() {
       << "\"clocks\":[";
     for (size_t i = 0; i < g_settings.clocks.size(); ++i) {
         const ClockEntry &e = g_settings.clocks[i];
-        j << (i ? "," : "") << "{\"scale\":\""
-          << (e.scale == MODE_TAI ? "tai" :
-              e.scale == MODE_LOCAL ? "local" : "utc")
+        j << (i ? "," : "") << "{\"zone\":\"" << json_escape(e.zone)
           << "\",\"style\":\"" << e.style << "\",\"name\":\""
           << json_escape(e.name) << "\"}";
     }
@@ -1217,18 +1243,7 @@ matrix:</p>
 </fieldset>
 
 <fieldset>
-<legend>Time zone &amp; date</legend>
-<label>Time zone (used by local clock lines):
- <input type="text" id="timezone" list="tzlist" value="Europe/Berlin">
- <datalist id="tzlist">
-  <option value="Europe/Berlin"><option value="Europe/Zurich">
-  <option value="Europe/Vienna"><option value="Europe/London">
-  <option value="UTC"><option value="America/New_York">
-  <option value="America/Chicago"><option value="America/Los_Angeles">
-  <option value="Asia/Tokyo"><option value="Asia/Shanghai">
-  <option value="Australia/Sydney">
- </datalist>
-</label>
+<legend>Date</legend>
 <label>Date format:
  <select id="date_format">
   <option value="dmy">31.12.2026 (DD.MM.YYYY)</option>
@@ -1293,13 +1308,21 @@ const STYLES = [['24h', 'digital 24h'], ['12h', 'digital 12h (AM/PM)'],
   ['flip', 'flip clock'], ['dcf77', 'DCF77 telegram'],
   ['pend', 'pendulum'], ['sand', 'hourglass'],
   ['words', 'word clock (German)']];
+const ZONES = ['UTC', 'TAI', 'Europe/Berlin', 'Europe/Zurich',
+  'Europe/Vienna', 'Europe/London', 'Europe/Paris', 'Europe/Moscow',
+  'America/New_York', 'America/Chicago', 'America/Denver',
+  'America/Los_Angeles', 'America/Sao_Paulo', 'Asia/Dubai',
+  'Asia/Kolkata', 'Asia/Shanghai', 'Asia/Tokyo', 'Asia/Singapore',
+  'Australia/Sydney', 'Pacific/Auckland'];
 function clockRow(e) {
   const div = document.createElement('div');
   div.className = 'crow';
+  const zones = ZONES.includes(e.zone) || !e.zone
+      ? ZONES : [e.zone].concat(ZONES);
   div.innerHTML =
-    '<select class="c_scale">' + ['utc', 'tai', 'local'].map(v =>
-      '<option value="' + v + '"' + (v === e.scale ? ' selected' : '') +
-      '>' + v.toUpperCase() + '</option>').join('') + '</select>' +
+    '<select class="c_zone">' + zones.map(v =>
+      '<option value="' + v + '"' + (v === e.zone ? ' selected' : '') +
+      '>' + v + '</option>').join('') + '</select>' +
     '<select class="c_style">' + STYLES.map(p =>
       '<option value="' + p[0] + '"' + (p[0] === e.style ? ' selected' : '') +
       '>' + p[1] + '</option>').join('') + '</select>' +
@@ -1315,16 +1338,16 @@ function clockRow(e) {
 function setClockRows(list) {
   const c = document.getElementById('clock_rows');
   c.innerHTML = '';
-  (list && list.length ? list : [{scale: 'utc', style: '24h', name: ''}])
+  (list && list.length ? list : [{zone: 'UTC', style: '24h', name: ''}])
       .forEach(e => c.appendChild(clockRow(e)));
 }
 document.getElementById('add_clock').addEventListener('click', () => {
   document.getElementById('clock_rows').appendChild(
-      clockRow({scale: 'utc', style: '24h', name: ''}));
+      clockRow({zone: 'UTC', style: '24h', name: ''}));
 });
 function clocksSerialized() {
   return Array.from(document.querySelectorAll('#clock_rows .crow')).map(r =>
-    r.querySelector('.c_scale').value + ',' +
+    r.querySelector('.c_zone').value + ',' +
     r.querySelector('.c_style').value + ',' +
     r.querySelector('.c_name').value.replace(/;/g, ' ').trim()
   ).join(';');
@@ -1365,7 +1388,6 @@ async function loadSettings() {
   document.getElementById('show_gm').checked = s.show_gm;
   document.getElementById('show_gm_details').checked = s.show_gm_details;
   document.getElementById('show_date').checked = s.show_date;
-  document.getElementById('timezone').value = s.timezone;
   document.getElementById('notify').checked = s.notify_gm_change;
   document.getElementById('domain_auto').checked = (s.domain === -1);
   document.getElementById('domain').value = (s.domain === -1) ? 0 : s.domain;
@@ -1387,7 +1409,6 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     show_gm: document.getElementById('show_gm').checked ? 1 : 0,
     show_gm_details: document.getElementById('show_gm_details').checked ? 1 : 0,
     show_date: document.getElementById('show_date').checked ? 1 : 0,
-    timezone: document.getElementById('timezone').value,
     date_format: document.getElementById('date_format').value,
     domain: document.getElementById('domain_auto').checked
         ? -1 : document.getElementById('domain').value,
@@ -1446,16 +1467,15 @@ function renderClock() {
   // Active clock line straight from the editor rows (live preview),
   // same PTP-second-aligned rotation as the LED display
   const rows = document.querySelectorAll('#clock_rows .crow');
-  let scale = 'utc', style = '24h', name = '';
+  let zone = 'UTC', style = '24h', name = '';
   if (rows.length) {
     const r = rows[rows.length > 1 ? Math.floor(sec / 4) % rows.length : 0];
-    scale = r.querySelector('.c_scale').value;
+    zone = r.querySelector('.c_zone').value;
     style = r.querySelector('.c_style').value;
     name = r.querySelector('.c_name').value.trim();
   }
-  let tz = scale === 'local'
-      ? document.getElementById('timezone').value : 'UTC';
-  if (scale !== 'tai') sec -= clockBase.off;     // TAI -> UTC
+  const tz = (zone === 'UTC' || zone === 'TAI') ? 'UTC' : zone;
+  if (zone !== 'TAI') sec -= clockBase.off;      // TAI -> UTC
 
   const d = new Date(sec * 1000);
   let p;
@@ -1486,7 +1506,8 @@ function renderClock() {
     body = p.hour + ':' + p.minute + ':' + p.second + '.' + fr9;
   }
   el.textContent = body;
-  ez.textContent = name === '%Z' ? (p.timeZoneName || '') : name;
+  ez.textContent = name === '%Z'
+      ? (zone === 'TAI' ? 'TAI' : (p.timeZoneName || '')) : name;
   const wd = p.weekday.toUpperCase();
   ed.textContent = df === 'iso'
       ? wd + ' ' + p.year + '-' + p.month + '-' + p.day
@@ -1766,10 +1787,11 @@ function render() {
 
   // Active clock line, same PTP-aligned rotation as the LED display
   const list = (S.clocks && S.clocks.length)
-      ? S.clocks : [{scale: 'utc', style: '24h', name: ''}];
+      ? S.clocks : [{zone: 'UTC', style: '24h', name: ''}];
   const cl = list[list.length > 1 ? Math.floor(sec / 4) % list.length : 0];
-  const tz = cl.scale === 'local' ? S.timezone : 'UTC';
-  if (cl.scale !== 'tai') sec -= base.off;
+  const tz = (cl.zone === 'UTC' || cl.zone === 'TAI' || !cl.zone)
+      ? 'UTC' : cl.zone;
+  if (cl.zone !== 'TAI') sec -= base.off;
   const d = new Date(sec * 1000);
   let p;
   try {
@@ -1801,7 +1823,8 @@ function render() {
   el.innerHTML = body +
       (sup ? '<span class="sup">' + sup + '</span>' : '');
   const nm = cl.name || '';
-  ez.textContent = nm === '%Z' ? (p.timeZoneName || '') : nm;
+  ez.textContent = nm === '%Z'
+      ? (cl.zone === 'TAI' ? 'TAI' : (p.timeZoneName || '')) : nm;
   const wd = p.weekday.toUpperCase();
   ed.textContent = df === 'iso'
       ? wd + ' ' + p.year + '-' + p.month + '-' + p.day
@@ -1939,7 +1962,8 @@ static void handle_client(int fd) {
             if (kv.count("show_zone"))
                 g_settings.show_zone = (kv["show_zone"] == "1");
             if (kv.count("clocks") && kv["clocks"].size() < 2048) {
-                std::vector<ClockEntry> v = clocks_parse(kv["clocks"]);
+                std::vector<ClockEntry> v =
+                    clocks_parse(kv["clocks"], g_settings.timezone);
                 if (!v.empty())
                     g_settings.clocks = v;
             }
@@ -2363,22 +2387,31 @@ int main(int argc, char **argv) {
             }
         }
 
-        int eff_mode = entry.scale;
-        if (eff_mode != MODE_TAI)
+        bool zone_tai = entry.zone == "TAI";
+        bool zone_utc = entry.zone == "UTC" || entry.zone.empty();
+        if (!zone_tai)
             sec -= current_utc_offset;   // TAI -> UTC
 
         struct tm tm_disp;
-        if (eff_mode == MODE_LOCAL)
-            localtime_r(&sec, &tm_disp);
-        else
+        if (zone_tai || zone_utc) {
             gmtime_r(&sec, &tm_disp);
+        } else {
+            ensure_tz(entry.zone);
+            localtime_r(&sec, &tm_disp);
+        }
 
         // Line label: the entry's name; %Z expands to the zone abbreviation
         std::string cycle_label = entry.name;
         if (cycle_label == "%Z") {
-            char zb[24];
-            cycle_label = (strftime(zb, sizeof(zb), "%Z", &tm_disp) > 0)
-                ? std::string(zb) : std::string();
+            if (zone_tai) {
+                cycle_label = "TAI";
+            } else if (zone_utc) {
+                cycle_label = "UTC";
+            } else {
+                char zb[24];
+                cycle_label = (strftime(zb, sizeof(zb), "%Z", &tm_disp) > 0)
+                    ? std::string(zb) : std::string();
+            }
         }
 
         offscreen->Fill(0,0,0);
@@ -2539,10 +2572,10 @@ int main(int argc, char **argv) {
             // announces the NEXT minute, so encode that.
             time_t tnext = sec + (60 - tm_disp.tm_sec);
             struct tm tn;
-            if (eff_mode == MODE_LOCAL)
-                localtime_r(&tnext, &tn);
-            else
+            if (zone_tai || zone_utc)
                 gmtime_r(&tnext, &tn);
+            else
+                localtime_r(&tnext, &tn);   // ensure_tz already applied
             bool bit[59] = {false};
             auto put_bcd = [&](int v, int start, int n, int &par) {
                 int b = ((v / 10) << 4) | (v % 10);
