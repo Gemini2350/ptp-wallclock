@@ -105,7 +105,7 @@ struct ClockEntry {
 };
 
 static const char *kStyles[] = {"24h", "12h", "unix", "bcd", "flip",
-                                "dcf77", "pend", "sand", "words"};
+                                "dcf77"};
 
 static bool style_valid(const std::string &st) {
     for (const char *k : kStyles)
@@ -1305,9 +1305,7 @@ document.getElementById('domain_auto').addEventListener('change', syncDomainInpu
 // --- LED clock-line list editor ---
 const STYLES = [['24h', 'digital 24h'], ['12h', 'digital 12h (AM/PM)'],
   ['unix', 'Unix timestamp'], ['bcd', 'binary (BCD)'],
-  ['flip', 'flip clock'], ['dcf77', 'DCF77 telegram'],
-  ['pend', 'pendulum'], ['sand', 'hourglass'],
-  ['words', 'word clock (German)']];
+  ['flip', 'flip clock'], ['dcf77', 'DCF77 telegram']];
 const ZONES = ['UTC', 'TAI', 'Europe/Berlin', 'Europe/Zurich',
   'Europe/Vienna', 'Europe/London', 'Europe/Paris', 'Europe/Moscow',
   'America/New_York', 'America/Chicago', 'America/Denver',
@@ -2413,6 +2411,13 @@ int main(int argc, char **argv) {
                     ? std::string(zb) : std::string();
             }
         }
+        // 12h style: AM/PM lives on the label line so the big line keeps
+        // all nine fractional digits
+        if (entry.style == "12h") {
+            const char *ampm = tm_disp.tm_hour < 12 ? "AM" : "PM";
+            cycle_label += cycle_label.empty() ? ampm
+                                               : (std::string(" ") + ampm);
+        }
 
         offscreen->Fill(0,0,0);
 
@@ -2501,11 +2506,23 @@ int main(int argc, char **argv) {
 
         const std::string &style = entry.style;
         if (style == "unix") {
-            // Seconds since the epoch (UTC or TAI scale) + 7 fast digits
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%lld.%07u",
-                     (long long)sec, nsec / 100);
-            draw_center(font, buf, text_base, c_main);
+            // Seconds since the epoch, big — all nine fractional digits
+            // follow in the small font on the same baseline
+            char bsec[24], bfrac[16];
+            snprintf(bsec, sizeof(bsec), "%lld", (long long)sec);
+            snprintf(bfrac, sizeof(bfrac), ".%09u", nsec);
+            if (have_small_font) {
+                int wbig = (font.CharacterWidth('0') + 1) *
+                           (int)strlen(bsec) - 1;
+                int wsm = (small_font.CharacterWidth('0') + 1) *
+                          (int)strlen(bfrac) - 1;
+                int x0 = (matrix_options.cols - (wbig + 2 + wsm)) / 2;
+                DrawText(cv, font, x0, text_base, c_main, nullptr, bsec, 1);
+                DrawText(cv, small_font, x0 + wbig + 2, text_base, c_main,
+                         nullptr, bfrac, 1);
+            } else {
+                draw_center(font, bsec, text_base, c_main);
+            }
         } else if (style == "bcd") {
             // Binary clock: six BCD columns (HHMMSS), MSB at the top
             int dg[6] = {tm_disp.tm_hour / 10, tm_disp.tm_hour % 10,
@@ -2530,19 +2547,22 @@ int main(int argc, char **argv) {
                 }
             }
         } else if (style == "flip") {
-            // Solari-style roll: changed digits slide down over 250 ms
-            char cur[9];
-            snprintf(cur, sizeof(cur), "%02d:%02d:%02d",
-                     tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec);
+            // Solari-style roll on HH:MM:SS — the nine fractional digits
+            // follow plainly and spin on their own
+            char cur[24];
+            snprintf(cur, sizeof(cur), "%02d:%02d:%02d.%09u",
+                     tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec,
+                     nsec);
             if (!flip_init) {
-                memcpy(flip_prev, cur, 9);
-                memcpy(flip_old, cur, 9);
+                memcpy(flip_prev, cur, 8);
+                memcpy(flip_old, cur, 8);
+                flip_prev[8] = flip_old[8] = 0;
                 for (int i = 0; i < 8; ++i)
                     flip_change[i] = 0;
                 flip_init = true;
             }
             int cw = font.CharacterWidth('0') + 1;
-            int x0 = (matrix_options.cols - (cw * 8 - 1)) / 2;
+            int x0 = (matrix_options.cols - (cw * 18 - 1)) / 2;
             clip_canvas.inner = cv;
             clip_canvas.y0 = text_base - font.baseline();
             clip_canvas.y1 = text_base + 2;
@@ -2566,6 +2586,9 @@ int main(int argc, char **argv) {
                              nullptr, one, 1);
                 }
             }
+            // ".nnnnnnnnn" — drawn plainly, no roll
+            DrawText(cv, font, x0 + 8 * cw, text_base, c_main,
+                     nullptr, cur + 8, 1);
         } else if (style == "dcf77") {
             // The current minute as a DCF77 telegram: 59 second marks
             // (short = 0, long = 1), second 59 is the sync gap. DCF77
@@ -2623,95 +2646,19 @@ int main(int argc, char **argv) {
                     for (int dx = 0; dx < 3; ++dx)
                         cv->SetPixel(cx + dx, cy + 2 - dy, cc.r, cc.g, cc.b);
             }
-        } else if (style == "pend") {
-            // Digital time with a metronome ball, phase-locked to the
-            // PTP second: it reaches the ends exactly on the tick
-            char tb[16];
-            snprintf(tb, sizeof(tb), "%02d:%02d:%02d",
-                     tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec);
-            draw_center(font, tb, 13, c_main);
-            int sy = band_h - 2;
-            if (sy > 14) {
-                cv->SetPixel(4, sy, c_dim.r, c_dim.g, c_dim.b);
-                cv->SetPixel(63, sy, c_dim.r, c_dim.g, c_dim.b);
-                cv->SetPixel(123, sy, c_dim.r, c_dim.g, c_dim.b);
-                double t2 = (double)(display_ns % 2000000000ULL) / 1e9;
-                int bx = 63 + (int)(cos(M_PI * t2) * 58.0);
-                for (int dy = 0; dy < 2; ++dy)
-                    for (int dx = 0; dx < 2; ++dx)
-                        cv->SetPixel(bx + dx, sy - 1 + dy,
-                                     c_main.r, c_main.g, c_main.b);
-            }
-        } else if (style == "sand") {
-            // Hourglass: one grain per second, the pile is the minute
-            if (have_small_font) {
-                char tb[16];
-                snprintf(tb, sizeof(tb), "%02d:%02d:%02d",
-                         tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec);
-                draw_center(small_font, tb, 6, c_main);
-            }
-            static const int w6[6] = {15, 13, 11, 9, 7, 5};   // sum 60
-            static const int w4[4] = {19, 17, 13, 11};        // sum 60
-            const int *widths = band_h >= 24 ? w6 : w4;
-            int nrows = band_h >= 24 ? 6 : 4;
-            int placed = 0;
-            for (int r = 0; r < nrows && placed < tm_disp.tm_sec; ++r) {
-                int y = band_h - 1 - r;
-                for (int k = 0; k < widths[r] && placed < tm_disp.tm_sec;
-                     ++k) {
-                    int off = ((k + 1) / 2) * ((k % 2) ? 1 : -1);
-                    cv->SetPixel(64 + off, y, c_main.r, c_main.g, c_main.b);
-                    placed++;
-                }
-            }
-            int fall_top = 8, fall_bot = band_h - nrows - 1;
-            if (fall_bot > fall_top) {
-                int fy = fall_top + (int)((fall_bot - fall_top) *
-                                          (nsec / 1e9));
-                cv->SetPixel(64, fy, c_main.r, c_main.g, c_main.b);
-            }
-        } else if (style == "words") {
-            // German word clock, rounded to the nearest 5 minutes
-            static const char *kHours[12] = {"ZWOELF", "EINS", "ZWEI",
-                "DREI", "VIER", "FUENF", "SECHS", "SIEBEN", "ACHT",
-                "NEUN", "ZEHN", "ELF"};
-            static const char *kPhrase[12] = {"", "FUENF NACH",
-                "ZEHN NACH", "VIERTEL NACH", "ZWANZIG NACH",
-                "FUENF VOR HALB", "HALB", "FUENF NACH HALB",
-                "ZWANZIG VOR", "VIERTEL VOR", "ZEHN VOR", "FUENF VOR"};
-            int seg = ((tm_disp.tm_min + 2) / 5) % 12;
-            int hh = tm_disp.tm_hour + (((tm_disp.tm_min + 2) / 5) >= 5 ||
-                                        ((tm_disp.tm_min + 2) / 5) == 12
-                                        ? 1 : 0);
-            const char *hw = kHours[hh % 12];
-            if (have_small_font) {
-                if (seg == 0) {
-                    char l1[32];
-                    snprintf(l1, sizeof(l1), "%s UHR", hw);
-                    draw_center(small_font, l1, band_h / 2 + 2, c_main);
-                } else {
-                    draw_center(small_font, kPhrase[seg],
-                                band_h / 2 - 3, c_main);
-                    draw_center(small_font, hw, band_h / 2 + 4, c_main);
-                }
-            }
         } else {
-            // Digital 24h (default) / 12h
+            // Digital 24h (default) / 12h — always all nine fractional
+            // digits; in 12h the AM/PM sits on the label line
             char time_buffer[64];
+            int hh = tm_disp.tm_hour;
             if (style == "12h") {
-                int h12 = tm_disp.tm_hour % 12;
-                if (h12 == 0)
-                    h12 = 12;
-                snprintf(time_buffer, sizeof(time_buffer),
-                         "%02d:%02d:%02d.%06u %cM",
-                         h12, tm_disp.tm_min, tm_disp.tm_sec, nsec / 1000,
-                         tm_disp.tm_hour < 12 ? 'A' : 'P');
-            } else {
-                snprintf(time_buffer, sizeof(time_buffer),
-                         "%02d:%02d:%02d.%09u",
-                         tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec,
-                         nsec);
+                hh = hh % 12;
+                if (hh == 0)
+                    hh = 12;
             }
+            snprintf(time_buffer, sizeof(time_buffer),
+                     "%02d:%02d:%02d.%09u",
+                     hh, tm_disp.tm_min, tm_disp.tm_sec, nsec);
             draw_center(font, time_buffer, text_base, c_main);
         }
 
