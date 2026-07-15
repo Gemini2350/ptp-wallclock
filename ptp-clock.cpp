@@ -1192,19 +1192,19 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <label>Brightness: <span id="bval">100</span> %
  <input type="range" id="brightness" min="1" max="100" value="100">
 </label>
-<label>
- <input type="checkbox" id="rotate180"> Rotate display 180&deg; (LED matrix mounted upside down)
-</label>
-<p class="hint">Clock lines on the LED matrix — one line is static, several
-alternate every 4 seconds. The name is shown as the small label
-(blank = no label, <code>%Z</code> = zone abbreviation):</p>
+<p class="hint">Clock lines — one line is static, several alternate every
+4 seconds. The name is shown as the small label (blank = no label,
+<code>%Z</code> = zone abbreviation). The <a href="/clock">browser
+clock</a> follows the same lines (pixel styles fall back to digital):</p>
 <div id="clock_rows"></div>
 <p style="margin: 0.3em 0">
  <button type="button" id="add_clock">+ add clock line</button>
 </p>
+<label>
+ <input type="checkbox" id="rotate180"> Rotate display 180&deg; (LED matrix mounted upside down)
+</label>
 <p class="hint">The 2nd-line options below only affect the physical LED
-matrix &mdash; the <a href="/clock">browser clock</a> always shows its own
-date and status line:</p>
+matrix:</p>
 <label>
  <input type="checkbox" id="show_gm"> Show grandmaster ID (2nd line)
 </label>
@@ -1217,12 +1217,8 @@ date and status line:</p>
 </fieldset>
 
 <fieldset>
-<legend>Time</legend>
-<label><input type="radio" name="mode" value="utc" checked> UTC</label>
-<label><input type="radio" name="mode" value="tai"> TAI</label>
-<label><input type="radio" name="mode" value="local"> Local time (time zone)</label>
-<label><input type="radio" name="mode" value="cycle"> Alternating UTC &rarr; TAI &rarr; local (4 s each, labelled)</label>
-<label>Time zone:
+<legend>Time zone &amp; date</legend>
+<label>Time zone (used by local clock lines):
  <input type="text" id="timezone" list="tzlist" value="Europe/Berlin">
  <datalist id="tzlist">
   <option value="Europe/Berlin"><option value="Europe/Zurich">
@@ -1232,24 +1228,6 @@ date and status line:</p>
   <option value="Asia/Tokyo"><option value="Asia/Shanghai">
   <option value="Australia/Sydney">
  </datalist>
-</label>
-<label>Local time label (optional):
- <input type="text" id="tz_label" placeholder="e.g. ZURICH — empty = zone abbreviation (CEST)">
-</label>
-<label>UTC label (optional):
- <input type="text" id="utc_label" placeholder="empty = UTC">
-</label>
-<label>TAI label (optional):
- <input type="text" id="tai_label" placeholder="empty = TAI">
-</label>
-<label>
- <input type="checkbox" id="show_zone"> Always show the time scale label (UTC / TAI / zone)
-</label>
-<label>Time format:
- <select id="time_format">
-  <option value="24">24-hour</option>
-  <option value="12">12-hour (AM/PM)</option>
- </select>
 </label>
 <label>Date format:
  <select id="date_format">
@@ -1388,10 +1366,6 @@ async function loadSettings() {
   document.getElementById('show_gm_details').checked = s.show_gm_details;
   document.getElementById('show_date').checked = s.show_date;
   document.getElementById('timezone').value = s.timezone;
-  document.getElementById('tz_label').value = s.tz_label;
-  document.getElementById('utc_label').value = s.utc_label;
-  document.getElementById('tai_label').value = s.tai_label;
-  document.getElementById('show_zone').checked = s.show_zone;
   document.getElementById('notify').checked = s.notify_gm_change;
   document.getElementById('domain_auto').checked = (s.domain === -1);
   document.getElementById('domain').value = (s.domain === -1) ? 0 : s.domain;
@@ -1400,9 +1374,7 @@ async function loadSettings() {
   document.getElementById('iface').value = s.iface;
   document.getElementById('iflist').innerHTML =
       ['auto'].concat(s.ifaces).map(i => '<option value="' + i + '">').join('');
-  document.getElementById('time_format').value = s.time_format;
   document.getElementById('date_format').value = s.date_format;
-  document.querySelector('input[name=mode][value="' + s.mode + '"]').checked = true;
 }
 
 document.getElementById('form').addEventListener('submit', async (e) => {
@@ -1415,13 +1387,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     show_gm: document.getElementById('show_gm').checked ? 1 : 0,
     show_gm_details: document.getElementById('show_gm_details').checked ? 1 : 0,
     show_date: document.getElementById('show_date').checked ? 1 : 0,
-    mode: document.querySelector('input[name=mode]:checked').value,
     timezone: document.getElementById('timezone').value,
-    tz_label: document.getElementById('tz_label').value,
-    utc_label: document.getElementById('utc_label').value,
-    tai_label: document.getElementById('tai_label').value,
-    show_zone: document.getElementById('show_zone').checked ? 1 : 0,
-    time_format: document.getElementById('time_format').value,
     date_format: document.getElementById('date_format').value,
     domain: document.getElementById('domain_auto').checked
         ? -1 : document.getElementById('domain').value,
@@ -1470,19 +1436,26 @@ function renderClock() {
     ed.textContent = '';
     return;
   }
-  let mode = document.querySelector('input[name=mode]:checked').value;
-  const h12 = document.getElementById('time_format').value === '12';
   const df = document.getElementById('date_format').value;
 
   const elapsed = performance.now() - clockBase.perf;
   const totalNs = clockBase.nsec + elapsed * 1e6;
   let sec = clockBase.sec + Math.floor(totalNs / 1e9);
   const frac = dither(Math.floor(totalNs % 1e9));
-  const cycling = mode === 'cycle';              // rotate per PTP second
-  if (cycling) mode = ['utc', 'tai', 'local'][Math.floor(sec / 4) % 3];
-  let tz = mode === 'local'
+
+  // Active clock line straight from the editor rows (live preview),
+  // same PTP-second-aligned rotation as the LED display
+  const rows = document.querySelectorAll('#clock_rows .crow');
+  let scale = 'utc', style = '24h', name = '';
+  if (rows.length) {
+    const r = rows[rows.length > 1 ? Math.floor(sec / 4) % rows.length : 0];
+    scale = r.querySelector('.c_scale').value;
+    style = r.querySelector('.c_style').value;
+    name = r.querySelector('.c_name').value.trim();
+  }
+  let tz = scale === 'local'
       ? document.getElementById('timezone').value : 'UTC';
-  if (mode !== 'tai') sec -= clockBase.off;      // TAI -> UTC
+  if (scale !== 'tai') sec -= clockBase.off;     // TAI -> UTC
 
   const d = new Date(sec * 1000);
   let p;
@@ -1498,28 +1471,22 @@ function renderClock() {
     ed.textContent = 'unknown time zone: ' + tz;
     return;
   }
-  let hh = p.hour, suffix = '';
-  if (h12) {
-    let h = parseInt(hh, 10);
-    suffix = h >= 12 ? ' PM' : ' AM';
+  // Body text per style (pixel styles fall back to digital 24h)
+  const fr9 = String(frac).padStart(9, '0');
+  let body;
+  if (style === 'unix') {
+    body = sec + '.' + fr9;
+  } else if (style === '12h') {
+    let h = parseInt(p.hour, 10);
+    const am = h >= 12 ? ' PM' : ' AM';
     h = h % 12 || 12;
-    hh = String(h).padStart(2, '0');
+    body = String(h).padStart(2, '0') + ':' + p.minute + ':' +
+        p.second + '.' + fr9 + am;
+  } else {
+    body = p.hour + ':' + p.minute + ':' + p.second + '.' + fr9;
   }
-  // Shown scale on line 2 (cycle mode, or always via show_zone),
-  // date on line 3
-  let cyc = '';
-  if (cycling || document.getElementById('show_zone').checked)
-    cyc = mode === 'local'
-        ? (document.getElementById('tz_label').value ||
-           p.timeZoneName || 'LOCAL')
-        : mode === 'utc'
-          ? (document.getElementById('utc_label').value || 'UTC')
-          : (document.getElementById('tai_label').value || 'TAI');
-  else if (mode === 'tai')
-    suffix += ' ' + (document.getElementById('tai_label').value || 'TAI');
-  el.textContent = hh + ':' + p.minute + ':' + p.second + '.' +
-      String(frac).padStart(9, '0') + suffix;
-  ez.textContent = cyc;
+  el.textContent = body;
+  ez.textContent = name === '%Z' ? (p.timeZoneName || '') : name;
   const wd = p.weekday.toUpperCase();
   ed.textContent = df === 'iso'
       ? wd + ' ' + p.year + '-' + p.month + '-' + p.day
@@ -1790,17 +1757,19 @@ function render() {
     ed.textContent = st && !st.have_ptp ? 'WAITING FOR PTP' : '';
     return;
   }
-  let mode = S.mode;
-  const h12 = S.time_format === '12', df = S.date_format;
+  const df = S.date_format;
 
   const elapsed = performance.now() - base.perf;
   const totalNs = base.nsec + elapsed * 1e6;
   let sec = base.sec + Math.floor(totalNs / 1e9);
   const frac = dither(Math.floor(totalNs % 1e9));
-  const cycling = mode === 'cycle';              // rotate per PTP second
-  if (cycling) mode = ['utc', 'tai', 'local'][Math.floor(sec / 4) % 3];
-  const tz = mode === 'local' ? S.timezone : 'UTC';
-  if (mode !== 'tai') sec -= base.off;
+
+  // Active clock line, same PTP-aligned rotation as the LED display
+  const list = (S.clocks && S.clocks.length)
+      ? S.clocks : [{scale: 'utc', style: '24h', name: ''}];
+  const cl = list[list.length > 1 ? Math.floor(sec / 4) % list.length : 0];
+  const tz = cl.scale === 'local' ? S.timezone : 'UTC';
+  if (cl.scale !== 'tai') sec -= base.off;
   const d = new Date(sec * 1000);
   let p;
   try {
@@ -1815,27 +1784,24 @@ function render() {
     ed.textContent = 'UNKNOWN TIME ZONE';
     return;
   }
-  let hh = p.hour, sup = '';
-  if (h12) {
-    let h = parseInt(hh, 10);
+  // Body per style (pixel styles fall back to digital 24h)
+  const fr9 = String(frac).padStart(9, '0');
+  let sup = '', body;
+  if (cl.style === 'unix') {
+    body = sec + '.' + fr9;
+  } else if (cl.style === '12h') {
+    let h = parseInt(p.hour, 10);
     sup = h >= 12 ? 'PM' : 'AM';
     h = h % 12 || 12;
-    hh = String(h).padStart(2, '0');
+    body = String(h).padStart(2, '0') + ':' + p.minute + ':' +
+        p.second + '.' + fr9;
+  } else {
+    body = p.hour + ':' + p.minute + ':' + p.second + '.' + fr9;
   }
-  // Shown scale on line 2 (cycle mode, or always via show_zone),
-  // date on line 3
-  let cyc = '';
-  if (cycling || S.show_zone)
-    cyc = mode === 'local'
-        ? (S.tz_label || p.timeZoneName || 'LOCAL')
-        : mode === 'utc' ? (S.utc_label || 'UTC')
-                         : (S.tai_label || 'TAI');
-  else if (mode === 'tai')
-    sup += (sup ? ' ' : '') + (S.tai_label || 'TAI');
-  el.innerHTML = hh + ':' + p.minute + ':' + p.second + '.' +
-      String(frac).padStart(9, '0') +
+  el.innerHTML = body +
       (sup ? '<span class="sup">' + sup + '</span>' : '');
-  ez.textContent = cyc;
+  const nm = cl.name || '';
+  ez.textContent = nm === '%Z' ? (p.timeZoneName || '') : nm;
   const wd = p.weekday.toUpperCase();
   ed.textContent = df === 'iso'
       ? wd + ' ' + p.year + '-' + p.month + '-' + p.day

@@ -176,16 +176,11 @@ Settings:
   time source (e.g. `GNSS`) on the matrix
 - **Date** — show the date on the matrix (if several second-line options are
   enabled, the line alternates every 4 seconds)
-- **Time display** — UTC, TAI, or local time with a configurable time zone
-  (IANA names such as `Europe/Berlin`), 24-hour or 12-hour (AM/PM) format —
-  or an alternating mode that cycles UTC → TAI → local every 4 seconds and
-  labels which scale is currently shown (`UTC` / `TAI` / e.g. `CEST`), on
-  the LED matrix and the browser clock alike. On the matrix the label gets
-  a small line of its own between the time and the second line, so date /
-  grandmaster info stays visible; the local leg's label can be given a
-  custom name (e.g. `ZURICH`), and the label can also be shown permanently
-  in the fixed modes
-- **Date format** — `DD.MM.YYYY`, ISO 8601 (`YYYY-MM-DD`), or `MM/DD/YYYY`
+- **Time zone & date format** — the IANA time zone used by local clock
+  lines (e.g. `Europe/Berlin`) and the date format (`DD.MM.YYYY`, ISO 8601,
+  or `MM/DD/YYYY`). The browser clock follows the same clock lines as the
+  LED matrix — labels appear between time and date, and pixel styles fall
+  back to a digital rendering
 - **PTP domain** — automatic detection (default) or a fixed domain number
   (0–255); the detected domain is shown in the status panel
 - **Network interface** — selectable from the interfaces present on the
