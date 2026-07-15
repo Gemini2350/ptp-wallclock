@@ -91,6 +91,8 @@ struct Settings {
     std::string timezone = "Europe/Berlin";
     std::string tz_label;                 // custom label for the local time
                                           // scale; empty = %Z abbreviation
+    std::string utc_label;                // custom label for UTC; empty = UTC
+    std::string tai_label;                // custom label for TAI; empty = TAI
     bool show_zone = false;               // show the scale label also in
                                           // the fixed (non-cycle) modes
     int time_format = 24;                 // 24 or 12 (AM/PM)
@@ -295,6 +297,8 @@ static void save_settings_locked() {
     f << "mode=" << g_settings.mode << "\n";
     f << "timezone=" << g_settings.timezone << "\n";
     f << "tz_label=" << g_settings.tz_label << "\n";
+    f << "utc_label=" << g_settings.utc_label << "\n";
+    f << "tai_label=" << g_settings.tai_label << "\n";
     f << "show_zone=" << (g_settings.show_zone ? 1 : 0) << "\n";
     f << "time_format=" << g_settings.time_format << "\n";
     f << "date_format=" << (g_settings.date_format == DATE_ISO ? "iso" :
@@ -349,6 +353,10 @@ static void load_settings() {
                 g_settings.timezone = val;
         } else if (key == "tz_label") {
             g_settings.tz_label = val;
+        } else if (key == "utc_label") {
+            g_settings.utc_label = val;
+        } else if (key == "tai_label") {
+            g_settings.tai_label = val;
         } else if (key == "show_zone") {
             g_settings.show_zone = (val == "1");
         } else if (key == "time_format") {
@@ -860,6 +868,8 @@ static std::string settings_json() {
                            g_settings.mode == MODE_CYCLE ? "cycle" : "utc") << "\","
       << "\"timezone\":\"" << json_escape(g_settings.timezone) << "\","
       << "\"tz_label\":\"" << json_escape(g_settings.tz_label) << "\","
+      << "\"utc_label\":\"" << json_escape(g_settings.utc_label) << "\","
+      << "\"tai_label\":\"" << json_escape(g_settings.tai_label) << "\","
       << "\"show_zone\":" << (g_settings.show_zone ? "true" : "false") << ","
       << "\"time_format\":\"" << g_settings.time_format << "\","
       << "\"date_format\":\"" << (g_settings.date_format == DATE_ISO ? "iso" :
@@ -1098,6 +1108,12 @@ date and status line:</p>
 <label>Local time label (optional):
  <input type="text" id="tz_label" placeholder="e.g. ZURICH — empty = zone abbreviation (CEST)">
 </label>
+<label>UTC label (optional):
+ <input type="text" id="utc_label" placeholder="empty = UTC">
+</label>
+<label>TAI label (optional):
+ <input type="text" id="tai_label" placeholder="empty = TAI">
+</label>
 <label>
  <input type="checkbox" id="show_zone"> Always show the time scale label (UTC / TAI / zone)
 </label>
@@ -1201,6 +1217,8 @@ async function loadSettings() {
   document.getElementById('show_date').checked = s.show_date;
   document.getElementById('timezone').value = s.timezone;
   document.getElementById('tz_label').value = s.tz_label;
+  document.getElementById('utc_label').value = s.utc_label;
+  document.getElementById('tai_label').value = s.tai_label;
   document.getElementById('show_zone').checked = s.show_zone;
   document.getElementById('notify').checked = s.notify_gm_change;
   document.getElementById('domain_auto').checked = (s.domain === -1);
@@ -1227,6 +1245,8 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     mode: document.querySelector('input[name=mode]:checked').value,
     timezone: document.getElementById('timezone').value,
     tz_label: document.getElementById('tz_label').value,
+    utc_label: document.getElementById('utc_label').value,
+    tai_label: document.getElementById('tai_label').value,
     show_zone: document.getElementById('show_zone').checked ? 1 : 0,
     time_format: document.getElementById('time_format').value,
     date_format: document.getElementById('date_format').value,
@@ -1319,9 +1339,11 @@ function renderClock() {
     cyc = mode === 'local'
         ? (document.getElementById('tz_label').value ||
            p.timeZoneName || 'LOCAL')
-        : mode.toUpperCase();
+        : mode === 'utc'
+          ? (document.getElementById('utc_label').value || 'UTC')
+          : (document.getElementById('tai_label').value || 'TAI');
   else if (mode === 'tai')
-    suffix += ' TAI';
+    suffix += ' ' + (document.getElementById('tai_label').value || 'TAI');
   el.textContent = hh + ':' + p.minute + ':' + p.second + '.' +
       String(frac).padStart(9, '0') + suffix;
   ez.textContent = cyc;
@@ -1632,9 +1654,11 @@ function render() {
   let cyc = '';
   if (cycling || S.show_zone)
     cyc = mode === 'local'
-        ? (S.tz_label || p.timeZoneName || 'LOCAL') : mode.toUpperCase();
+        ? (S.tz_label || p.timeZoneName || 'LOCAL')
+        : mode === 'utc' ? (S.utc_label || 'UTC')
+                         : (S.tai_label || 'TAI');
   else if (mode === 'tai')
-    sup += (sup ? ' ' : '') + 'TAI';
+    sup += (sup ? ' ' : '') + (S.tai_label || 'TAI');
   el.innerHTML = hh + ':' + p.minute + ':' + p.second + '.' +
       String(frac).padStart(9, '0') +
       (sup ? '<span class="sup">' + sup + '</span>' : '');
@@ -1769,6 +1793,10 @@ static void handle_client(int fd) {
             }
             if (kv.count("tz_label") && kv["tz_label"].size() < 64)
                 g_settings.tz_label = kv["tz_label"];
+            if (kv.count("utc_label") && kv["utc_label"].size() < 64)
+                g_settings.utc_label = kv["utc_label"];
+            if (kv.count("tai_label") && kv["tai_label"].size() < 64)
+                g_settings.tai_label = kv["tai_label"];
             if (kv.count("show_zone"))
                 g_settings.show_zone = (kv["show_zone"] == "1");
             if (kv.count("time_format")) {
@@ -2191,9 +2219,9 @@ int main(int argc, char **argv) {
         std::string cycle_label;
         if (s.mode == MODE_CYCLE || s.show_zone) {
             if (eff_mode == MODE_UTC) {
-                cycle_label = "UTC";
+                cycle_label = s.utc_label.empty() ? "UTC" : s.utc_label;
             } else if (eff_mode == MODE_TAI) {
-                cycle_label = "TAI";
+                cycle_label = s.tai_label.empty() ? "TAI" : s.tai_label;
             } else if (!s.tz_label.empty()) {
                 cycle_label = s.tz_label;   // user-defined name
             } else {
