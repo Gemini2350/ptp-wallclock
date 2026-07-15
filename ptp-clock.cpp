@@ -2236,8 +2236,10 @@ int main(int argc, char **argv) {
                 lines.push_back(id_line);
             if (s.show_gm_details && !detail_line.empty())
                 lines.push_back(detail_line);
+            // Rotation window from the PTP time (like the cycle mode), so
+            // all display lines switch at the same moment
             if (!lines.empty())
-                line2 = lines[(now_ns / 4000000000ULL) % lines.size()];
+                line2 = lines[(display_ns / 4000000000ULL) % lines.size()];
             if (gm_recent_change && s.notify_gm_change) {
                 line2 = "! NEW GM !";
                 line2_alert = true;
