@@ -171,7 +171,8 @@ Settings:
   the LED matrix and the browser clock alike. On the matrix the label gets
   a small line of its own between the time and the second line, so date /
   grandmaster info stays visible; the local leg's label can be given a
-  custom name (e.g. `ZURICH`)
+  custom name (e.g. `ZURICH`), and the label can also be shown permanently
+  in the fixed modes
 - **Date format** — `DD.MM.YYYY`, ISO 8601 (`YYYY-MM-DD`), or `MM/DD/YYYY`
 - **PTP domain** — automatic detection (default) or a fixed domain number
   (0–255); the detected domain is shown in the status panel
