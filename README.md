@@ -55,7 +55,9 @@ These are only needed for the physical LED clock — the
 requirements and runs anywhere Docker runs; all it needs is a network that
 carries PTP.
 
-- Raspberry Pi (tested on Raspberry Pi 3/4 - 5 not working at the moment)
+- Raspberry Pi (tested on Raspberry Pi 3/4/5 — Pi 5 works since the
+  `rpi-rgb-led-matrix` library gained its RP1 backend; `install.sh` always
+  builds the current library)
 - RGB LED matrix compatible with the `rpi-rgb-led-matrix` library
 -- [Adafruit RGB Matrix HAT](https://www.adafruit.com/product/2345)
 -- 2 x [HUB75 LED Panel 32x64 Pixel](https://www.waveshare.com/RGB-Matrix-P3-64x32.htm) (32 x 128 total)
