@@ -33,7 +33,11 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
   receipt timeouts are honored, so the clock fails over automatically
 - Automatic PTP domain detection (locks onto the first domain with Announce
   traffic, rescans on timeout), or a fixed domain 0–255
-- Displays time on an RGB LED matrix (UTC, TAI, or local time zone)
+- Displays time on an RGB LED matrix as a configurable list of clock lines:
+  each line has a time scale (UTC / TAI / local), a rendering style, and an
+  optional label — one line is static, several alternate every 4 seconds.
+  Styles: digital 24h/12h, Unix timestamp, binary (BCD), flip clock,
+  DCF77 telegram, pendulum, hourglass, German word clock
 - Optional second display line: date, grandmaster ID and/or priorities &
   clock quality (alternating every 4 seconds)
 - Grandmaster changes are shown on the display itself ("! NEW GM !")
@@ -160,6 +164,12 @@ Settings:
   (the clock keeps tracking PTP in the background)
 - **Rotate 180°** — for LED panels that are mounted upside down, applied
   live without a restart
+- **Clock lines** — the list of clocks shown on the LED matrix. Per line:
+  time scale (UTC / TAI / local), style (digital 24h/12h, Unix timestamp,
+  binary BCD, flip clock, DCF77 telegram, pendulum, hourglass, German word
+  clock), and an optional label (blank = none, `%Z` = zone abbreviation).
+  One line is shown statically, several alternate every 4 seconds —
+  PTP-second aligned, like everything else
 - **Grandmaster ID** — show the current PTP grandmaster identity as a second
   line on the matrix
 - **Priorities & clock quality** — show priority 1/2, clock class, and the

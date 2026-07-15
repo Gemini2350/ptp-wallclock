@@ -53,6 +53,22 @@ public:
     void Fill(uint8_t r, uint8_t g, uint8_t b) override { inner->Fill(r, g, b); }
 };
 
+// Draws through to another canvas but discards pixels outside a vertical
+// window — used for the flip-clock roll animation.
+class ClipCanvas : public Canvas {
+public:
+    Canvas *inner = nullptr;
+    int y0 = 0, y1 = 31;
+    int width() const override { return inner->width(); }
+    int height() const override { return inner->height(); }
+    void SetPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) override {
+        if (y >= y0 && y <= y1)
+            inner->SetPixel(x, y, r, g, b);
+    }
+    void Clear() override { inner->Clear(); }
+    void Fill(uint8_t r, uint8_t g, uint8_t b) override { inner->Fill(r, g, b); }
+};
+
 // Short time-source label for the matrix details line (IEEE 1588 table 7)
 static const char *time_source_short(uint8_t ts) {
     switch (ts) {
@@ -79,6 +95,69 @@ static void InterruptHandler(int signo) {
 enum TimeMode { MODE_UTC = 0, MODE_TAI = 1, MODE_LOCAL = 2, MODE_CYCLE = 3 };
 enum DateFormat { DATE_DMY = 0, DATE_ISO = 1, DATE_MDY = 2 };
 
+// One clock line on the LED display. The display shows a configurable
+// list of these: a single entry is static, several alternate every 4 s.
+struct ClockEntry {
+    int scale = MODE_UTC;                 // MODE_UTC / MODE_TAI / MODE_LOCAL
+    std::string style = "24h";            // rendering style, see kStyles
+    std::string name;                     // label; "" = none, "%Z" = zone
+};
+
+static const char *kStyles[] = {"24h", "12h", "unix", "bcd", "flip",
+                                "dcf77", "pend", "sand", "words"};
+
+static bool style_valid(const std::string &st) {
+    for (const char *k : kStyles)
+        if (st == k)
+            return true;
+    return false;
+}
+
+// Serialized form: "scale,style,name;scale,style,name" — the name is
+// everything after the second comma, so commas inside names are fine.
+static std::string clocks_serialize(const std::vector<ClockEntry> &v) {
+    std::string out;
+    for (const auto &e : v) {
+        if (!out.empty())
+            out += ";";
+        out += (e.scale == MODE_TAI ? "tai" :
+                e.scale == MODE_LOCAL ? "local" : "utc");
+        out += ",";
+        out += e.style;
+        out += ",";
+        out += e.name;
+    }
+    return out;
+}
+
+static std::vector<ClockEntry> clocks_parse(const std::string &in) {
+    std::vector<ClockEntry> out;
+    std::stringstream ss(in);
+    std::string item;
+    while (std::getline(ss, item, ';')) {
+        size_t c1 = item.find(',');
+        if (c1 == std::string::npos)
+            continue;
+        size_t c2 = item.find(',', c1 + 1);
+        if (c2 == std::string::npos)
+            continue;
+        ClockEntry e;
+        std::string sc = item.substr(0, c1);
+        e.scale = sc == "tai" ? MODE_TAI :
+                  sc == "local" ? MODE_LOCAL : MODE_UTC;
+        e.style = item.substr(c1 + 1, c2 - c1 - 1);
+        if (!style_valid(e.style))
+            e.style = "24h";
+        e.name = item.substr(c2 + 1);
+        if (e.name.size() > 24)
+            e.name.resize(24);
+        out.push_back(e);
+        if (out.size() >= 12)
+            break;
+    }
+    return out;
+}
+
 struct Settings {
     uint8_t r = 255, g = 255, b = 0;      // display color
     int brightness = 100;                 // display brightness in percent
@@ -95,6 +174,7 @@ struct Settings {
     std::string tai_label;                // custom label for TAI; empty = TAI
     bool show_zone = false;               // show the scale label also in
                                           // the fixed (non-cycle) modes
+    std::vector<ClockEntry> clocks;       // LED display clock lines
     int time_format = 24;                 // 24 or 12 (AM/PM)
     int date_format = DATE_DMY;           // DD.MM.YYYY / ISO / MM/DD/YYYY
     bool notify_gm_change = false;        // notify on grandmaster change
@@ -300,6 +380,7 @@ static void save_settings_locked() {
     f << "utc_label=" << g_settings.utc_label << "\n";
     f << "tai_label=" << g_settings.tai_label << "\n";
     f << "show_zone=" << (g_settings.show_zone ? 1 : 0) << "\n";
+    f << "clocks=" << clocks_serialize(g_settings.clocks) << "\n";
     f << "time_format=" << g_settings.time_format << "\n";
     f << "date_format=" << (g_settings.date_format == DATE_ISO ? "iso" :
                             g_settings.date_format == DATE_MDY ? "mdy" :
@@ -316,10 +397,8 @@ static void save_settings_locked() {
 
 static void load_settings() {
     std::ifstream f(g_config_path);
-    if (!f)
-        return;
     std::string line;
-    while (std::getline(f, line)) {
+    while (f && std::getline(f, line)) {
         size_t eq = line.find('=');
         if (eq == std::string::npos)
             continue;
@@ -359,6 +438,8 @@ static void load_settings() {
             g_settings.tai_label = val;
         } else if (key == "show_zone") {
             g_settings.show_zone = (val == "1");
+        } else if (key == "clocks") {
+            g_settings.clocks = clocks_parse(val);
         } else if (key == "time_format") {
             if (val == "12" || val == "24")
                 g_settings.time_format = atoi(val.c_str());
@@ -388,6 +469,30 @@ static void load_settings() {
         }
     }
     g_domain = g_settings.domain;
+
+    // No clock list yet (fresh install or pre-list config): build one from
+    // the classic mode/format/label settings so behavior stays the same.
+    if (g_settings.clocks.empty()) {
+        std::string style = g_settings.time_format == 12 ? "12h" : "24h";
+        auto label_for = [&](int scale) -> std::string {
+            if (scale == MODE_UTC)
+                return g_settings.utc_label.empty() ? "UTC"
+                                                    : g_settings.utc_label;
+            if (scale == MODE_TAI)
+                return g_settings.tai_label.empty() ? "TAI"
+                                                    : g_settings.tai_label;
+            return g_settings.tz_label.empty() ? "%Z" : g_settings.tz_label;
+        };
+        if (g_settings.mode == MODE_CYCLE) {
+            for (int sc : {MODE_UTC, MODE_TAI, MODE_LOCAL})
+                g_settings.clocks.push_back({sc, style, label_for(sc)});
+        } else {
+            g_settings.clocks.push_back(
+                {g_settings.mode, style,
+                 g_settings.show_zone ? label_for(g_settings.mode)
+                                      : std::string()});
+        }
+    }
 }
 
 // ---- PTP processing ----
@@ -871,6 +976,16 @@ static std::string settings_json() {
       << "\"utc_label\":\"" << json_escape(g_settings.utc_label) << "\","
       << "\"tai_label\":\"" << json_escape(g_settings.tai_label) << "\","
       << "\"show_zone\":" << (g_settings.show_zone ? "true" : "false") << ","
+      << "\"clocks\":[";
+    for (size_t i = 0; i < g_settings.clocks.size(); ++i) {
+        const ClockEntry &e = g_settings.clocks[i];
+        j << (i ? "," : "") << "{\"scale\":\""
+          << (e.scale == MODE_TAI ? "tai" :
+              e.scale == MODE_LOCAL ? "local" : "utc")
+          << "\",\"style\":\"" << e.style << "\",\"name\":\""
+          << json_escape(e.name) << "\"}";
+    }
+    j << "],"
       << "\"time_format\":\"" << g_settings.time_format << "\","
       << "\"date_format\":\"" << (g_settings.date_format == DATE_ISO ? "iso" :
                                   g_settings.date_format == DATE_MDY ? "mdy" :
@@ -1013,6 +1128,12 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
         padding: 0.6em; border-radius: 4px; margin-bottom: 1em; }
  #saved { color: #6c6; visibility: hidden; margin-left: 1em; }
  .hint { color: #888; font-size: 0.85em; margin: 0.8em 0 0.2em; }
+ .crow { display: flex; gap: 4px; margin: 0.3em 0; }
+ .crow select, .crow input { padding: 0.25em; background: #2a2a2a;
+        color: #eee; border: 1px solid #555; }
+ .crow input { flex: 1; min-width: 0; }
+ .crow .c_del { padding: 0.1em 0.55em; background: #733; }
+ #add_clock { padding: 0.25em 0.8em; background: #364; }
  #clock { font-family: monospace; text-align: center; color: #fd0;
         font-size: clamp(1em, 4.4vw, 1.8em); white-space: nowrap; }
  a { color: #7ab; }
@@ -1074,6 +1195,13 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <label>
  <input type="checkbox" id="rotate180"> Rotate display 180&deg; (LED matrix mounted upside down)
 </label>
+<p class="hint">Clock lines on the LED matrix — one line is static, several
+alternate every 4 seconds. The name is shown as the small label
+(blank = no label, <code>%Z</code> = zone abbreviation):</p>
+<div id="clock_rows"></div>
+<p style="margin: 0.3em 0">
+ <button type="button" id="add_clock">+ add clock line</button>
+</p>
 <p class="hint">The 2nd-line options below only affect the physical LED
 matrix &mdash; the <a href="/clock">browser clock</a> always shows its own
 date and status line:</p>
@@ -1181,6 +1309,49 @@ function syncDomainInput() {
 }
 document.getElementById('domain_auto').addEventListener('change', syncDomainInput);
 
+// --- LED clock-line list editor ---
+const STYLES = [['24h', 'digital 24h'], ['12h', 'digital 12h (AM/PM)'],
+  ['unix', 'Unix timestamp'], ['bcd', 'binary (BCD)'],
+  ['flip', 'flip clock'], ['dcf77', 'DCF77 telegram'],
+  ['pend', 'pendulum'], ['sand', 'hourglass'],
+  ['words', 'word clock (German)']];
+function clockRow(e) {
+  const div = document.createElement('div');
+  div.className = 'crow';
+  div.innerHTML =
+    '<select class="c_scale">' + ['utc', 'tai', 'local'].map(v =>
+      '<option value="' + v + '"' + (v === e.scale ? ' selected' : '') +
+      '>' + v.toUpperCase() + '</option>').join('') + '</select>' +
+    '<select class="c_style">' + STYLES.map(p =>
+      '<option value="' + p[0] + '"' + (p[0] === e.style ? ' selected' : '') +
+      '>' + p[1] + '</option>').join('') + '</select>' +
+    '<input class="c_name" maxlength="24" placeholder="label (blank = none)">' +
+    '<button type="button" class="c_del" title="remove">&times;</button>';
+  div.querySelector('.c_name').value = e.name || '';
+  div.querySelector('.c_del').addEventListener('click', () => {
+    if (document.querySelectorAll('#clock_rows .crow').length > 1)
+      div.remove();
+  });
+  return div;
+}
+function setClockRows(list) {
+  const c = document.getElementById('clock_rows');
+  c.innerHTML = '';
+  (list && list.length ? list : [{scale: 'utc', style: '24h', name: ''}])
+      .forEach(e => c.appendChild(clockRow(e)));
+}
+document.getElementById('add_clock').addEventListener('click', () => {
+  document.getElementById('clock_rows').appendChild(
+      clockRow({scale: 'utc', style: '24h', name: ''}));
+});
+function clocksSerialized() {
+  return Array.from(document.querySelectorAll('#clock_rows .crow')).map(r =>
+    r.querySelector('.c_scale').value + ',' +
+    r.querySelector('.c_style').value + ',' +
+    r.querySelector('.c_name').value.replace(/;/g, ' ').trim()
+  ).join(';');
+}
+
 // Blackout toggle and brightness slider apply immediately (no Save needed)
 let blackout = false;
 function renderBlackout() {
@@ -1210,6 +1381,7 @@ async function loadSettings() {
   document.getElementById('brightness').value = s.brightness;
   document.getElementById('bval').textContent = s.brightness;
   document.getElementById('rotate180').checked = s.rotate180;
+  setClockRows(s.clocks);
   blackout = s.blackout;
   renderBlackout();
   document.getElementById('show_gm').checked = s.show_gm;
@@ -1239,6 +1411,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     color: document.getElementById('color').value,
     brightness: document.getElementById('brightness').value,
     rotate180: document.getElementById('rotate180').checked ? 1 : 0,
+    clocks: clocksSerialized(),
     show_gm: document.getElementById('show_gm').checked ? 1 : 0,
     show_gm_details: document.getElementById('show_gm_details').checked ? 1 : 0,
     show_date: document.getElementById('show_date').checked ? 1 : 0,
@@ -1799,6 +1972,11 @@ static void handle_client(int fd) {
                 g_settings.tai_label = kv["tai_label"];
             if (kv.count("show_zone"))
                 g_settings.show_zone = (kv["show_zone"] == "1");
+            if (kv.count("clocks") && kv["clocks"].size() < 2048) {
+                std::vector<ClockEntry> v = clocks_parse(kv["clocks"]);
+                if (!v.empty())
+                    g_settings.clocks = v;
+            }
             if (kv.count("time_format")) {
                 if (kv["time_format"] == "12" || kv["time_format"] == "24")
                     g_settings.time_format = atoi(kv["time_format"].c_str());
@@ -1931,6 +2109,13 @@ int main(int argc, char **argv) {
 
     FrameCanvas *offscreen = matrix->CreateFrameCanvas();
     FlipCanvas flip_canvas;               // optional 180-degree rotation
+    ClipCanvas clip_canvas;               // for the flip-clock animation
+
+    // Flip-clock roll state (per character cell)
+    size_t flip_entry_idx = (size_t)-1;
+    bool flip_init = false;
+    char flip_prev[9] = {0}, flip_old[9] = {0};
+    uint64_t flip_change[9] = {0};
 
     // --- Fonts ---
     Font font;
@@ -2198,13 +2383,21 @@ int main(int argc, char **argv) {
         time_t sec = display_ns / 1000000000ULL;
         uint32_t nsec = display_ns % 1000000000ULL;
 
-        // Cycle mode rotates UTC -> TAI -> local every 4 s. The window is
-        // derived from the PTP second, so LED and browser clocks flip in
-        // sync; the second line labels which scale is shown.
-        static const int kCycle[3] = {MODE_UTC, MODE_TAI, MODE_LOCAL};
-        int eff_mode = (s.mode == MODE_CYCLE)
-            ? kCycle[(sec / 4) % 3] : s.mode;
+        // Active clock line: one entry = static, several = alternating
+        // every 4 s, aligned to the PTP second (so LED, browser clocks and
+        // the info-line rotation below all switch at the same moment)
+        ClockEntry entry;
+        if (!s.clocks.empty()) {
+            size_t idx = s.clocks.size() > 1
+                ? (size_t)((sec / 4) % s.clocks.size()) : 0;
+            entry = s.clocks[idx];
+            if (idx != flip_entry_idx) {
+                flip_entry_idx = idx;
+                flip_init = false;        // reset the flip animation
+            }
+        }
 
+        int eff_mode = entry.scale;
         if (eff_mode != MODE_TAI)
             sec -= current_utc_offset;   // TAI -> UTC
 
@@ -2214,41 +2407,12 @@ int main(int argc, char **argv) {
         else
             gmtime_r(&sec, &tm_disp);
 
-        // Scale label: always shown in cycle mode, in the fixed modes
-        // when the show_zone option is on
-        std::string cycle_label;
-        if (s.mode == MODE_CYCLE || s.show_zone) {
-            if (eff_mode == MODE_UTC) {
-                cycle_label = s.utc_label.empty() ? "UTC" : s.utc_label;
-            } else if (eff_mode == MODE_TAI) {
-                cycle_label = s.tai_label.empty() ? "TAI" : s.tai_label;
-            } else if (!s.tz_label.empty()) {
-                cycle_label = s.tz_label;   // user-defined name
-            } else {
-                char zb[24];
-                if (strftime(zb, sizeof(zb), "%Z", &tm_disp) > 0)
-                    cycle_label = zb;    // e.g. CEST
-                else
-                    cycle_label = "LOCAL";
-            }
-        }
-
-        char time_buffer[64];
-        if (s.time_format == 12) {
-            // 12-hour: fewer fractional digits to make room for AM/PM
-            int h12 = tm_disp.tm_hour % 12;
-            if (h12 == 0)
-                h12 = 12;
-            snprintf(time_buffer, sizeof(time_buffer),
-                     "%02d:%02d:%02d.%06u %cM",
-                     h12, tm_disp.tm_min, tm_disp.tm_sec,
-                     nsec / 1000,
-                     tm_disp.tm_hour < 12 ? 'A' : 'P');
-        } else {
-            snprintf(time_buffer, sizeof(time_buffer),
-                     "%02d:%02d:%02d.%09u",
-                     tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec,
-                     nsec);
+        // Line label: the entry's name; %Z expands to the zone abbreviation
+        std::string cycle_label = entry.name;
+        if (cycle_label == "%Z") {
+            char zb[24];
+            cycle_label = (strftime(zb, sizeof(zb), "%Z", &tm_disp) > 0)
+                ? std::string(zb) : std::string();
         }
 
         offscreen->Fill(0,0,0);
@@ -2305,27 +2469,252 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Drawn width of N monospace chars with DrawText extra_spacing 1:
-        // N * (charwidth + 1) - 1  — the trailing spacing is not visible.
-        int time_len = (int)strlen(time_buffer);
-        int x_center =
-            (matrix_options.cols -
-             ((font.CharacterWidth('0') + 1) * time_len - 1)) / 2;
-
-        // With a second line active, move the time up to make room
-        int y_center = !line2.empty()
-            ? font.baseline() + 3
-            : (matrix_options.rows + font.baseline()) / 2;
+        // --- Render the active clock line in its style ---
+        // Vertical band available to the renderer above the small lines
+        int band_h = 32;
+        if (!line2.empty())
+            band_h = mid_line.empty() ? 23 : 16;
 
         // Without a small font the alerts fall back to coloring the time
         // itself red (10 s on a GM change; while an unaccepted GM is elected).
         bool time_alert = !have_small_font &&
                           ((gm_recent_change && s.notify_gm_change) ||
                            gm_unaccepted);
-        DrawText(&flip_canvas, font,
-                 x_center, y_center,
-                 time_alert ? Color(255, 0, 0) : Color(s.r, s.g, s.b),
-                 nullptr, time_buffer, 1);
+        Color c_main = time_alert ? Color(255, 0, 0)
+                                  : Color(s.r, s.g, s.b);
+        Color c_dim(s.r / 5, s.g / 5, s.b / 5);
+        Canvas *cv = &flip_canvas;
+
+        // Baseline for single-line text styles (legacy placement)
+        int text_base = !line2.empty()
+            ? font.baseline() + 3
+            : (matrix_options.rows + font.baseline()) / 2;
+
+        // Centered text: N monospace chars at extra_spacing 1 are
+        // N * (charwidth + 1) - 1 pixels wide
+        auto draw_center = [&](Font &f, const char *txt, int ybase,
+                               Color col) {
+            int n = (int)strlen(txt);
+            int x = (matrix_options.cols -
+                     ((f.CharacterWidth('0') + 1) * n - 1)) / 2;
+            DrawText(cv, f, x, ybase, col, nullptr, txt, 1);
+        };
+
+        const std::string &style = entry.style;
+        if (style == "unix") {
+            // Seconds since the epoch (UTC or TAI scale) + 7 fast digits
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%lld.%07u",
+                     (long long)sec, nsec / 100);
+            draw_center(font, buf, text_base, c_main);
+        } else if (style == "bcd") {
+            // Binary clock: six BCD columns (HHMMSS), MSB at the top
+            int dg[6] = {tm_disp.tm_hour / 10, tm_disp.tm_hour % 10,
+                         tm_disp.tm_min / 10,  tm_disp.tm_min % 10,
+                         tm_disp.tm_sec / 10,  tm_disp.tm_sec % 10};
+            int cell = band_h >= 24 ? 5 : 3;
+            int dot = cell - 1;
+            int ytop = (band_h - (4 * cell - 1)) / 2;
+            if (ytop < 0)
+                ytop = 0;
+            int total = 6 * (dot + 2) - 2 + 2 * 4;
+            int x0 = (matrix_options.cols - total) / 2;
+            for (int c = 0; c < 6; ++c) {
+                int x = x0 + c * (dot + 2) + (c / 2) * 4;
+                for (int b = 0; b < 4; ++b) {
+                    bool on = (dg[c] >> (3 - b)) & 1;
+                    Color cc = on ? c_main : c_dim;
+                    for (int dy = 0; dy < dot; ++dy)
+                        for (int dx = 0; dx < dot; ++dx)
+                            cv->SetPixel(x + dx, ytop + b * cell + dy,
+                                         cc.r, cc.g, cc.b);
+                }
+            }
+        } else if (style == "flip") {
+            // Solari-style roll: changed digits slide down over 250 ms
+            char cur[9];
+            snprintf(cur, sizeof(cur), "%02d:%02d:%02d",
+                     tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec);
+            if (!flip_init) {
+                memcpy(flip_prev, cur, 9);
+                memcpy(flip_old, cur, 9);
+                for (int i = 0; i < 8; ++i)
+                    flip_change[i] = 0;
+                flip_init = true;
+            }
+            int cw = font.CharacterWidth('0') + 1;
+            int x0 = (matrix_options.cols - (cw * 8 - 1)) / 2;
+            clip_canvas.inner = cv;
+            clip_canvas.y0 = text_base - font.baseline();
+            clip_canvas.y1 = text_base + 2;
+            for (int i = 0; i < 8; ++i) {
+                if (cur[i] != flip_prev[i]) {
+                    flip_old[i] = flip_prev[i];
+                    flip_prev[i] = cur[i];
+                    flip_change[i] = display_ns;
+                }
+                char one[2] = {cur[i], 0};
+                uint64_t dt = display_ns - flip_change[i];
+                if (flip_change[i] != 0 && dt < 250000000ULL) {
+                    int off = (int)(dt * 14 / 250000000ULL);
+                    char oldc[2] = {flip_old[i], 0};
+                    DrawText(&clip_canvas, font, x0 + i * cw,
+                             text_base + off, c_main, nullptr, oldc, 1);
+                    DrawText(&clip_canvas, font, x0 + i * cw,
+                             text_base + off - 14, c_main, nullptr, one, 1);
+                } else {
+                    DrawText(cv, font, x0 + i * cw, text_base, c_main,
+                             nullptr, one, 1);
+                }
+            }
+        } else if (style == "dcf77") {
+            // The current minute as a DCF77 telegram: 59 second marks
+            // (short = 0, long = 1), second 59 is the sync gap. DCF77
+            // announces the NEXT minute, so encode that.
+            time_t tnext = sec + (60 - tm_disp.tm_sec);
+            struct tm tn;
+            if (eff_mode == MODE_LOCAL)
+                localtime_r(&tnext, &tn);
+            else
+                gmtime_r(&tnext, &tn);
+            bool bit[59] = {false};
+            auto put_bcd = [&](int v, int start, int n, int &par) {
+                int b = ((v / 10) << 4) | (v % 10);
+                for (int i = 0; i < n; ++i) {
+                    bit[start + i] = (b >> i) & 1;
+                    par ^= (int)bit[start + i];
+                }
+            };
+            int par = 0;
+            bit[17] = tn.tm_isdst > 0;
+            bit[18] = !bit[17];
+            bit[20] = true;
+            par = 0; put_bcd(tn.tm_min, 21, 7, par);  bit[28] = par;
+            par = 0; put_bcd(tn.tm_hour, 29, 6, par); bit[35] = par;
+            par = 0;
+            put_bcd(tn.tm_mday, 36, 6, par);
+            put_bcd(tn.tm_wday == 0 ? 7 : tn.tm_wday, 42, 3, par);
+            put_bcd(tn.tm_mon + 1, 45, 5, par);
+            put_bcd(tn.tm_year % 100, 50, 8, par);
+            bit[58] = par;
+
+            int ytop = (band_h - 9) / 2;
+            if (ytop < 0)
+                ytop = 0;
+            for (int i = 0; i < 60; ++i) {
+                int cx = 4 + (i % 30) * 4;
+                int cy = ytop + (i / 30) * 6;
+                if (i == 59) {            // sync gap: no mark
+                    cv->SetPixel(cx, cy + 2, c_dim.r, c_dim.g, c_dim.b);
+                    continue;
+                }
+                int h = bit[i] ? 3 : 1;   // long pulse = 1, short = 0
+                Color cc(0, 0, 0);
+                if (i < tm_disp.tm_sec) {
+                    cc = c_main;          // already transmitted
+                } else if (i == tm_disp.tm_sec) {
+                    // live carrier dip: 100 ms for 0, 200 ms for 1
+                    bool pulse = nsec < (bit[i] ? 200000000u : 100000000u);
+                    cc = pulse ? Color(255, 255, 255) : c_main;
+                } else {
+                    cc = c_dim;           // still to come
+                    h = 1;
+                }
+                for (int dy = 0; dy < h; ++dy)
+                    for (int dx = 0; dx < 3; ++dx)
+                        cv->SetPixel(cx + dx, cy + 2 - dy, cc.r, cc.g, cc.b);
+            }
+        } else if (style == "pend") {
+            // Digital time with a metronome ball, phase-locked to the
+            // PTP second: it reaches the ends exactly on the tick
+            char tb[16];
+            snprintf(tb, sizeof(tb), "%02d:%02d:%02d",
+                     tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec);
+            draw_center(font, tb, 13, c_main);
+            int sy = band_h - 2;
+            if (sy > 14) {
+                cv->SetPixel(4, sy, c_dim.r, c_dim.g, c_dim.b);
+                cv->SetPixel(63, sy, c_dim.r, c_dim.g, c_dim.b);
+                cv->SetPixel(123, sy, c_dim.r, c_dim.g, c_dim.b);
+                double t2 = (double)(display_ns % 2000000000ULL) / 1e9;
+                int bx = 63 + (int)(cos(M_PI * t2) * 58.0);
+                for (int dy = 0; dy < 2; ++dy)
+                    for (int dx = 0; dx < 2; ++dx)
+                        cv->SetPixel(bx + dx, sy - 1 + dy,
+                                     c_main.r, c_main.g, c_main.b);
+            }
+        } else if (style == "sand") {
+            // Hourglass: one grain per second, the pile is the minute
+            if (have_small_font) {
+                char tb[16];
+                snprintf(tb, sizeof(tb), "%02d:%02d:%02d",
+                         tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec);
+                draw_center(small_font, tb, 6, c_main);
+            }
+            static const int w6[6] = {15, 13, 11, 9, 7, 5};   // sum 60
+            static const int w4[4] = {19, 17, 13, 11};        // sum 60
+            const int *widths = band_h >= 24 ? w6 : w4;
+            int nrows = band_h >= 24 ? 6 : 4;
+            int placed = 0;
+            for (int r = 0; r < nrows && placed < tm_disp.tm_sec; ++r) {
+                int y = band_h - 1 - r;
+                for (int k = 0; k < widths[r] && placed < tm_disp.tm_sec;
+                     ++k) {
+                    int off = ((k + 1) / 2) * ((k % 2) ? 1 : -1);
+                    cv->SetPixel(64 + off, y, c_main.r, c_main.g, c_main.b);
+                    placed++;
+                }
+            }
+            int fall_top = 8, fall_bot = band_h - nrows - 1;
+            if (fall_bot > fall_top) {
+                int fy = fall_top + (int)((fall_bot - fall_top) *
+                                          (nsec / 1e9));
+                cv->SetPixel(64, fy, c_main.r, c_main.g, c_main.b);
+            }
+        } else if (style == "words") {
+            // German word clock, rounded to the nearest 5 minutes
+            static const char *kHours[12] = {"ZWOELF", "EINS", "ZWEI",
+                "DREI", "VIER", "FUENF", "SECHS", "SIEBEN", "ACHT",
+                "NEUN", "ZEHN", "ELF"};
+            static const char *kPhrase[12] = {"", "FUENF NACH",
+                "ZEHN NACH", "VIERTEL NACH", "ZWANZIG NACH",
+                "FUENF VOR HALB", "HALB", "FUENF NACH HALB",
+                "ZWANZIG VOR", "VIERTEL VOR", "ZEHN VOR", "FUENF VOR"};
+            int seg = ((tm_disp.tm_min + 2) / 5) % 12;
+            int hh = tm_disp.tm_hour + (((tm_disp.tm_min + 2) / 5) >= 5 ||
+                                        ((tm_disp.tm_min + 2) / 5) == 12
+                                        ? 1 : 0);
+            const char *hw = kHours[hh % 12];
+            if (have_small_font) {
+                if (seg == 0) {
+                    char l1[32];
+                    snprintf(l1, sizeof(l1), "%s UHR", hw);
+                    draw_center(small_font, l1, band_h / 2 + 2, c_main);
+                } else {
+                    draw_center(small_font, kPhrase[seg],
+                                band_h / 2 - 3, c_main);
+                    draw_center(small_font, hw, band_h / 2 + 4, c_main);
+                }
+            }
+        } else {
+            // Digital 24h (default) / 12h
+            char time_buffer[64];
+            if (style == "12h") {
+                int h12 = tm_disp.tm_hour % 12;
+                if (h12 == 0)
+                    h12 = 12;
+                snprintf(time_buffer, sizeof(time_buffer),
+                         "%02d:%02d:%02d.%06u %cM",
+                         h12, tm_disp.tm_min, tm_disp.tm_sec, nsec / 1000,
+                         tm_disp.tm_hour < 12 ? 'A' : 'P');
+            } else {
+                snprintf(time_buffer, sizeof(time_buffer),
+                         "%02d:%02d:%02d.%09u",
+                         tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec,
+                         nsec);
+            }
+            draw_center(font, time_buffer, text_base, c_main);
+        }
 
         if (!line2.empty()) {
             int x2 = (matrix_options.cols -
