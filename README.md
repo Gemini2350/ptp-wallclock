@@ -152,12 +152,12 @@ The clock serves a settings page on `http://<pi-address>:8319`. At the top
 it shows the current PTP time as a live, smoothly ticking clock with all
 nine fractional digits, just like the matrix (the server sends its TAI time
 with every status poll and the browser extrapolates in between; expect a few
-milliseconds of network offset, so the fast digits are extrapolated rather
-than measured — digits finer than the browser's timer resolution are
-dithered every frame so they spin like on the LED panel instead of
-freezing). The clock follows the
-configured time mode and formats, so it mirrors what the LED matrix shows.
-Settings:
+milliseconds of network offset). The fractional digits — on the LED matrix
+and in the browser alike — use a per-position speed ladder: the tenths
+digit is the true value, and every further digit visibly changes faster
+than the one before it. The real values change far too fast for any
+display, so the fast digits are synthesized sample-and-hold; what you see
+is an ordered acceleration instead of uniform flicker. Settings:
 
 - **Display color** — color picker for the LED matrix text
 - **Brightness** — 1–100 % slider, applied immediately

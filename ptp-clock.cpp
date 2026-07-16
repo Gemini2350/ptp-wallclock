@@ -69,6 +69,25 @@ public:
     void Fill(uint8_t r, uint8_t g, uint8_t b) override { inner->Fill(r, g, b); }
 };
 
+// Fractional digits with a per-position speed ladder: the tenths digit is
+// the true value; every further digit gets its own visible update rate
+// (~10/s at the front, geometrically faster towards the back). The true
+// values change far too fast for any display — sample-and-hold with a
+// deterministic hash makes the eye see an ordered acceleration instead of
+// uniform flicker.
+static void format_fraction(char out[10], uint64_t t_ns) {
+    static const uint64_t kHold[9] = {
+        100000000ULL, 66000000ULL, 43600000ULL, 28700000ULL, 19000000ULL,
+        12500000ULL, 8300000ULL, 5500000ULL, 3600000ULL};
+    out[0] = (char)('0' + (t_ns / 100000000ULL) % 10);
+    for (int k = 1; k < 9; ++k) {
+        uint32_t idx = (uint32_t)(t_ns / kHold[k]);
+        uint32_t v = idx * 2654435761u + (uint32_t)(k + 1) * 40503u;
+        out[k] = (char)('0' + (v >> 16) % 10);
+    }
+    out[9] = 0;
+}
+
 // Short time-source label for the matrix details line (IEEE 1588 table 7)
 static const char *time_source_short(uint8_t ts) {
     switch (ts) {
@@ -1425,24 +1444,22 @@ document.getElementById('form').addEventListener('submit', async (e) => {
 });
 
 // Live PTP clock: the server sends TAI at poll time, the browser
-// extrapolates in between and renders in the configured mode/format.
-// Digits finer than the browser timer resolution (performance.now() is
-// coarsened to 0.1-1 ms for privacy) would freeze between polls, so they
-// are dithered every frame — like the unreadably fast digits on the LED.
-let quantumNs = 1e6;
-(function () {
-  let last = performance.now(), min = Infinity, seen = 0;
-  for (let i = 0; i < 20000 && seen < 20; i++) {
-    const t = performance.now();
-    if (t > last) { min = Math.min(min, t - last); seen++; }
-    last = t;
+// extrapolates in between. Fractional digits use a per-position speed
+// ladder (same as the LED): the tenths digit is real, every further
+// digit visibly changes faster than the one before it — sample-and-hold
+// with a deterministic hash, since the true values change far too fast
+// for any display anyway.
+const FRAC_HOLD = [1e8, 6.6e7, 4.36e7, 2.87e7, 1.9e7,
+                   1.25e7, 8.3e6, 5.5e6, 3.6e6];
+function fracDigits(tNs) {
+  let s = String(Math.floor(tNs / 1e8) % 10);
+  for (let k = 1; k < 9; k++) {
+    const idx = Math.floor(tNs / FRAC_HOLD[k]) >>> 0;
+    const v = (Math.imul(idx, 2654435761) + (k + 1) * 40503) >>> 0;
+    s += (v >>> 16) % 10;
   }
-  if (seen > 0)
-    quantumNs = Math.min(1e6, Math.max(1e3,
-        Math.pow(10, Math.ceil(Math.log10(min * 1e6)))));
-})();
-const dither = (frac) =>
-    frac - (frac % quantumNs) + Math.floor(Math.random() * quantumNs);
+  return s;
+}
 
 let clockBase = null;   // {sec, nsec, perf, off}
 function renderClock() {
@@ -1460,7 +1477,8 @@ function renderClock() {
   const elapsed = performance.now() - clockBase.perf;
   const totalNs = clockBase.nsec + elapsed * 1e6;
   let sec = clockBase.sec + Math.floor(totalNs / 1e9);
-  const frac = dither(Math.floor(totalNs % 1e9));
+  // Reduced TAI ns (mod ~1 day) keeps the math exact in doubles
+  const fr9 = fracDigits((clockBase.sec % 100000) * 1e9 + totalNs);
 
   // Active clock line straight from the editor rows (live preview),
   // same PTP-second-aligned rotation as the LED display
@@ -1490,7 +1508,6 @@ function renderClock() {
     return;
   }
   // Body text per style (pixel styles fall back to digital 24h)
-  const fr9 = String(frac).padStart(9, '0');
   let body;
   if (style === 'unix') {
     body = sec + '.' + fr9;
@@ -1681,22 +1698,20 @@ const TSRC = {0x10:'atomic clock',0x20:'GPS/GNSS',0x30:'terrestrial radio',
  0x40:'PTP',0x50:'NTP',0x60:'hand set',0x90:'other',
  0xA0:'internal oscillator'};
 
-// Digits finer than the browser timer resolution are dithered every frame
-// (see the settings page clock for the same trick)
-let quantumNs = 1e6;
-(function () {
-  let last = performance.now(), min = Infinity, seen = 0;
-  for (let i = 0; i < 20000 && seen < 20; i++) {
-    const t = performance.now();
-    if (t > last) { min = Math.min(min, t - last); seen++; }
-    last = t;
+// Fractional digits with a per-position speed ladder (same as the LED):
+// the tenths digit is real, every further digit visibly changes faster
+// than the one before it — sample-and-hold with a deterministic hash.
+const FRAC_HOLD = [1e8, 6.6e7, 4.36e7, 2.87e7, 1.9e7,
+                   1.25e7, 8.3e6, 5.5e6, 3.6e6];
+function fracDigits(tNs) {
+  let s = String(Math.floor(tNs / 1e8) % 10);
+  for (let k = 1; k < 9; k++) {
+    const idx = Math.floor(tNs / FRAC_HOLD[k]) >>> 0;
+    const v = (Math.imul(idx, 2654435761) + (k + 1) * 40503) >>> 0;
+    s += (v >>> 16) % 10;
   }
-  if (seen > 0)
-    quantumNs = Math.min(1e6, Math.max(1e3,
-        Math.pow(10, Math.ceil(Math.log10(min * 1e6)))));
-})();
-const dither = (frac) =>
-    frac - (frac % quantumNs) + Math.floor(Math.random() * quantumNs);
+  return s;
+}
 
 let S = null;          // settings (mode, formats, color, notify)
 let st = null;         // last status
@@ -1781,7 +1796,8 @@ function render() {
   const elapsed = performance.now() - base.perf;
   const totalNs = base.nsec + elapsed * 1e6;
   let sec = base.sec + Math.floor(totalNs / 1e9);
-  const frac = dither(Math.floor(totalNs % 1e9));
+  // Reduced TAI ns (mod ~1 day) keeps the math exact in doubles
+  const fr9 = fracDigits((base.sec % 100000) * 1e9 + totalNs);
 
   // Active clock line, same PTP-aligned rotation as the LED display
   const list = (S.clocks && S.clocks.length)
@@ -1805,7 +1821,6 @@ function render() {
     return;
   }
   // Body per style (pixel styles fall back to digital 24h)
-  const fr9 = String(frac).padStart(9, '0');
   let sup = '', body;
   if (cl.style === 'unix') {
     body = sec + '.' + fr9;
@@ -2510,7 +2525,8 @@ int main(int argc, char **argv) {
             // follow in the small font on the same baseline
             char bsec[24], bfrac[16];
             snprintf(bsec, sizeof(bsec), "%lld", (long long)sec);
-            snprintf(bfrac, sizeof(bfrac), ".%09u", nsec);
+            bfrac[0] = '.';
+            format_fraction(bfrac + 1, display_ns);
             if (have_small_font) {
                 int wbig = (font.CharacterWidth('0') + 1) *
                            (int)strlen(bsec) - 1;
@@ -2549,10 +2565,12 @@ int main(int argc, char **argv) {
         } else if (style == "flip") {
             // Solari-style roll on HH:MM:SS — the nine fractional digits
             // follow plainly and spin on their own
+            char fracbuf[10];
+            format_fraction(fracbuf, display_ns);
             char cur[24];
-            snprintf(cur, sizeof(cur), "%02d:%02d:%02d.%09u",
+            snprintf(cur, sizeof(cur), "%02d:%02d:%02d.%s",
                      tm_disp.tm_hour, tm_disp.tm_min, tm_disp.tm_sec,
-                     nsec);
+                     fracbuf);
             if (!flip_init) {
                 memcpy(flip_prev, cur, 8);
                 memcpy(flip_old, cur, 8);
@@ -2656,9 +2674,11 @@ int main(int argc, char **argv) {
                 if (hh == 0)
                     hh = 12;
             }
+            char fracbuf[10];
+            format_fraction(fracbuf, display_ns);
             snprintf(time_buffer, sizeof(time_buffer),
-                     "%02d:%02d:%02d.%09u",
-                     hh, tm_disp.tm_min, tm_disp.tm_sec, nsec);
+                     "%02d:%02d:%02d.%s",
+                     hh, tm_disp.tm_min, tm_disp.tm_sec, fracbuf);
             draw_center(font, time_buffer, text_base, c_main);
         }
 
