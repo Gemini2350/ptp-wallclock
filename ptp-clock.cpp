@@ -14,6 +14,13 @@
 #include <unistd.h>
 #include <ifaddrs.h>
 #include <poll.h>
+#include <fcntl.h>
+#ifdef __linux__
+#include <linux/net_tstamp.h>
+#include <linux/sockios.h>
+#include <linux/ethtool.h>
+#include <linux/errqueue.h>
+#endif
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
@@ -207,6 +214,7 @@ struct Settings {
     int date_format = DATE_DMY;           // DD.MM.YYYY / ISO / MM/DD/YYYY
     bool notify_gm_change = false;        // notify on grandmaster change
     int http_port = 8319;
+    bool hwts = true;                     // try PTP hardware timestamping
     int domain = -1;                      // PTP domain, -1 = auto detect
     std::string iface = "auto";           // interface, "auto" = all of them
     std::string acceptable_gms;           // comma-separated GM identities;
@@ -301,6 +309,15 @@ static int g_hist_rate_n = 0, g_hist_rate_i = 0;
 static std::atomic<uint32_t> g_cnt_sync{0}, g_cnt_fup{0};
 static std::atomic<uint32_t> g_cnt_ann{0}, g_cnt_dresp{0};
 
+// ---- PTP hardware timestamping (Linux, optional) ----
+// When available, the NIC's PHC becomes the local timing clock: Sync
+// arrival (t2) comes from the hardware RX timestamp, the Delay_Req send
+// time (t3) from the TX error queue, and the display reads the PHC.
+static bool g_hwts = false;
+static int g_phc_fd = -1;
+static std::string g_hwts_desc;           // e.g. "eth0 via /dev/ptp0"
+static std::atomic<unsigned long long> g_last_sync_age_ns{0};  // mono, for UI
+
 static void hist_push(int32_t *buf, int &n, int &i, int64_t v) {
     if (v > 2000000000LL) v = 2000000000LL;
     if (v < -2000000000LL) v = -2000000000LL;
@@ -314,6 +331,20 @@ static uint64_t mono_ns() {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+// The local timing clock: the NIC's PHC when hardware timestamping is
+// active (packet timestamps come from the same clock), else monotonic.
+static uint64_t local_clock_ns() {
+#ifdef __linux__
+    if (g_hwts) {
+        timespec ts;
+        clockid_t cid = (clockid_t)((~(clockid_t)g_phc_fd) << 3) | 3;
+        if (clock_gettime(cid, &ts) == 0)
+            return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    }
+#endif
+    return mono_ns();
 }
 
 static uint64_t be_bytes(const uint8_t *p, int n) {
@@ -452,6 +483,7 @@ static void save_settings_locked() {
     else
         f << "domain=" << g_settings.domain << "\n";
     f << "iface=" << g_settings.iface << "\n";
+    f << "hwts=" << (g_settings.hwts ? 1 : 0) << "\n";
     f << "acceptable_gms=" << g_settings.acceptable_gms << "\n";
 }
 
@@ -524,6 +556,8 @@ static void load_settings() {
         } else if (key == "iface") {
             if (!val.empty())
                 g_settings.iface = val;
+        } else if (key == "hwts") {
+            g_settings.hwts = (val != "0");
         } else if (key == "acceptable_gms") {
             g_settings.acceptable_gms = val;
         }
@@ -574,6 +608,7 @@ static void reset_ptp_state() {
     have_ptp_ref = false;
     g_path_delay_ns = 0;
     g_last_sync_mono_ns = 0;
+    g_last_sync_age_ns = 0;
     g_active_domain = -1;
     g_last_announce_mono_ns = 0;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -756,7 +791,8 @@ static void complete_sync_pair(int64_t t1, int64_t t2) {
     }
     g_offset_atomic = g_offset_ns;
     g_last_sync_mono_ns = (uint64_t)t2;
-    have_ptp_ref = true;
+    g_last_sync_age_ns = mono_ns();       // housekeeping clock, not t2:
+    have_ptp_ref = true;                  // t2 may be PHC time (hw mode)
 }
 
 // Port 319 (event): Sync
@@ -768,6 +804,11 @@ static void process_event_packet(const uint8_t *buf, ssize_t len,
     if (msg_type != 0x00)                 // only Sync
         return;
     g_cnt_sync++;
+
+    // Hardware mode: a Sync without a hardware timestamp (arrived on a
+    // non-PHC interface) is useless for timing
+    if (now_mono == 0)
+        return;
 
     // BMCA: only accept Sync from the elected master
     if (!g_have_master || memcmp(buf + 20, g_elected_sender, 10) != 0)
@@ -986,6 +1027,173 @@ static void init_clock_identity(int sock, const std::string &iface) {
     g_clock_id[7] = pid & 0xFF;
 }
 
+// Probe the interface(s) for PTP hardware timestamping and enable it if
+// available. Must run while still root (SIOCSHWTSTAMP and /dev/ptpN need
+// privileges; the socket option and the kept-open PHC fd survive the
+// later privilege drop). Falls back to software timestamps silently.
+static void try_enable_hw_timestamping(int sock_event) {
+#ifdef __linux__
+    std::vector<std::string> cand;
+    if (g_settings.iface == "auto")
+        cand = list_ifaces();
+    else
+        cand.push_back(g_settings.iface);
+    for (const auto &name : cand) {
+        struct ifreq ifr{};
+        strncpy(ifr.ifr_name, name.c_str(), sizeof(ifr.ifr_name) - 1);
+        struct ethtool_ts_info info{};
+        info.cmd = ETHTOOL_GET_TS_INFO;
+        ifr.ifr_data = (char *)&info;
+        if (ioctl(sock_event, SIOCETHTOOL, &ifr) < 0)
+            continue;
+        unsigned need = SOF_TIMESTAMPING_RX_HARDWARE |
+                        SOF_TIMESTAMPING_TX_HARDWARE |
+                        SOF_TIMESTAMPING_RAW_HARDWARE;
+        if ((info.so_timestamping & need) != need || info.phc_index < 0)
+            continue;
+
+        // Turn on timestamping in the NIC; filter support varies
+        static const int kFilters[] = {HWTSTAMP_FILTER_ALL,
+                                       HWTSTAMP_FILTER_PTP_V2_L4_EVENT,
+                                       HWTSTAMP_FILTER_PTP_V2_EVENT};
+        struct hwtstamp_config cfg{};
+        cfg.tx_type = HWTSTAMP_TX_ON;
+        bool nic_ok = false;
+        for (int filt : kFilters) {
+            cfg.rx_filter = filt;
+            struct ifreq ifr2{};
+            strncpy(ifr2.ifr_name, name.c_str(), sizeof(ifr2.ifr_name) - 1);
+            ifr2.ifr_data = (char *)&cfg;
+            if (ioctl(sock_event, SIOCSHWTSTAMP, &ifr2) == 0) {
+                nic_ok = true;
+                break;
+            }
+        }
+        if (!nic_ok)
+            continue;
+
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/ptp%d", info.phc_index);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            std::cerr << "Hardware timestamping: cannot open " << path
+                      << ", staying on software timestamps\n";
+            continue;
+        }
+
+        int flags = SOF_TIMESTAMPING_RX_HARDWARE |
+                    SOF_TIMESTAMPING_RAW_HARDWARE |
+                    SOF_TIMESTAMPING_TX_HARDWARE |
+                    SOF_TIMESTAMPING_OPT_TSONLY;
+        if (setsockopt(sock_event, SOL_SOCKET, SO_TIMESTAMPING,
+                       &flags, sizeof(flags)) < 0) {
+            close(fd);
+            continue;
+        }
+
+        g_phc_fd = fd;
+        g_hwts_desc = name + " via " + path;
+        g_hwts = true;
+        std::cout << "PTP hardware timestamping enabled on " << g_hwts_desc
+                  << "\n";
+        return;
+    }
+    std::cout << "PTP hardware timestamping not available, "
+              << "using software timestamps\n";
+#else
+    (void)sock_event;
+#endif
+}
+
+// Receive one packet from the event socket and return the local timestamp
+// to pair with it: the hardware (PHC) RX timestamp in hw mode, else
+// CLOCK_MONOTONIC_RAW. Returns 0 when no usable timestamp exists (hw mode
+// and the packet arrived on a different interface).
+static uint64_t recv_event_packet(int sock, uint8_t *buf, size_t buflen,
+                                  ssize_t *len_out) {
+#ifdef __linux__
+    struct iovec iov{buf, buflen};
+    union { char buf[256]; struct cmsghdr align; } ctrl;
+    struct msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctrl.buf;
+    msg.msg_controllen = sizeof(ctrl.buf);
+    ssize_t len = recvmsg(sock, &msg, 0);
+    *len_out = len;
+    if (len <= 0)
+        return 0;
+    if (!g_hwts)
+        return mono_ns();
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c;
+         c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPING) {
+            struct scm_timestamping tss;
+            memcpy(&tss, CMSG_DATA(c), sizeof(tss));
+            if (tss.ts[2].tv_sec || tss.ts[2].tv_nsec)   // [2] = raw hardware
+                return (uint64_t)tss.ts[2].tv_sec * 1000000000ULL +
+                       tss.ts[2].tv_nsec;
+        }
+    }
+    return 0;
+#else
+    ssize_t len = recv(sock, buf, buflen, 0);
+    *len_out = len;
+    return len > 0 ? mono_ns() : 0;
+#endif
+}
+
+#ifdef __linux__
+// Discard leftover error-queue entries (a TX timestamp that arrived
+// after its fetch window would otherwise be taken as the NEXT Delay_Req's
+// send time — about a second off)
+static void drain_errqueue(int sock) {
+    union { char buf[256]; struct cmsghdr align; } ctrl;
+    char dbuf[64];
+    struct iovec iov{dbuf, sizeof(dbuf)};
+    struct msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    do {
+        msg.msg_control = ctrl.buf;
+        msg.msg_controllen = sizeof(ctrl.buf);
+    } while (recvmsg(sock, &msg, MSG_ERRQUEUE) >= 0);
+}
+
+// Hardware TX timestamp of the just-sent Delay_Req, looped back by the
+// kernel on the socket's error queue. Usually there within microseconds;
+// give up after ~4 ms (that delay round is then skipped).
+static uint64_t fetch_tx_timestamp(int sock) {
+    for (int tries = 0; tries < 20; ++tries) {
+        union { char buf[256]; struct cmsghdr align; } ctrl;
+        char dbuf[64];
+        struct iovec iov{dbuf, sizeof(dbuf)};
+        struct msghdr msg{};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = ctrl.buf;
+        msg.msg_controllen = sizeof(ctrl.buf);
+        ssize_t r = recvmsg(sock, &msg, MSG_ERRQUEUE);
+        if (r < 0) {
+            usleep(200);
+            continue;
+        }
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c;
+             c = CMSG_NXTHDR(&msg, c)) {
+            if (c->cmsg_level == SOL_SOCKET &&
+                c->cmsg_type == SCM_TIMESTAMPING) {
+                struct scm_timestamping tss;
+                memcpy(&tss, CMSG_DATA(c), sizeof(tss));
+                if (tss.ts[2].tv_sec || tss.ts[2].tv_nsec)
+                    return (uint64_t)tss.ts[2].tv_sec * 1000000000ULL +
+                           tss.ts[2].tv_nsec;
+            }
+        }
+    }
+    return 0;
+}
+#endif
+
 // Add/drop the PTP multicast membership on one interface (both sockets).
 // op is IP_ADD_MEMBERSHIP or IP_DROP_MEMBERSHIP.
 static void membership(int sock_event, int sock_gen, uint32_t ip, int op) {
@@ -1142,7 +1350,7 @@ static std::string status_json() {
         since_change = now.tv_sec - g_last_gm_change.tv_sec;
 
     double sync_age = -1;
-    unsigned long long last_sync = g_last_sync_mono_ns.load();
+    unsigned long long last_sync = g_last_sync_age_ns.load();
     if (last_sync > 0) {
         uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
         sync_age = (double)(now_ns - last_sync) / 1e9;
@@ -1151,7 +1359,7 @@ static std::string status_json() {
     // Current PTP time (TAI), split so the values stay exact in JS doubles
     long long tai_sec = -1, tai_nsec = 0;
     if (have_ptp_ref) {
-        long long tai = (long long)mono_ns() - g_offset_atomic.load();
+        long long tai = (long long)local_clock_ns() - g_offset_atomic.load();
         if (tai > 0) {
             tai_sec = tai / 1000000000LL;
             tai_nsec = tai % 1000000000LL;
@@ -1169,6 +1377,8 @@ static std::string status_json() {
       << "\"iface\":\"" << json_escape(g_settings.iface) << "\","
       << "\"iface_active\":\"" << json_escape(g_joined_names) << "\","
       << "\"iface_up\":" << (g_iface_up ? "true" : "false") << ","
+      << "\"hwts\":" << (g_hwts ? "true" : "false") << ","
+      << "\"hwts_desc\":\"" << json_escape(g_hwts_desc) << "\","
       << "\"gm_id\":\"" << (g_have_gm ? format_gm(g_gm.id) : "") << "\","
       << "\"gm_vendor\":\"" << (g_have_gm ? lookup_vendor(g_gm.id) : "") << "\","
       << "\"gm_accepted\":" << (gm_acceptable_locked() ? "true" : "false") << ","
@@ -1277,6 +1487,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <table class="status">
  <tr><td>PTP</td><td id="s_ptp">&ndash;</td></tr>
  <tr><td>Interface</td><td id="s_iface">&ndash;</td></tr>
+ <tr><td>Timestamping</td><td id="s_hwts">&ndash;</td></tr>
  <tr><td>Domain</td><td id="s_domain">&ndash;</td></tr>
  <tr><td>Grandmaster</td><td id="s_gm">&ndash;</td></tr>
  <tr><td>Vendor</td><td id="s_vendor">&ndash;</td></tr>
@@ -1721,6 +1932,7 @@ async function poll() {
         ? (s.iface_active ? 'auto (' + s.iface_active + ')'
                           : 'auto (searching...)')
         : s.iface + (s.iface_up ? '' : ' (not connected)'));
+    set('s_hwts', s.hwts ? 'hardware (' + s.hwts_desc + ')' : 'software');
     set('s_domain', s.domain === -1
         ? (s.active_domain >= 0
            ? s.active_domain + ' (auto-detected)'
@@ -2252,6 +2464,19 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Hardware timestamping setup needs privileges — do it now, before
+    // the matrix library drops them
+    if (g_settings.hwts)
+        try_enable_hw_timestamping(sock_sync);
+    else
+        std::cout << "PTP hardware timestamping disabled (hwts=0)\n";
+
+    // Non-blocking: with SO_TIMESTAMPING a pending TX timestamp on the
+    // error queue can mark the socket readable without data — a blocking
+    // recv would then hang the main loop
+    fcntl(sock_sync, F_SETFL, O_NONBLOCK);
+    fcntl(sock_general, F_SETFL, O_NONBLOCK);
+
 #ifndef NO_MATRIX
     // --- Matrix options ---
     RGBMatrix::Options matrix_options;
@@ -2435,9 +2660,10 @@ int main(int argc, char **argv) {
         // --- SYNC (port 319) ---
         if (FD_ISSET(sock_sync, &fds)) {
             uint8_t buf[128];
-            ssize_t len = recv(sock_sync, buf, sizeof(buf), 0);
+            ssize_t len = 0;
+            uint64_t ts = recv_event_packet(sock_sync, buf, sizeof(buf), &len);
             if (len > 0)
-                process_event_packet(buf, len, mono_ns());
+                process_event_packet(buf, len, ts);
         }
 
         // --- ANNOUNCE / FOLLOW_UP / DELAY_RESP (port 320) ---
@@ -2480,6 +2706,10 @@ int main(int argc, char **argv) {
             now_ns - last_dreq_ns >= 1000000000ULL) {
             uint8_t pkt[44];
             build_delay_req(pkt, ++g_dreq_seq);
+#ifdef __linux__
+            if (g_hwts)
+                drain_errqueue(sock_sync);
+#endif
             uint64_t t_a = mono_ns();
             int sent_ok = 0;
             for (const auto &j : joined) {
@@ -2494,10 +2724,21 @@ int main(int argc, char **argv) {
             }
             uint64_t t_b = mono_ns();
             if (sent_ok > 0) {
-                g_pending_dreq.valid = true;
-                g_pending_dreq.seq = g_dreq_seq;
-                g_pending_dreq.t3_mono = t_a + (t_b - t_a) / 2;
-                g_dreq_sent++;
+                uint64_t t3 = 0;
+#ifdef __linux__
+                if (g_hwts)
+                    // PHC send time from the error queue; if the NIC gives
+                    // none, skip this round (never mix in software times)
+                    t3 = fetch_tx_timestamp(sock_sync);
+                else
+#endif
+                    t3 = t_a + (t_b - t_a) / 2;
+                if (t3) {
+                    g_pending_dreq.valid = true;
+                    g_pending_dreq.seq = g_dreq_seq;
+                    g_pending_dreq.t3_mono = t3;
+                    g_dreq_sent++;
+                }
             }
             last_dreq_ns = now_ns;
         }
@@ -2546,7 +2787,7 @@ int main(int argc, char **argv) {
         }
 
         // --- Smooth time: master(TAI) = local(mono) - offset ---
-        int64_t display_signed = (int64_t)mono_ns() - g_offset_ns;
+        int64_t display_signed = (int64_t)local_clock_ns() - g_offset_ns;
         if (display_signed < 0)
             display_signed = 0;
         uint64_t display_ns = (uint64_t)display_signed;

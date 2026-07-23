@@ -33,6 +33,11 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
   receipt timeouts are honored, so the clock fails over automatically
 - Automatic PTP domain detection (locks onto the first domain with Announce
   traffic, rescans on timeout), or a fixed domain 0–255
+- PTP hardware timestamping when the NIC has a PHC (e.g. Raspberry Pi 5,
+  CM4, Intel i210/i225): Sync arrival and Delay_Req departure are stamped
+  by the hardware and the display runs directly off the PTP hardware
+  clock — enabled automatically at startup, with transparent fallback to
+  software timestamps. The status panel shows which mode is active
 - Displays time on an RGB LED matrix as a configurable list of clock lines:
   each line has a time zone (UTC, TAI, or any IANA zone — world clock!), a
   rendering style, and an optional label — one line is static, several
@@ -49,7 +54,8 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
 - One-step installation with systemd service
 - Headless mode for Docker: a fullscreen browser clock (`/clock`) replaces
   the LED panel
-- Runs entirely in user space, no kernel PTP support needed
+- Runs entirely in user space; kernel PTP (PHC) support is used when
+  present but never required
 
 ---
 
@@ -142,6 +148,11 @@ Notes:
   multicast group on every interface with an IPv4 address). To pin it, set
   `-e PTP_WALLCLOCK_IFACE=eth0` or change it in the web UI (the volume
   keeps the settings).
+- For PTP hardware timestamping inside the container the NIC's PHC must be
+  passed in and the container needs `CAP_NET_ADMIN`:
+  `--cap-add NET_ADMIN --device /dev/ptp0` (matching commented lines are
+  in `docker-compose.yml`). Without them the container simply uses
+  software timestamps.
 - The same headless binary can be built without Docker: `make headless`.
 
 ---
@@ -223,12 +234,13 @@ the interesting µs range.
 Settings are persisted as simple `key=value` pairs. The file is
 `/var/lib/ptp-wallclock/ptp-wallclock.conf` when installed via `install.sh`,
 otherwise `ptp-wallclock.conf` in the working directory (override with the
-`PTP_WALLCLOCK_CONF` environment variable). One setting is only available
-in the file (restart required):
+`PTP_WALLCLOCK_CONF` environment variable). Two settings are only
+available in the file (restart required):
 
-| Key         | Default | Meaning                              |
-|-------------|---------|--------------------------------------|
-| `http_port` | `8319`  | Port of the web interface            |
+| Key         | Default | Meaning                                        |
+|-------------|---------|------------------------------------------------|
+| `http_port` | `8319`  | Port of the web interface                      |
+| `hwts`      | `1`     | Try PTP hardware timestamping, `0` = never     |
 
 The network interface (`iface`, default `auto`) can be changed in the web
 interface without a restart. In `auto` mode the clock joins the PTP
@@ -257,11 +269,25 @@ silently misbehaving.
 
 ## Accuracy
 
-Packets are timestamped in user space (no hardware timestamping), so the
-achievable accuracy is in the sub-millisecond range on a Raspberry Pi —
-plenty for a wall clock display, but this is a visualization tool, not a
-reference clock. Sync/Follow_Up and Delay_Resp measurements are smoothed
-with a small exponential filter.
+At startup the clock probes the network interface for PTP hardware
+timestamping (`ETHTOOL_GET_TS_INFO`). If the NIC has a PHC — Raspberry
+Pi 5 (RP1 Ethernet) and CM4 have one, Pi 3/4 do not — timestamping is
+enabled in the NIC, Sync arrival (t2) is taken from the hardware RX
+timestamp, the Delay_Req send time (t3) from the hardware TX timestamp on
+the socket error queue, and the displayed time is derived from the PHC
+itself, eliminating the user-space scheduling jitter from the
+measurements. The status panel shows the active mode, e.g.
+`hardware (eth0 via /dev/ptp0)`. Set `hwts=0` in the configuration file
+to force software timestamps.
+
+Without a PHC, packets are timestamped in user space and the achievable
+accuracy is in the sub-millisecond range — plenty for a wall clock
+display, but this is a visualization tool, not a reference clock. In both
+modes Sync/Follow_Up and Delay_Resp measurements are smoothed with a
+small exponential filter. Note that the LED refresh and the browser
+rendering add their own few milliseconds — hardware timestamping makes
+the *measurements* honest (visible in the PTP analysis charts), not the
+photons faster.
 
 ## References
 
@@ -272,4 +298,5 @@ with a small exponential filter.
 - PTPv1 (IEEE 1588-2002) is not supported. The implementation targets PTPv2
   (IEEE 1588-2008) only.
 
-- Only software timestamps are used (see Accuracy above).
+- Hardware timestamping is probed once at startup; after changing the
+  interface setting, restart the service to re-probe.

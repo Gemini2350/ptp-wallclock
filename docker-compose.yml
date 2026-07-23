@@ -10,6 +10,11 @@ services:
     # To pin it to one interface instead:
     # environment:
     #   - PTP_WALLCLOCK_IFACE=eth0
+    # For PTP hardware timestamping (NIC with a PHC, e.g. Raspberry Pi 5):
+    # cap_add:
+    #   - NET_ADMIN
+    # devices:
+    #   - /dev/ptp0:/dev/ptp0
 
 volumes:
   ptp-wallclock:
