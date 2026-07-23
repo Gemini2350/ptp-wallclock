@@ -1510,6 +1510,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 
 <fieldset>
 <legend>PTP analysis</legend>
+<div class="chart-legend" id="ts_mode" style="margin:0 0 0.5em">&ndash;</div>
 <div class="chart-title">Sync offset jitter &amp; path delay</div>
 <canvas class="chart" id="ch_off"></canvas>
 <div class="chart-legend"><span style="color:#fd0">&#9632;</span> offset
@@ -1933,6 +1934,12 @@ async function poll() {
                           : 'auto (searching...)')
         : s.iface + (s.iface_up ? '' : ' (not connected)'));
     set('s_hwts', s.hwts ? 'hardware (' + s.hwts_desc + ')' : 'software');
+    document.getElementById('ts_mode').innerHTML = s.hwts
+        ? '<span style="color:#6c6">&#9679;</span> hardware timestamping ('
+          + s.hwts_desc + ') &mdash; t2/t3 stamped by the NIC, clock reads '
+          + 'the PHC'
+        : '<span style="color:#fd0">&#9679;</span> software timestamping '
+          + '&mdash; measurements include OS scheduling jitter';
     set('s_domain', s.domain === -1
         ? (s.active_domain >= 0
            ? s.active_domain + ' (auto-detected)'
@@ -2427,6 +2434,9 @@ static void http_server_thread(int port) {
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
+    // Under systemd stdout is a block-buffered pipe — without this the
+    // startup messages only reach journald when the process exits
+    std::cout << std::unitbuf;
     resolve_config_path();
     // Container/first-run convenience: PTP_WALLCLOCK_IFACE sets the default
     // interface; a saved setting from the web UI still wins.
