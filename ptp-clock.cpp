@@ -15,6 +15,7 @@
 #include <ifaddrs.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <algorithm>
 #ifdef __linux__
 #include <linux/net_tstamp.h>
 #include <linux/sockios.h>
@@ -131,7 +132,7 @@ struct ClockEntry {
 };
 
 static const char *kStyles[] = {"24h", "12h", "unix", "bcd", "flip",
-                                "dcf77"};
+                                "dcf77", "graph", "rates"};
 
 static bool style_valid(const std::string &st) {
     for (const char *k : kStyles)
@@ -1451,7 +1452,8 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  #saved { color: #6c6; visibility: hidden; margin-left: 1em; }
  .hint { color: #888; font-size: 0.85em; margin: 0.8em 0 0.2em; }
  canvas.chart { width: 100%; height: 110px; background: #111;
-        border: 1px solid #333; border-radius: 4px; display: block; }
+        border: 1px solid #333; border-radius: 4px; display: block;
+        cursor: zoom-in; }
  .chart-title { color: #aaa; font-size: 0.85em; margin: 0.7em 0 0.2em; }
  .chart-legend { color: #888; font-size: 0.8em; margin: 0.2em 0 0.4em;
         font-family: monospace; }
@@ -1509,7 +1511,8 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 </fieldset>
 
 <fieldset>
-<legend>PTP analysis</legend>
+<legend>PTP analysis &nbsp;<a href="/analysis" target="_blank"
+ rel="noopener">large view &rarr;</a></legend>
 <div class="chart-legend" id="ts_mode" style="margin:0 0 0.5em">&ndash;</div>
 <div class="chart-title">Sync offset jitter &amp; path delay</div>
 <canvas class="chart" id="ch_off"></canvas>
@@ -1624,7 +1627,8 @@ document.getElementById('domain_auto').addEventListener('change', syncDomainInpu
 // --- LED clock-line list editor ---
 const STYLES = [['24h', 'digital 24h'], ['12h', 'digital 12h (AM/PM)'],
   ['unix', 'Unix timestamp'], ['bcd', 'binary (BCD)'],
-  ['flip', 'flip clock'], ['dcf77', 'DCF77 telegram']];
+  ['flip', 'flip clock'], ['dcf77', 'DCF77 telegram'],
+  ['graph', 'PTP graph (jitter/delay)'], ['rates', 'PTP message rates']];
 const ZONES = ['UTC', 'TAI', 'Europe/Berlin', 'Europe/Zurich',
   'Europe/Vienna', 'Europe/London', 'Europe/Paris', 'Europe/Moscow',
   'America/New_York', 'America/Chicago', 'America/Denver',
@@ -1904,6 +1908,9 @@ async function pollHistory() {
 }
 pollHistory();
 setInterval(pollHistory, 2000);
+for (const id of ['ch_off', 'ch_rate'])
+  document.getElementById(id).onclick =
+      () => window.open('/analysis', '_blank');
 
 const set = (id, text) => document.getElementById(id).textContent = text;
 let lastChanges = null;
@@ -2009,6 +2016,123 @@ setInterval(poll, 2000);
 )HTML";
 
 // Fullscreen browser clock ("the display" for headless installations)
+// Fullscreen version of the analysis charts (linked from the settings
+// page, or click one of the small charts)
+static const char *kAnalysisHtml = R"ANA(<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PTP analysis</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+ * { box-sizing: border-box; }
+ body { background: #000; color: #ccc; font-family: monospace;
+        margin: 0; padding: 1em 1.4em; }
+ h1 { font-size: 1.05em; color: #999; font-weight: normal;
+      margin: 0 0 0.2em; }
+ h1 a { color: #58a6ff; text-decoration: none; font-size: 0.9em; }
+ #ts_mode { color: #888; font-size: 0.9em; margin: 0 0 0.8em; }
+ .chart-title { color: #aaa; margin: 0.5em 0 0.3em; }
+ canvas { width: 100%; height: 34vh; display: block; background: #0a0a0a;
+          border: 1px solid #222; border-radius: 4px; }
+ .chart-legend { color: #888; font-size: 0.9em; margin: 0.3em 0 0.6em; }
+</style>
+</head>
+<body>
+<h1>PTP analysis &nbsp;<a href="/">&larr; settings</a></h1>
+<div id="ts_mode">&ndash;</div>
+<div class="chart-title">Sync offset jitter &amp; path delay</div>
+<canvas id="ch_off"></canvas>
+<div class="chart-legend"><span style="color:#fd0">&#9632;</span> offset
+deviation per Sync &nbsp;<span style="color:#6cf">&#9632;</span> path delay
+samples</div>
+<div class="chart-title">Received message rates (per second, this domain)</div>
+<canvas id="ch_rate"></canvas>
+<div class="chart-legend"><span style="color:#6c6">&#9632;</span> Sync
+&nbsp;<span style="color:#6cf">&#9632;</span> Follow_Up
+&nbsp;<span style="color:#fd0">&#9632;</span> Announce
+&nbsp;<span style="color:#f6c">&#9632;</span> Delay_Resp
+&nbsp;&nbsp;<span id="rate_now"></span></div>
+<script>
+function drawChart(id, series, fmt, includeZero) {
+  const cv = document.getElementById(id);
+  const w = cv.width = cv.clientWidth * 2;      // 2x for crisp lines
+  const h = cv.height = cv.clientHeight * 2;
+  const g = cv.getContext('2d');
+  g.clearRect(0, 0, w, h);
+  let all = [];
+  series.forEach(s => { all = all.concat(s.data); });
+  if (!all.length) {
+    g.fillStyle = '#666';
+    g.font = '28px sans-serif';
+    g.fillText('collecting data...', 14, 40);
+    return;
+  }
+  const sorted = all.slice().sort((a, b) => a - b);
+  const q = f => sorted[Math.max(0, Math.min(sorted.length - 1,
+      Math.floor(f * (sorted.length - 1))))];
+  let mn = q(0.03), mx = q(0.97);
+  if (includeZero) { mn = Math.min(mn, 0); mx = Math.max(mx, 0); }
+  if (mx === mn) { mx += 1; mn -= 1; }
+  const pad = (mx - mn) * 0.12;
+  const lo = mn - pad, hi = mx + pad;
+  const y = v => Math.max(1, Math.min(h - 1,
+      h - (v - lo) / (hi - lo) * h));
+  if (includeZero && mn <= 0 && mx >= 0) {
+    g.strokeStyle = '#333';
+    g.beginPath(); g.moveTo(0, y(0)); g.lineTo(w, y(0)); g.stroke();
+  }
+  series.forEach(s => {
+    if (!s.data.length) return;
+    g.strokeStyle = s.color;
+    g.lineWidth = 3;
+    g.beginPath();
+    s.data.forEach((v, k) => {
+      const x = k / Math.max(1, s.data.length - 1) * w;
+      k ? g.lineTo(x, y(v)) : g.moveTo(x, y(v));
+    });
+    g.stroke();
+  });
+  g.fillStyle = '#888';
+  g.font = '24px monospace';
+  g.fillText(fmt(mx), 8, 28);
+  g.fillText(fmt(mn), 8, h - 10);
+}
+async function poll() {
+  try {
+    const hh = await fetch('/api/history').then(r => r.json());
+    drawChart('ch_off', [
+      {data: hh.offset.map(v => v / 1000), color: '#fd0'},
+      {data: hh.delay.map(v => v / 1000), color: '#6cf'}
+    ], v => v.toFixed(1) + ' µs', true);
+    drawChart('ch_rate', [
+      {data: hh.rates.sync, color: '#6c6'},
+      {data: hh.rates.fup, color: '#6cf'},
+      {data: hh.rates.ann, color: '#fd0'},
+      {data: hh.rates.dresp, color: '#f6c'}
+    ], v => Math.round(v) + '/s', true);
+    const last = a => a.length ? a[a.length - 1] : 0;
+    document.getElementById('rate_now').textContent =
+        'now: ' + last(hh.rates.sync) + '/' + last(hh.rates.fup) + '/' +
+        last(hh.rates.ann) + '/' + last(hh.rates.dresp);
+    const s = await fetch('/api/status').then(r => r.json());
+    document.getElementById('ts_mode').innerHTML = s.hwts
+        ? '<span style="color:#6c6">&#9679;</span> hardware timestamping ('
+          + s.hwts_desc + ') &mdash; t2/t3 stamped by the NIC, clock reads '
+          + 'the PHC'
+        : '<span style="color:#fd0">&#9679;</span> software timestamping '
+          + '&mdash; measurements include OS scheduling jitter';
+  } catch (e) {}
+}
+poll();
+setInterval(poll, 2000);
+window.addEventListener('resize', poll);
+</script>
+</body>
+</html>
+)ANA";
+
 static const char *kClockHtml = R"CLOCK(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2301,6 +2425,9 @@ static void handle_client(int fd) {
         send_response(fd, "200 OK", "text/html; charset=utf-8", kIndexHtml);
     } else if (method == "GET" && path == "/clock") {
         send_response(fd, "200 OK", "text/html; charset=utf-8", kClockHtml);
+    } else if (method == "GET" && path == "/analysis") {
+        send_response(fd, "200 OK", "text/html; charset=utf-8",
+                      kAnalysisHtml);
     } else if (method == "GET" &&
                (path == "/favicon.svg" || path == "/favicon.ico")) {
         send_response(fd, "200 OK", "image/svg+xml", kFaviconSvg);
@@ -2759,9 +2886,35 @@ int main(int argc, char **argv) {
         std::string id_line, detail_line;
         bool gm_recent_change = false;
         bool gm_unaccepted = false;
+        // Analysis history copies (oldest first) for the graph styles
+        int32_t hoff[kHistN], hdel[kHistN];
+        uint16_t hrate[4][kHistN];
+        int hoff_n = 0, hdel_n = 0, hrate_n = 0;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             s = g_settings;
+            bool want_hist = false;
+            for (const auto &ce : s.clocks)
+                if (ce.style == "graph" || ce.style == "rates")
+                    want_hist = true;
+            if (want_hist) {
+                auto cp = [](const int32_t *buf, int n, int i, int32_t *dst) {
+                    for (int k = 0; k < n; ++k)
+                        dst[k] = buf[(i - n + k + 2 * kHistN) % kHistN];
+                    return n;
+                };
+                hoff_n = cp(g_hist_off, g_hist_off_n, g_hist_off_i, hoff);
+                hdel_n = cp(g_hist_del, g_hist_del_n, g_hist_del_i, hdel);
+                hrate_n = g_hist_rate_n;
+                for (int k = 0; k < hrate_n; ++k) {
+                    int idx = (g_hist_rate_i - hrate_n + k + 2 * kHistN)
+                              % kHistN;
+                    hrate[0][k] = g_hist_rate[idx].sync;
+                    hrate[1][k] = g_hist_rate[idx].fup;
+                    hrate[2][k] = g_hist_rate[idx].ann;
+                    hrate[3][k] = g_hist_rate[idx].dresp;
+                }
+            }
             gm_unaccepted = g_have_gm && !gm_acceptable_locked();
             if (g_have_gm) {
                 id_line = format_gm(g_gm.id);
@@ -3082,6 +3235,72 @@ int main(int argc, char **argv) {
                 for (int dy = 0; dy < h; ++dy)
                     for (int dx = 0; dx < 3; ++dx)
                         cv->SetPixel(cx + dx, cy + 2 - dy, cc.r, cc.g, cc.b);
+            }
+        } else if (style == "graph" || style == "rates") {
+            // PTP analysis on the matrix — same data as the web charts.
+            // "graph" plots the offset deviation per Sync plus the path
+            // delay samples, "rates" the received messages per second.
+            struct Series { const int32_t *v; int n; Color col; };
+            int32_t r32[4][kHistN];
+            std::vector<Series> series;
+            if (style == "graph") {
+                series.push_back({hdel, hdel_n, Color(40, 140, 255)});
+                series.push_back({hoff, hoff_n, c_main});
+            } else {
+                const Color rc[4] = {Color(60, 220, 100),
+                                     Color(80, 190, 255),
+                                     Color(255, 210, 0),
+                                     Color(255, 90, 190)};
+                for (int f = 0; f < 4; ++f) {
+                    for (int k = 0; k < hrate_n; ++k)
+                        r32[f][k] = hrate[f][k];
+                    series.push_back({r32[f], hrate_n, rc[f]});
+                }
+            }
+            std::vector<int32_t> all;
+            for (const auto &sr : series)
+                all.insert(all.end(), sr.v, sr.v + sr.n);
+            if ((int)all.size() < 2) {
+                if (have_small_font)
+                    draw_center(small_font, "COLLECTING...",
+                                band_h / 2 + 3, c_dim);
+            } else {
+                // Robust autoscale like the web charts: percentiles with
+                // zero included, outliers clip at the band edge
+                std::sort(all.begin(), all.end());
+                auto q = [&](double f) {
+                    return (int64_t)all[(size_t)(f * (all.size() - 1))];
+                };
+                int64_t mn = std::min<int64_t>(q(0.03), 0);
+                int64_t mx = std::max<int64_t>(q(0.97), 0);
+                if (mx == mn) { mx += 1; mn -= 1; }
+                int64_t margin = (mx - mn) * 12 / 100;
+                int64_t lo = mn - margin, hi = mx + margin;
+                int W = matrix_options.cols;
+                auto ypix = [&](int64_t v) {
+                    if (v < lo) v = lo;
+                    if (v > hi) v = hi;
+                    return (int)((int64_t)(band_h - 1) -
+                                 (v - lo) * (band_h - 1) / (hi - lo));
+                };
+                int yz = ypix(0);
+                for (int x = 0; x < W; ++x)
+                    cv->SetPixel(x, yz, c_dim.r, c_dim.g, c_dim.b);
+                for (const auto &sr : series) {
+                    if (sr.n < 2)
+                        continue;
+                    int prev = -1;
+                    for (int x = 0; x < W; ++x) {
+                        int y = ypix(sr.v[(int64_t)x * (sr.n - 1)
+                                          / (W - 1)]);
+                        int a = prev < 0 ? y : std::min(prev, y);
+                        int b = prev < 0 ? y : std::max(prev, y);
+                        for (int yy = a; yy <= b; ++yy)
+                            cv->SetPixel(x, yy, sr.col.r, sr.col.g,
+                                         sr.col.b);
+                        prev = y;
+                    }
+                }
             }
         } else {
             // Digital 24h (default) / 12h — always all nine fractional

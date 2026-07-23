@@ -43,7 +43,9 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
   rendering style, and an optional label — one line is static, several
   alternate every 4 seconds.
   Styles: digital 24h/12h, Unix timestamp, binary (BCD), flip clock,
-  DCF77 telegram — all with the full nine fractional digits
+  DCF77 telegram — all with the full nine fractional digits — plus the
+  live PTP analysis charts (offset jitter & path delay, or message rates)
+  as display lines on the matrix itself
 - Optional second display line: date, grandmaster ID and/or priorities &
   clock quality (alternating every 4 seconds)
 - Grandmaster changes are shown on the display itself ("! NEW GM !")
@@ -180,9 +182,10 @@ is an ordered acceleration instead of uniform flicker. Settings:
   time zone (UTC, TAI, or any IANA zone — so a world clock like
   `New York / Zurich / Tokyo` is just three lines), style (digital 24h/12h,
   Unix timestamp, binary BCD, flip clock, DCF77 telegram — all with the
-  full nine fractional digits), and an optional label (blank = none,
-  `%Z` = zone abbreviation). One line is shown statically, several
-  alternate every 4 seconds — PTP-second aligned, like everything else
+  full nine fractional digits — or one of the two live PTP analysis
+  graphs), and an optional label (blank = none, `%Z` = zone abbreviation).
+  One line is shown statically, several alternate every 4 seconds —
+  PTP-second aligned, like everything else
 - **Grandmaster ID** — show the current PTP grandmaster identity as a second
   line on the matrix
 - **Priorities & clock quality** — show priority 1/2, clock class, and the
@@ -222,7 +225,12 @@ jitter (how far each Sync was off the smoothed estimate) together with the
 raw path-delay samples, and the received message rates per second (Sync,
 Follow_Up, Announce, Delay_Resp) in the active domain. The charts
 auto-scale on percentiles, so the step of a master switch doesn't flatten
-the interesting µs range.
+the interesting µs range. It also states whether the data comes from
+hardware or software timestamps. Clicking a chart (or the *large view*
+link) opens a fullscreen version at `/analysis`. And because the charts
+are clock-line styles too (`PTP graph`, `PTP message rates`), they can be
+put on the LED matrix itself — as an extra alternating line or as a
+dedicated 128×32 jitter display.
 
 > Note: browser push notifications require the page to be allowed to notify;
 > on plain HTTP some browsers only show the in-page banner.
