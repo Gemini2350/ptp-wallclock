@@ -288,6 +288,27 @@ static std::atomic<bool> g_reset_ptp{false};   // web thread requests state rese
 static std::atomic<bool> g_iface_changed{false};  // web thread changed iface
 static std::atomic<bool> g_iface_up{false};    // multicast currently joined
 
+// ---- PTP analysis history (rings guarded by g_mutex) ----
+static const int kHistN = 150;
+static int32_t g_hist_off[kHistN];             // offset deviation per Sync, ns
+static int g_hist_off_n = 0, g_hist_off_i = 0;
+static int32_t g_hist_del[kHistN];             // path delay samples, ns
+static int g_hist_del_n = 0, g_hist_del_i = 0;
+struct RateSample { uint16_t sync, fup, ann, dresp; };
+static RateSample g_hist_rate[kHistN];         // received messages per second
+static int g_hist_rate_n = 0, g_hist_rate_i = 0;
+// per-second counters (domain-filtered wire view), reset every second
+static std::atomic<uint32_t> g_cnt_sync{0}, g_cnt_fup{0};
+static std::atomic<uint32_t> g_cnt_ann{0}, g_cnt_dresp{0};
+
+static void hist_push(int32_t *buf, int &n, int &i, int64_t v) {
+    if (v > 2000000000LL) v = 2000000000LL;
+    if (v < -2000000000LL) v = -2000000000LL;
+    buf[i] = (int32_t)v;
+    i = (i + 1) % kHistN;
+    if (n < kHistN) n++;
+}
+
 // ---- Helpers ----
 static uint64_t mono_ns() {
     timespec ts;
@@ -721,6 +742,12 @@ static void complete_sync_pair(int64_t t1, int64_t t2) {
     g_have_pair = true;
 
     int64_t sample = t2 - t1 - (g_have_mpd ? g_mpd_ns : 0);
+    // Analysis history: how far this sync was off the smoothed estimate
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        hist_push(g_hist_off, g_hist_off_n, g_hist_off_i,
+                  g_have_offset ? sample - g_offset_ns : 0);
+    }
     if (!g_have_offset || llabs(sample - g_offset_ns) > 100000000LL) {
         g_offset_ns = sample;             // first sample or step: jump
         g_have_offset = true;
@@ -740,6 +767,7 @@ static void process_event_packet(const uint8_t *buf, ssize_t len,
     uint8_t msg_type = buf[0] & 0x0F;
     if (msg_type != 0x00)                 // only Sync
         return;
+    g_cnt_sync++;
 
     // BMCA: only accept Sync from the elected master
     if (!g_have_master || memcmp(buf + 20, g_elected_sender, 10) != 0)
@@ -772,6 +800,7 @@ static void process_general_packet(const uint8_t *buf, ssize_t len,
 
     // --- Announce (0x0B): feed the BMCA master list ---
     if (msg_type == 0x0B && len >= 64) {
+        g_cnt_ann++;
         g_last_announce_mono_ns = now_mono;
 
         GMInfo gm;
@@ -822,6 +851,7 @@ static void process_general_packet(const uint8_t *buf, ssize_t len,
     }
     // --- Follow_Up (0x08): precise origin timestamp (t1) ---
     else if (msg_type == 0x08) {
+        g_cnt_fup++;
         uint16_t seq = (buf[30] << 8) | buf[31];
         if (g_pending_sync.valid && g_pending_sync.seq == seq &&
             memcmp(g_pending_sync.src, buf + 20, 10) == 0) {
@@ -833,6 +863,7 @@ static void process_general_packet(const uint8_t *buf, ssize_t len,
     }
     // --- Delay_Resp (0x09): t4 for our Delay_Req ---
     else if (msg_type == 0x09 && len >= 54) {
+        g_cnt_dresp++;
         if (!g_pending_dreq.valid || !g_have_pair)
             return;
         if (memcmp(buf + 44, g_clock_id, 8) != 0 ||
@@ -861,6 +892,10 @@ static void process_general_packet(const uint8_t *buf, ssize_t len,
         }
         g_path_delay_ns = g_mpd_ns;
         g_dresp_received++;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            hist_push(g_hist_del, g_hist_del_n, g_hist_del_i, sample);
+        }
     }
 }
 
@@ -1047,6 +1082,38 @@ static std::string settings_json() {
     return j.str();
 }
 
+// Analysis history for the settings-page charts (oldest first)
+static std::string history_json() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::ostringstream j;
+    auto ring = [&](const int32_t *buf, int n, int i) {
+        for (int k = 0; k < n; ++k) {
+            int idx = (i - n + k + 2 * kHistN) % kHistN;
+            j << (k ? "," : "") << buf[idx];
+        }
+    };
+    j << "{\"offset\":[";
+    ring(g_hist_off, g_hist_off_n, g_hist_off_i);
+    j << "],\"delay\":[";
+    ring(g_hist_del, g_hist_del_n, g_hist_del_i);
+    j << "],\"rates\":{";
+    const char *names[4] = {"sync", "fup", "ann", "dresp"};
+    for (int f = 0; f < 4; ++f) {
+        j << (f ? "," : "") << "\"" << names[f] << "\":[";
+        for (int k = 0; k < g_hist_rate_n; ++k) {
+            int idx = (g_hist_rate_i - g_hist_rate_n + k + 2 * kHistN)
+                      % kHistN;
+            const RateSample &r = g_hist_rate[idx];
+            uint16_t v = f == 0 ? r.sync : f == 1 ? r.fup
+                       : f == 2 ? r.ann : r.dresp;
+            j << (k ? "," : "") << v;
+        }
+        j << "]";
+    }
+    j << "}}";
+    return j.str();
+}
+
 // Favicon: an LED-style clock face (served at /favicon.svg)
 static const char *kFaviconSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
  <rect width="64" height="64" rx="14" fill="#0b0b0b"/>
@@ -1173,6 +1240,11 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
         padding: 0.6em; border-radius: 4px; margin-bottom: 1em; }
  #saved { color: #6c6; visibility: hidden; margin-left: 1em; }
  .hint { color: #888; font-size: 0.85em; margin: 0.8em 0 0.2em; }
+ canvas.chart { width: 100%; height: 110px; background: #111;
+        border: 1px solid #333; border-radius: 4px; display: block; }
+ .chart-title { color: #aaa; font-size: 0.85em; margin: 0.7em 0 0.2em; }
+ .chart-legend { color: #888; font-size: 0.8em; margin: 0.2em 0 0.4em;
+        font-family: monospace; }
  .crow { display: flex; gap: 4px; margin: 0.3em 0; }
  .crow select, .crow input { padding: 0.25em; background: #2a2a2a;
         color: #eee; border: 1px solid #555; }
@@ -1223,6 +1295,22 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <fieldset>
 <legend>Visible masters (BMCA)</legend>
 <table class="masters" id="masters"><tr><td>none</td></tr></table>
+</fieldset>
+
+<fieldset>
+<legend>PTP analysis</legend>
+<div class="chart-title">Sync offset jitter &amp; path delay</div>
+<canvas class="chart" id="ch_off"></canvas>
+<div class="chart-legend"><span style="color:#fd0">&#9632;</span> offset
+deviation per Sync &nbsp;<span style="color:#6cf">&#9632;</span> path delay
+samples</div>
+<div class="chart-title">Received message rates (per second, this domain)</div>
+<canvas class="chart" id="ch_rate"></canvas>
+<div class="chart-legend"><span style="color:#6c6">&#9632;</span> Sync
+&nbsp;<span style="color:#6cf">&#9632;</span> Follow_Up
+&nbsp;<span style="color:#fd0">&#9632;</span> Announce
+&nbsp;<span style="color:#f6c">&#9632;</span> Delay_Resp
+&nbsp;&nbsp;<span id="rate_now"></span></div>
 </fieldset>
 
 <form id="form">
@@ -1534,6 +1622,76 @@ function renderClock() {
   renderClock();
   requestAnimationFrame(clockTick);
 })();
+
+// --- Analysis charts (plain canvas, no libraries) ---
+function drawChart(id, series, fmt, includeZero) {
+  const cv = document.getElementById(id);
+  const w = cv.width = cv.clientWidth * 2;      // 2x for crisp lines
+  const h = cv.height = 220;
+  const g = cv.getContext('2d');
+  g.clearRect(0, 0, w, h);
+  let all = [];
+  series.forEach(s => { all = all.concat(s.data); });
+  if (!all.length) {
+    g.fillStyle = '#666';
+    g.font = '20px sans-serif';
+    g.fillText('collecting data...', 10, 30);
+    return;
+  }
+  // Robust autoscale: percentiles keep step outliers (master switches)
+  // from flattening the interesting range; outliers clip at the edge
+  const sorted = all.slice().sort((a, b) => a - b);
+  const q = f => sorted[Math.max(0, Math.min(sorted.length - 1,
+      Math.floor(f * (sorted.length - 1))))];
+  let mn = q(0.03), mx = q(0.97);
+  if (includeZero) { mn = Math.min(mn, 0); mx = Math.max(mx, 0); }
+  if (mx === mn) { mx += 1; mn -= 1; }
+  const pad = (mx - mn) * 0.12;
+  const lo = mn - pad, hi = mx + pad;
+  const y = v => Math.max(1, Math.min(h - 1,
+      h - (v - lo) / (hi - lo) * h));
+  if (includeZero && mn <= 0 && mx >= 0) {
+    g.strokeStyle = '#333';
+    g.beginPath(); g.moveTo(0, y(0)); g.lineTo(w, y(0)); g.stroke();
+  }
+  series.forEach(s => {
+    if (!s.data.length) return;
+    g.strokeStyle = s.color;
+    g.lineWidth = 2;
+    g.beginPath();
+    s.data.forEach((v, k) => {
+      const x = k / Math.max(1, s.data.length - 1) * w;
+      k ? g.lineTo(x, y(v)) : g.moveTo(x, y(v));
+    });
+    g.stroke();
+  });
+  g.fillStyle = '#888';
+  g.font = '18px monospace';
+  g.fillText(fmt(mx), 6, 20);
+  g.fillText(fmt(mn), 6, h - 8);
+}
+
+async function pollHistory() {
+  try {
+    const hh = await fetch('/api/history').then(r => r.json());
+    drawChart('ch_off', [
+      {data: hh.offset.map(v => v / 1000), color: '#fd0'},
+      {data: hh.delay.map(v => v / 1000), color: '#6cf'}
+    ], v => v.toFixed(1) + ' µs', true);
+    drawChart('ch_rate', [
+      {data: hh.rates.sync, color: '#6c6'},
+      {data: hh.rates.fup, color: '#6cf'},
+      {data: hh.rates.ann, color: '#fd0'},
+      {data: hh.rates.dresp, color: '#f6c'}
+    ], v => Math.round(v) + '/s', true);
+    const last = a => a.length ? a[a.length - 1] : 0;
+    document.getElementById('rate_now').textContent =
+        'now: ' + last(hh.rates.sync) + '/' + last(hh.rates.fup) + '/' +
+        last(hh.rates.ann) + '/' + last(hh.rates.dresp);
+  } catch (e) {}
+}
+pollHistory();
+setInterval(pollHistory, 2000);
 
 const set = (id, text) => document.getElementById(id).textContent = text;
 let lastChanges = null;
@@ -1931,6 +2089,8 @@ static void handle_client(int fd) {
         send_response(fd, "200 OK", "application/json", settings_json());
     } else if (method == "GET" && path == "/api/status") {
         send_response(fd, "200 OK", "application/json", status_json());
+    } else if (method == "GET" && path == "/api/history") {
+        send_response(fd, "200 OK", "application/json", history_json());
     } else if (method == "POST" && path == "/api/settings") {
         auto kv = parse_form(body);
         {
@@ -2299,11 +2459,19 @@ int main(int argc, char **argv) {
             }
         }
 
-        // --- BMCA housekeeping: drop masters that stopped announcing ---
+        // --- BMCA housekeeping + per-second analysis tick ---
         if (now_ns - last_bmca_ns >= 1000000000ULL) {
             last_bmca_ns = now_ns;
             std::lock_guard<std::mutex> lock(g_mutex);
             bmca_elect_locked(now_ns);
+            g_hist_rate[g_hist_rate_i] = {
+                (uint16_t)g_cnt_sync.exchange(0),
+                (uint16_t)g_cnt_fup.exchange(0),
+                (uint16_t)g_cnt_ann.exchange(0),
+                (uint16_t)g_cnt_dresp.exchange(0)};
+            g_hist_rate_i = (g_hist_rate_i + 1) % kHistN;
+            if (g_hist_rate_n < kHistN)
+                g_hist_rate_n++;
         }
 
         // --- Delay_Req once per second, out of every joined interface

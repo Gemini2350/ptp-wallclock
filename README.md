@@ -206,6 +206,13 @@ Delay_Req/Delay_Resp counter. A separate table lists all masters
 currently visible in the domain with the BMCA-elected one marked — handy for
 watching a failover happen.
 
+A **PTP analysis** section charts the last couple of minutes: sync offset
+jitter (how far each Sync was off the smoothed estimate) together with the
+raw path-delay samples, and the received message rates per second (Sync,
+Follow_Up, Announce, Delay_Resp) in the active domain. The charts
+auto-scale on percentiles, so the step of a master switch doesn't flatten
+the interesting µs range.
+
 > Note: browser push notifications require the page to be allowed to notify;
 > on plain HTTP some browsers only show the in-page banner.
 
