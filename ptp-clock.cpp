@@ -16,6 +16,10 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <algorithm>
+#include <termios.h>
+#ifdef __linux__
+#include <linux/pps.h>
+#endif
 #ifdef __linux__
 #include <linux/net_tstamp.h>
 #include <linux/sockios.h>
@@ -216,6 +220,11 @@ struct Settings {
     bool notify_gm_change = false;        // notify on grandmaster change
     int http_port = 8319;
     bool hwts = true;                     // try PTP hardware timestamping
+    bool gm_enable = false;               // act as GNSS grandmaster
+    std::string gm_serial = "/dev/serial0";  // NMEA source
+    std::string gm_pps = "/dev/pps0";     // PPS source (pps-gpio)
+    int gm_prio1 = 128, gm_prio2 = 128;   // our announce priorities
+    int gm_utc_offset = 37;               // TAI - UTC for the announce
     int domain = -1;                      // PTP domain, -1 = auto detect
     std::string iface = "auto";           // interface, "auto" = all of them
     std::string acceptable_gms;           // comma-separated GM identities;
@@ -303,6 +312,8 @@ static int32_t g_hist_off[kHistN];             // offset deviation per Sync, ns
 static int g_hist_off_n = 0, g_hist_off_i = 0;
 static int32_t g_hist_del[kHistN];             // path delay samples, ns
 static int g_hist_del_n = 0, g_hist_del_i = 0;
+static int32_t g_hist_cmp[kHistN];             // wire PTP - GNSS, ns
+static int g_hist_cmp_n = 0, g_hist_cmp_i = 0;
 struct RateSample { uint16_t sync, fup, ann, dresp; };
 static RateSample g_hist_rate[kHistN];         // received messages per second
 static int g_hist_rate_n = 0, g_hist_rate_i = 0;
@@ -318,6 +329,49 @@ static bool g_hwts = false;
 static int g_phc_fd = -1;
 static std::string g_hwts_desc;           // e.g. "eth0 via /dev/ptp0"
 static std::atomic<unsigned long long> g_last_sync_age_ns{0};  // mono, for UI
+
+// ---- PTP grandmaster mode (GNSS-disciplined) ----
+// Role: CLIENT = plain client; GM_WAIT = grandmaster mode on but no
+// usable GNSS yet (behaves like a client); GM_PASSIVE = GNSS drives the
+// clock but a better master won the BMCA; GM_ACTIVE = we are the elected
+// grandmaster and transmit Announce/Sync.
+enum { ROLE_CLIENT = 0, ROLE_GM_WAIT = 1, ROLE_GM_PASSIVE = 2,
+       ROLE_GM_ACTIVE = 3 };
+static std::atomic<int> g_role{ROLE_CLIENT};
+static std::atomic<bool> g_gnss_lock{false};
+static std::atomic<int> g_gnss_sats_used{-1};       // GGA: satellites used
+static std::atomic<int> g_gnss_sats_view{-1};       // GSV: in view
+static std::atomic<int> g_gnss_fixq{0};             // GGA fix quality
+static std::atomic<int> g_gnss_hdop10{-1};          // HDOP * 10
+static std::atomic<unsigned long long> g_gnss_last_pps{0};     // mono
+static std::atomic<unsigned long long> g_gnss_last_sample{0};  // mono
+static std::atomic<uint32_t> g_gnss_sample_count{0};
+static std::atomic<bool> g_gnss_serial_ok{false};
+static std::atomic<bool> g_gnss_pps_ok{false};
+static std::atomic<int> g_gnss_serial_fd{-1};       // opened while root
+static std::atomic<int> g_gnss_pps_fd{-1};
+
+// Satellites in view (from GSV) and the pending time sample handed from
+// the GNSS thread to the main loop — guarded by g_gnss_mutex. Lock order:
+// g_mutex may be taken first, never the other way around.
+struct SatInfo { char talker[3]; int prn; int snr; uint64_t seen; };
+static std::mutex g_gnss_mutex;
+static std::vector<SatInfo> g_gnss_sats;
+static bool g_gnss_sample_valid = false;
+static int64_t g_gnss_t1 = 0, g_gnss_t2 = 0;
+
+// Wire-PTP vs GNSS comparison (clock GNSS-driven, network Syncs measured
+// against it; positive = the network master is ahead of GNSS)
+static uint8_t g_cmp_target[10] = {0};    // main thread: who we compare to
+static std::atomic<bool> g_cmp_target_valid{false};
+static bool g_cmp_have = false;           // main thread (EMA state)
+static int64_t g_cmp_ns = 0;
+static std::atomic<long long> g_cmp_atomic{0};
+static std::atomic<long long> g_cmp_last{0};
+static std::atomic<uint32_t> g_cmp_count{0};
+static char g_cmp_gm_str[32] = "";        // guarded by g_mutex
+
+static uint16_t g_ann_seq = 0, g_sync_seq = 0;      // main thread
 
 static void hist_push(int32_t *buf, int &n, int &i, int64_t v) {
     if (v > 2000000000LL) v = 2000000000LL;
@@ -485,6 +539,12 @@ static void save_settings_locked() {
         f << "domain=" << g_settings.domain << "\n";
     f << "iface=" << g_settings.iface << "\n";
     f << "hwts=" << (g_settings.hwts ? 1 : 0) << "\n";
+    f << "gm_enable=" << (g_settings.gm_enable ? 1 : 0) << "\n";
+    f << "gm_serial=" << g_settings.gm_serial << "\n";
+    f << "gm_pps=" << g_settings.gm_pps << "\n";
+    f << "gm_prio1=" << g_settings.gm_prio1 << "\n";
+    f << "gm_prio2=" << g_settings.gm_prio2 << "\n";
+    f << "gm_utc_offset=" << g_settings.gm_utc_offset << "\n";
     f << "acceptable_gms=" << g_settings.acceptable_gms << "\n";
 }
 
@@ -559,6 +619,26 @@ static void load_settings() {
                 g_settings.iface = val;
         } else if (key == "hwts") {
             g_settings.hwts = (val != "0");
+        } else if (key == "gm_enable") {
+            g_settings.gm_enable = (val == "1");
+        } else if (key == "gm_serial") {
+            if (!val.empty())
+                g_settings.gm_serial = val;
+        } else if (key == "gm_pps") {
+            if (!val.empty())
+                g_settings.gm_pps = val;
+        } else if (key == "gm_prio1") {
+            int v = atoi(val.c_str());
+            if (v >= 0 && v <= 255)
+                g_settings.gm_prio1 = v;
+        } else if (key == "gm_prio2") {
+            int v = atoi(val.c_str());
+            if (v >= 0 && v <= 255)
+                g_settings.gm_prio2 = v;
+        } else if (key == "gm_utc_offset") {
+            int v = atoi(val.c_str());
+            if (v >= 0 && v <= 99)
+                g_settings.gm_utc_offset = v;
         } else if (key == "acceptable_gms") {
             g_settings.acceptable_gms = val;
         }
@@ -610,6 +690,9 @@ static void reset_ptp_state() {
     g_path_delay_ns = 0;
     g_last_sync_mono_ns = 0;
     g_last_sync_age_ns = 0;
+    g_cmp_target_valid = false;
+    g_cmp_have = false;
+    g_cmp_count = 0;
     g_active_domain = -1;
     g_last_announce_mono_ns = 0;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -772,12 +855,34 @@ static void bmca_elect_locked(uint64_t now) {
 
 // A (t1, t2) pair is complete: update the offset estimate.
 // local = master + offset  =>  offset = t2 - t1 - meanPathDelay
-static void complete_sync_pair(int64_t t1, int64_t t2) {
+// wire=false marks a GNSS sample (grandmaster mode). While GNSS drives
+// the clock, wire pairs are not used for discipline — they are measured
+// AGAINST the GNSS reference instead (positive = network master ahead).
+static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
     g_last_t1 = t1;
     g_last_t2 = t2;
     g_have_pair = true;
 
-    int64_t sample = t2 - t1 - (g_have_mpd ? g_mpd_ns : 0);
+    // A GNSS sample has no network path, so no mean path delay applies
+    int64_t sample = t2 - t1 - ((wire && g_have_mpd) ? g_mpd_ns : 0);
+    if (wire && g_role.load() >= ROLE_GM_PASSIVE) {
+        if (!g_have_offset)
+            return;                       // no GNSS reference yet
+        int64_t d = g_offset_ns - sample; // wire master - GNSS, ns
+        if (!g_cmp_have) {
+            g_cmp_ns = d;
+            g_cmp_have = true;
+        } else {
+            g_cmp_ns += (d - g_cmp_ns) / 8;
+        }
+        g_cmp_atomic = g_cmp_ns;
+        g_cmp_last = d;
+        g_cmp_count++;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        hist_push(g_hist_cmp, g_hist_cmp_n, g_hist_cmp_i, d);
+        return;
+    }
+
     // Analysis history: how far this sync was off the smoothed estimate
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -811,9 +916,17 @@ static void process_event_packet(const uint8_t *buf, ssize_t len,
     if (now_mono == 0)
         return;
 
-    // BMCA: only accept Sync from the elected master
-    if (!g_have_master || memcmp(buf + 20, g_elected_sender, 10) != 0)
+    // GNSS-driven (grandmaster/passive): Syncs from the comparison
+    // target are measured against GNSS, everything else is ignored.
+    // Otherwise BMCA rules: only the elected master disciplines us.
+    if (g_role.load() >= ROLE_GM_PASSIVE) {
+        if (!g_cmp_target_valid.load() ||
+            memcmp(buf + 20, g_cmp_target, 10) != 0)
+            return;
+    } else if (!g_have_master ||
+               memcmp(buf + 20, g_elected_sender, 10) != 0) {
         return;
+    }
 
     uint16_t seq = (buf[30] << 8) | buf[31];
     bool two_step = buf[6] & 0x02;
@@ -954,6 +1067,364 @@ static void build_delay_req(uint8_t *buf, uint16_t seq) {
     buf[32] = 1;                          // controlField Delay_Req
     buf[33] = 0x7F;                       // logMessageInterval
     // originTimestamp (34..43) may be zero
+}
+
+// ---- PTP master TX (grandmaster mode) ----
+static void ptp_master_header(uint8_t *buf, uint8_t type, uint16_t len,
+                              uint16_t flags, uint16_t seq, uint8_t control,
+                              int8_t log_itv) {
+    memset(buf, 0, len);
+    buf[0] = type;
+    buf[1] = 0x02;                        // versionPTP 2
+    buf[2] = (uint8_t)(len >> 8);
+    buf[3] = (uint8_t)(len & 0xFF);
+    buf[4] = effective_domain();
+    buf[6] = (uint8_t)(flags >> 8);
+    buf[7] = (uint8_t)(flags & 0xFF);
+    memcpy(buf + 20, g_clock_id, 8);
+    buf[28] = 0; buf[29] = 1;             // portNumber 1
+    buf[30] = (uint8_t)(seq >> 8);
+    buf[31] = (uint8_t)(seq & 0xFF);
+    buf[32] = control;
+    buf[33] = (uint8_t)log_itv;
+}
+
+static void put_ptp_ts(uint8_t *p, int64_t tai_ns) {
+    uint64_t s = (uint64_t)(tai_ns / 1000000000LL);
+    uint32_t n = (uint32_t)(tai_ns % 1000000000LL);
+    for (int i = 0; i < 6; ++i)
+        p[i] = (uint8_t)(s >> (8 * (5 - i)));
+    for (int i = 0; i < 4; ++i)
+        p[6 + i] = (uint8_t)(n >> (8 * (3 - i)));
+}
+
+// Announce: our grandmaster dataset (same offsets the client parses)
+static void build_announce(uint8_t *buf, uint16_t seq, const GMInfo &self,
+                           int16_t utc_off, bool traceable) {
+    uint16_t flags = 0x0008 | 0x0004;     // ptpTimescale + utcOffsetValid
+    if (traceable)
+        flags |= 0x0010 | 0x0020;         // time + frequency traceable
+    ptp_master_header(buf, 0x0B, 64, flags, seq, 5, 0);
+    buf[44] = (uint8_t)(utc_off >> 8);
+    buf[45] = (uint8_t)(utc_off & 0xFF);
+    buf[47] = self.priority1;
+    buf[48] = self.clock_class;
+    buf[49] = self.clock_accuracy;
+    buf[50] = (uint8_t)(self.variance >> 8);
+    buf[51] = (uint8_t)(self.variance & 0xFF);
+    buf[52] = self.priority2;
+    memcpy(buf + 53, self.id, 8);
+    buf[61] = 0; buf[62] = 0;             // stepsRemoved
+    buf[63] = self.time_source;
+}
+
+static void build_sync(uint8_t *buf, uint16_t seq, int64_t approx_tai_ns) {
+    ptp_master_header(buf, 0x00, 44, 0x0200, seq, 0, 0);  // two-step
+    put_ptp_ts(buf + 34, approx_tai_ns);
+}
+
+static void build_follow_up(uint8_t *buf, uint16_t seq, int64_t t1_tai_ns) {
+    ptp_master_header(buf, 0x08, 44, 0, seq, 2, 0);
+    put_ptp_ts(buf + 34, t1_tai_ns);
+}
+
+// Delay_Resp for a received Delay_Req (echoes seq + correctionField)
+static void build_delay_resp(uint8_t *buf, const uint8_t *req,
+                             int64_t t4_tai_ns) {
+    ptp_master_header(buf, 0x09, 54, 0, 0, 3, 0);
+    memcpy(buf + 8, req + 8, 8);          // correctionField
+    memcpy(buf + 30, req + 30, 2);        // sequenceId
+    put_ptp_ts(buf + 34, t4_tai_ns);
+    memcpy(buf + 44, req + 20, 10);       // requestingPortIdentity
+}
+
+// ---- GNSS receiver (NMEA + PPS) for the grandmaster mode ----
+
+static bool nmea_checksum_ok(const char *line) {
+    if (line[0] != '$')
+        return false;
+    uint8_t cs = 0;
+    const char *p = line + 1;
+    while (*p && *p != '*')
+        cs ^= (uint8_t)*p++;
+    if (*p != '*' || !isxdigit((unsigned char)p[1]) ||
+        !isxdigit((unsigned char)p[2]))
+        return false;
+    return cs == (uint8_t)strtol(p + 1, nullptr, 16);
+}
+
+// Parse one NMEA sentence. GGA/GSV update the GNSS status; a valid RMC
+// fix sets *utc_out (UTC seconds since the epoch) and returns true.
+static bool nmea_parse_line(const char *line, time_t *utc_out) {
+    if (!nmea_checksum_ok(line))
+        return false;
+    const char *star = strchr(line, '*');
+    std::string body(line, star ? (size_t)(star - line) : strlen(line));
+    std::vector<std::string> f;
+    std::stringstream ss(body);
+    std::string item;
+    while (std::getline(ss, item, ','))
+        f.push_back(item);
+    if (f.empty() || f[0].size() < 6)
+        return false;
+    std::string talker = f[0].substr(1, 2);
+    std::string type = f[0].substr(3);
+
+    if (type == "GGA" && f.size() > 8) {
+        g_gnss_fixq = atoi(f[6].c_str());
+        g_gnss_sats_used = f[7].empty() ? -1 : atoi(f[7].c_str());
+        g_gnss_hdop10 = f[8].empty() ? -1 : (int)(atof(f[8].c_str()) * 10);
+    } else if (type == "GSV" && f.size() > 3) {
+        uint64_t now = mono_ns();
+        std::lock_guard<std::mutex> lk(g_gnss_mutex);
+        for (size_t i = 4; i + 3 < f.size(); i += 4) {
+            if (f[i].empty())
+                continue;
+            int prn = atoi(f[i].c_str());
+            int snr = f[i + 3].empty() ? -1 : atoi(f[i + 3].c_str());
+            bool found = false;
+            for (auto &s : g_gnss_sats) {
+                if (s.prn == prn && talker == s.talker) {
+                    s.snr = snr;
+                    s.seen = now;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                SatInfo si{};
+                snprintf(si.talker, sizeof(si.talker), "%s", talker.c_str());
+                si.prn = prn;
+                si.snr = snr;
+                si.seen = now;
+                g_gnss_sats.push_back(si);
+            }
+        }
+        g_gnss_sats.erase(
+            std::remove_if(g_gnss_sats.begin(), g_gnss_sats.end(),
+                           [&](const SatInfo &s) {
+                               return now - s.seen > 15000000000ULL;
+                           }),
+            g_gnss_sats.end());
+        g_gnss_sats_view = (int)g_gnss_sats.size();
+    } else if (type == "RMC" && f.size() > 9) {
+        if (f[2] != "A" || f[1].size() < 6 || f[9].size() < 6)
+            return false;
+        struct tm tmv{};
+        tmv.tm_hour = (f[1][0] - '0') * 10 + (f[1][1] - '0');
+        tmv.tm_min = (f[1][2] - '0') * 10 + (f[1][3] - '0');
+        tmv.tm_sec = (f[1][4] - '0') * 10 + (f[1][5] - '0');
+        tmv.tm_mday = (f[9][0] - '0') * 10 + (f[9][1] - '0');
+        tmv.tm_mon = (f[9][2] - '0') * 10 + (f[9][3] - '0') - 1;
+        tmv.tm_year = (f[9][4] - '0') * 10 + (f[9][5] - '0') + 100;
+        time_t t = timegm(&tmv);
+        if (t <= 0)
+            return false;
+        if (f[1].size() > 6 && atof(f[1].c_str() + 6) >= 0.5)
+            t += 1;                       // fix epoch in the 2nd half
+        *utc_out = t;
+        return true;
+    }
+    return false;
+}
+
+static int gnss_open_serial(const char *dev) {
+    int fd = open(dev, O_RDONLY | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0)
+        return -1;
+    struct termios tio{};
+    if (tcgetattr(fd, &tio) == 0) {
+        cfmakeraw(&tio);
+        tio.c_cflag |= CLOCAL | CREAD;
+        cfsetispeed(&tio, B9600);
+        cfsetospeed(&tio, B9600);
+        tcsetattr(fd, TCSANOW, &tio);
+    }
+    return fd;
+}
+
+#ifdef __linux__
+static int gnss_open_pps(const char *dev) {
+    int fd = open(dev, O_RDWR);
+    if (fd < 0)
+        return -1;
+    struct pps_kparams params{};
+    if (ioctl(fd, PPS_GETPARAMS, &params) == 0) {
+        params.mode |= PPS_CAPTUREASSERT;
+        ioctl(fd, PPS_SETPARAMS, &params);
+    }
+    return fd;
+}
+#endif
+
+// Open the GNSS devices while still privileged (called from main before
+// the matrix library drops to the daemon user)
+static void gnss_open_initial() {
+    int s = gnss_open_serial(g_settings.gm_serial.c_str());
+    g_gnss_serial_fd = s;
+    if (s >= 0)
+        std::cout << "GNSS: serial " << g_settings.gm_serial << " open\n";
+    else
+        std::cerr << "GNSS: cannot open serial " << g_settings.gm_serial
+                  << "\n";
+#ifdef __linux__
+    int p = gnss_open_pps(g_settings.gm_pps.c_str());
+    g_gnss_pps_fd = p;
+    if (p >= 0)
+        std::cout << "GNSS: PPS " << g_settings.gm_pps << " open\n";
+    else
+        std::cerr << "GNSS: cannot open PPS " << g_settings.gm_pps << "\n";
+#endif
+}
+
+// GNSS thread: pairs each PPS pulse (the exact top of second) with the
+// following RMC sentence (which second it was) and hands (TAI, local)
+// samples to the main loop. Reopens devices as needed — note that after
+// the matrix privilege drop reopening may need the udev rule/group set
+// up by install.sh.
+static void gnss_thread() {
+    char acc[1024];
+    size_t fill = 0;
+    uint32_t last_seq = 0;
+    bool have_seq = false;
+    uint64_t pulse_local = 0, pulse_mono = 0;
+    uint64_t next_reopen = 0;
+    std::string ser_dev, pps_dev;
+
+    for (;;) {
+        bool enabled;
+        std::string cfg_ser, cfg_pps;
+        int utc_off;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            enabled = g_settings.gm_enable;
+            cfg_ser = g_settings.gm_serial;
+            cfg_pps = g_settings.gm_pps;
+            utc_off = g_settings.gm_utc_offset;
+        }
+        if (!enabled) {
+            usleep(500000);
+            continue;
+        }
+        if (ser_dev.empty())
+            ser_dev = cfg_ser;
+        if (pps_dev.empty())
+            pps_dev = cfg_pps;
+
+        int sfd = g_gnss_serial_fd.load();
+        int pfd = g_gnss_pps_fd.load();
+        if (cfg_ser != ser_dev) {         // device changed in the web UI
+            if (sfd >= 0)
+                close(sfd);
+            g_gnss_serial_fd = sfd = -1;
+            ser_dev = cfg_ser;
+        }
+        if (cfg_pps != pps_dev) {
+            if (pfd >= 0)
+                close(pfd);
+            g_gnss_pps_fd = pfd = -1;
+            pps_dev = cfg_pps;
+        }
+        uint64_t now = mono_ns();
+        if ((sfd < 0 || pfd < 0) && now >= next_reopen) {
+            next_reopen = now + 5000000000ULL;
+            if (sfd < 0) {
+                sfd = gnss_open_serial(ser_dev.c_str());
+                g_gnss_serial_fd = sfd;
+            }
+#ifdef __linux__
+            if (pfd < 0) {
+                pfd = gnss_open_pps(pps_dev.c_str());
+                g_gnss_pps_fd = pfd;
+            }
+#endif
+        }
+        g_gnss_serial_ok = sfd >= 0;
+        g_gnss_pps_ok = pfd >= 0;
+
+        // --- PPS pulse (blocks up to 200 ms) ---
+#ifdef __linux__
+        if (pfd >= 0) {
+            struct pps_fdata fdata{};
+            fdata.timeout.sec = 0;
+            fdata.timeout.nsec = 200000000;
+            fdata.timeout.flags = ~PPS_TIME_INVALID;
+            if (ioctl(pfd, PPS_FETCH, &fdata) == 0) {
+                if (!have_seq || fdata.info.assert_sequence != last_seq) {
+                    have_seq = true;
+                    last_seq = fdata.info.assert_sequence;
+                    // The pulse is stamped with CLOCK_REALTIME; translate
+                    // it into the local timing clock
+                    timespec rt;
+                    clock_gettime(CLOCK_REALTIME, &rt);
+                    uint64_t loc = local_clock_ns();
+                    int64_t rt_now =
+                        (int64_t)rt.tv_sec * 1000000000LL + rt.tv_nsec;
+                    int64_t pulse_rt =
+                        (int64_t)fdata.info.assert_tu.sec * 1000000000LL +
+                        fdata.info.assert_tu.nsec;
+                    pulse_local =
+                        (uint64_t)((int64_t)loc - (rt_now - pulse_rt));
+                    pulse_mono = mono_ns();
+                    g_gnss_last_pps = pulse_mono;
+                }
+            } else if (errno != ETIMEDOUT && errno != EINTR) {
+                close(pfd);
+                g_gnss_pps_fd = -1;
+            }
+        } else
+#endif
+        {
+            usleep(200000);
+        }
+
+        // --- NMEA sentences ---
+        if (sfd >= 0) {
+            char rb[256];
+            ssize_t r;
+            while ((r = read(sfd, rb, sizeof(rb))) > 0) {
+                for (ssize_t i = 0; i < r; ++i) {
+                    char c = rb[i];
+                    if (c != '\n' && fill < sizeof(acc) - 1) {
+                        acc[fill++] = c;
+                        continue;
+                    }
+                    acc[fill] = 0;
+                    while (fill && acc[fill - 1] == '\r')
+                        acc[--fill] = 0;
+                    if (fill) {
+                        time_t utc = 0;
+                        if (nmea_parse_line(acc, &utc)) {
+                            uint64_t n2 = mono_ns();
+                            // The RMC names the second of the pulse that
+                            // just preceded it
+                            if (pulse_mono &&
+                                n2 - pulse_mono < 900000000ULL) {
+                                std::lock_guard<std::mutex> lk(g_gnss_mutex);
+                                g_gnss_t1 =
+                                    ((int64_t)utc + utc_off) * 1000000000LL;
+                                g_gnss_t2 = (int64_t)pulse_local;
+                                g_gnss_sample_valid = true;
+                                g_gnss_last_sample = n2;
+                                g_gnss_sample_count++;
+                            }
+                        }
+                    }
+                    fill = 0;
+                }
+            }
+            if (r == 0) {                 // EOF: USB receiver unplugged
+                close(sfd);
+                g_gnss_serial_fd = -1;
+            } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                       errno != EINTR) {
+                close(sfd);
+                g_gnss_serial_fd = -1;
+            }
+        }
+        g_gnss_lock = g_gnss_last_sample.load() != 0 &&
+                      mono_ns() - g_gnss_last_sample.load() < 10000000000ULL;
+    }
 }
 
 // ---- Network interface helpers ----
@@ -1282,6 +1753,12 @@ static std::string settings_json() {
       << "\"notify_gm_change\":" << (g_settings.notify_gm_change ? "true" : "false") << ","
       << "\"domain\":" << g_settings.domain << ","
       << "\"acceptable_gms\":\"" << json_escape(g_settings.acceptable_gms) << "\","
+      << "\"gm_enable\":" << (g_settings.gm_enable ? "true" : "false") << ","
+      << "\"gm_serial\":\"" << json_escape(g_settings.gm_serial) << "\","
+      << "\"gm_pps\":\"" << json_escape(g_settings.gm_pps) << "\","
+      << "\"gm_prio1\":" << g_settings.gm_prio1 << ","
+      << "\"gm_prio2\":" << g_settings.gm_prio2 << ","
+      << "\"gm_utc_offset\":" << g_settings.gm_utc_offset << ","
       << "\"iface\":\"" << json_escape(g_settings.iface) << "\","
       << "\"ifaces\":[";
     std::vector<std::string> ifs = list_ifaces();
@@ -1305,6 +1782,8 @@ static std::string history_json() {
     ring(g_hist_off, g_hist_off_n, g_hist_off_i);
     j << "],\"delay\":[";
     ring(g_hist_del, g_hist_del_n, g_hist_del_i);
+    j << "],\"cmp\":[";
+    ring(g_hist_cmp, g_hist_cmp_n, g_hist_cmp_i);
     j << "],\"rates\":{";
     const char *names[4] = {"sync", "fup", "ann", "dresp"};
     for (int f = 0; f < 4; ++f) {
@@ -1380,6 +1859,28 @@ static std::string status_json() {
       << "\"iface_up\":" << (g_iface_up ? "true" : "false") << ","
       << "\"hwts\":" << (g_hwts ? "true" : "false") << ","
       << "\"hwts_desc\":\"" << json_escape(g_hwts_desc) << "\","
+      << "\"role\":" << g_role.load() << ","
+      << "\"gm_enable\":" << (g_settings.gm_enable ? "true" : "false") << ","
+      << "\"gnss_lock\":" << (g_gnss_lock ? "true" : "false") << ","
+      << "\"gnss_serial_ok\":" << (g_gnss_serial_ok ? "true" : "false") << ","
+      << "\"gnss_pps_ok\":" << (g_gnss_pps_ok ? "true" : "false") << ","
+      << "\"gnss_sats_used\":" << g_gnss_sats_used.load() << ","
+      << "\"gnss_sats_view\":" << g_gnss_sats_view.load() << ","
+      << "\"gnss_fixq\":" << g_gnss_fixq.load() << ","
+      << "\"gnss_hdop10\":" << g_gnss_hdop10.load() << ","
+      << "\"gnss_pps_age\":"
+      << (g_gnss_last_pps.load()
+              ? (double)(mono_ns() - g_gnss_last_pps.load()) / 1e9
+              : -1.0) << ","
+      << "\"gnss_samples\":" << g_gnss_sample_count.load() << ","
+      << "\"cmp_valid\":"
+      << (g_cmp_target_valid.load() && g_cmp_count.load() > 0 ? "true"
+                                                              : "false")
+      << ","
+      << "\"cmp_ns\":" << g_cmp_atomic.load() << ","
+      << "\"cmp_last_ns\":" << g_cmp_last.load() << ","
+      << "\"cmp_count\":" << g_cmp_count.load() << ","
+      << "\"cmp_gm\":\"" << g_cmp_gm_str << "\","
       << "\"gm_id\":\"" << (g_have_gm ? format_gm(g_gm.id) : "") << "\","
       << "\"gm_vendor\":\"" << (g_have_gm ? lookup_vendor(g_gm.id) : "") << "\","
       << "\"gm_accepted\":" << (gm_acceptable_locked() ? "true" : "false") << ","
@@ -1406,7 +1907,19 @@ static std::string status_json() {
           << "\"priority2\":" << (int)m.gm.priority2 << ","
           << "\"clock_class\":" << (int)m.gm.clock_class << ","
           << "\"steps_removed\":" << m.gm.steps_removed << ","
+          << "\"self\":"
+          << (memcmp(m.sender, g_clock_id, 8) == 0 ? "true" : "false") << ","
           << "\"elected\":" << (m.elected ? "true" : "false") << "}";
+    }
+    j << "],\"gnss_sats\":[";
+    {
+        std::lock_guard<std::mutex> lk(g_gnss_mutex);
+        for (size_t i = 0; i < g_gnss_sats.size(); ++i) {
+            const SatInfo &s = g_gnss_sats[i];
+            j << (i ? "," : "") << "{\"sys\":\"" << s.talker[0]
+              << s.talker[1] << "\",\"prn\":" << s.prn
+              << ",\"snr\":" << s.snr << "}";
+        }
     }
     j << "]}";
     return j.str();
@@ -1457,6 +1970,12 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  .chart-title { color: #aaa; font-size: 0.85em; margin: 0.7em 0 0.2em; }
  .chart-legend { color: #888; font-size: 0.8em; margin: 0.2em 0 0.4em;
         font-family: monospace; }
+ .snrwrap { display: flex; align-items: flex-end; gap: 3px; height: 52px;
+        margin: 0.3em 0 1.4em; }
+ .snrbar { width: 11px; border-radius: 2px 2px 0 0; position: relative; }
+ .snrbar span { position: absolute; top: 100%; left: 50%;
+        transform: translateX(-50%); font-size: 0.6em; color: #777;
+        font-family: monospace; }
  .crow { display: flex; gap: 4px; margin: 0.3em 0; }
  .crow select, .crow input { padding: 0.25em; background: #2a2a2a;
         color: #eee; border: 1px solid #555; }
@@ -1488,6 +2007,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <legend>Status</legend>
 <table class="status">
  <tr><td>PTP</td><td id="s_ptp">&ndash;</td></tr>
+ <tr><td>Role</td><td id="s_role">&ndash;</td></tr>
  <tr><td>Interface</td><td id="s_iface">&ndash;</td></tr>
  <tr><td>Timestamping</td><td id="s_hwts">&ndash;</td></tr>
  <tr><td>Domain</td><td id="s_domain">&ndash;</td></tr>
@@ -1526,6 +2046,13 @@ samples</div>
 &nbsp;<span style="color:#fd0">&#9632;</span> Announce
 &nbsp;<span style="color:#f6c">&#9632;</span> Delay_Resp
 &nbsp;&nbsp;<span id="rate_now"></span></div>
+<div id="cmp_wrap" style="display:none">
+<div class="chart-title">Network PTP vs GNSS (per Sync of the network
+master)</div>
+<canvas class="chart" id="ch_cmp"></canvas>
+<div class="chart-legend"><span style="color:#f96">&#9632;</span>
+<span id="cmp_info">network master &minus; GNSS</span></div>
+</div>
 </fieldset>
 
 <form id="form">
@@ -1591,6 +2118,43 @@ matrix:</p>
  <input type="text" id="acceptable_gms"
         placeholder="00:1d:c1:ff:fe:12:34:56, 00:1d:c1:ff:fe:aa:bb:cc">
 </label>
+</fieldset>
+
+<fieldset>
+<legend>PTP grandmaster (GNSS)</legend>
+<label>
+ <input type="checkbox" id="gm_enable"> Act as PTP grandmaster when a
+ GNSS receiver provides time (NMEA + PPS)
+</label>
+<p class="hint">Needs a GNSS module with its PPS pulse on a GPIO
+(<code>dtoverlay=pps-gpio,gpiopin=18</code>) and NMEA on a serial port —
+see the README. With GNSS lock the clock announces itself with
+clockClass&nbsp;6 / GPS; a better grandmaster on the network still wins
+the BMCA, and its Syncs are then measured against GNSS (chart above).</p>
+<label>NMEA serial device:
+ <input type="text" id="gm_serial" list="serlist" value="/dev/serial0">
+ <datalist id="serlist"><option value="/dev/serial0">
+ <option value="/dev/ttyAMA0"><option value="/dev/ttyS0">
+ <option value="/dev/ttyACM0"><option value="/dev/ttyUSB0"></datalist>
+</label>
+<label>PPS device:
+ <input type="text" id="gm_pps" value="/dev/pps0">
+</label>
+<label>Priority 1:
+ <input type="number" id="gm_prio1" min="0" max="255" value="128">
+</label>
+<label>Priority 2:
+ <input type="number" id="gm_prio2" min="0" max="255" value="128">
+</label>
+<label>TAI &minus; UTC:
+ <input type="number" id="gm_utc" min="0" max="99" value="37">
+</label>
+<div id="gnss_box" style="display:none">
+ <div class="chart-title">GNSS receiver</div>
+ <div class="chart-legend" id="gnss_sum">&ndash;</div>
+ <div class="snrwrap" id="gnss_bars"></div>
+ <div class="chart-legend" id="gnss_cmp">&ndash;</div>
+</div>
 </fieldset>
 
 <fieldset>
@@ -1714,6 +2278,12 @@ async function loadSettings() {
   document.getElementById('domain').value = (s.domain === -1) ? 0 : s.domain;
   syncDomainInput();
   document.getElementById('acceptable_gms').value = s.acceptable_gms;
+  document.getElementById('gm_enable').checked = s.gm_enable;
+  document.getElementById('gm_serial').value = s.gm_serial;
+  document.getElementById('gm_pps').value = s.gm_pps;
+  document.getElementById('gm_prio1').value = s.gm_prio1;
+  document.getElementById('gm_prio2').value = s.gm_prio2;
+  document.getElementById('gm_utc').value = s.gm_utc_offset;
   document.getElementById('iface').value = s.iface;
   document.getElementById('iflist').innerHTML =
       ['auto'].concat(s.ifaces).map(i => '<option value="' + i + '">').join('');
@@ -1734,6 +2304,12 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     domain: document.getElementById('domain_auto').checked
         ? -1 : document.getElementById('domain').value,
     acceptable_gms: document.getElementById('acceptable_gms').value,
+    gm_enable: document.getElementById('gm_enable').checked ? 1 : 0,
+    gm_serial: document.getElementById('gm_serial').value,
+    gm_pps: document.getElementById('gm_pps').value,
+    gm_prio1: document.getElementById('gm_prio1').value,
+    gm_prio2: document.getElementById('gm_prio2').value,
+    gm_utc_offset: document.getElementById('gm_utc').value,
     iface: document.getElementById('iface').value,
     notify: document.getElementById('notify').checked ? 1 : 0
   });
@@ -1904,11 +2480,19 @@ async function pollHistory() {
     document.getElementById('rate_now').textContent =
         'now: ' + last(hh.rates.sync) + '/' + last(hh.rates.fup) + '/' +
         last(hh.rates.ann) + '/' + last(hh.rates.dresp);
+    const cw = document.getElementById('cmp_wrap');
+    if (hh.cmp && hh.cmp.length) {
+      cw.style.display = '';
+      drawChart('ch_cmp', [{data: hh.cmp.map(v => v / 1000), color: '#f96'}],
+                v => v.toFixed(1) + ' µs', true);
+    } else {
+      cw.style.display = 'none';
+    }
   } catch (e) {}
 }
 pollHistory();
 setInterval(pollHistory, 2000);
-for (const id of ['ch_off', 'ch_rate'])
+for (const id of ['ch_off', 'ch_rate', 'ch_cmp'])
   document.getElementById(id).onclick =
       () => window.open('/analysis', '_blank');
 
@@ -1941,6 +2525,53 @@ async function poll() {
                           : 'auto (searching...)')
         : s.iface + (s.iface_up ? '' : ' (not connected)'));
     set('s_hwts', s.hwts ? 'hardware (' + s.hwts_desc + ')' : 'software');
+    set('s_role', !s.gm_enable ? 'client'
+        : s.role === 3 ? 'GRANDMASTER (GNSS)'
+        : s.role === 2 ? 'passive — better grandmaster on the network'
+        : 'client (waiting for GNSS)');
+    const gb = document.getElementById('gnss_box');
+    gb.style.display = s.gm_enable ? '' : 'none';
+    if (s.gm_enable) {
+      let sum;
+      if (!s.gnss_serial_ok && !s.gnss_pps_ok)
+        sum = 'no receiver (serial and PPS device closed)';
+      else {
+        sum = (s.gnss_lock ? 'locked' :
+               s.gnss_fixq > 0 ? 'fix, waiting for PPS pairing' : 'no fix');
+        if (s.gnss_sats_used >= 0)
+          sum += ' — ' + s.gnss_sats_used + ' sats used';
+        if (s.gnss_sats_view >= 0)
+          sum += ', ' + s.gnss_sats_view + ' in view';
+        if (s.gnss_hdop10 >= 0)
+          sum += ', HDOP ' + (s.gnss_hdop10 / 10).toFixed(1);
+        if (s.gnss_pps_age >= 0 && s.gnss_pps_age < 100)
+          sum += ', PPS ' + s.gnss_pps_age.toFixed(1) + ' s ago';
+        else if (s.gnss_pps_ok)
+          sum += s.gnss_pps_age >= 0 ? ', PPS lost!' : ', no PPS pulse yet';
+        if (!s.gnss_serial_ok) sum += ' — serial closed!';
+        if (!s.gnss_pps_ok) sum += ' — PPS closed!';
+        sum += ' (' + s.gnss_samples + ' samples)';
+      }
+      document.getElementById('gnss_sum').textContent = sum;
+      const snrCol = v => v >= 35 ? '#6c6' : v >= 20 ? '#fd0' : '#f66';
+      document.getElementById('gnss_bars').innerHTML =
+        (s.gnss_sats || []).slice().sort((a, b) =>
+            a.sys === b.sys ? a.prn - b.prn : (a.sys < b.sys ? -1 : 1))
+          .map(t => {
+            const v = Math.max(0, t.snr);
+            const h = 4 + Math.min(46, v);
+            return '<div class="snrbar" title="' + t.sys + ' ' + t.prn +
+                   ': ' + (t.snr < 0 ? 'searching' : t.snr + ' dB-Hz') +
+                   '" style="height:' + h + 'px;background:' +
+                   (t.snr < 0 ? '#444' : snrCol(v)) +
+                   '"><span>' + t.prn + '</span></div>';
+          }).join('');
+      document.getElementById('gnss_cmp').textContent = s.cmp_valid
+        ? 'network PTP vs GNSS: ' + (s.cmp_ns / 1000).toFixed(1) +
+          ' µs (last ' + (s.cmp_last_ns / 1000).toFixed(1) + ' µs, ' +
+          s.cmp_count + ' Syncs, vs ' + s.cmp_gm + ')'
+        : 'network PTP vs GNSS: no comparison master';
+    }
     document.getElementById('ts_mode').innerHTML = s.hwts
         ? '<span style="color:#6c6">&#9679;</span> hardware timestamping ('
           + s.hwts_desc + ') &mdash; t2/t3 stamped by the NIC, clock reads '
@@ -1989,6 +2620,7 @@ async function poll() {
         s.masters.map(m =>
           '<tr' + (m.elected ? ' class="elected"' : '') + '><td title="' +
           (m.vendor || '') + '">' + m.gm_id +
+          (m.self ? ' (this clock)' : '') +
           '</td><td>' + m.priority1 + '</td><td>' + m.priority2 +
           '</td><td>' + m.clock_class + '</td><td>' + m.steps_removed +
           '</td><td>' + (m.elected ? '&#9733;' : '') + '</td></tr>').join('')
@@ -2054,6 +2686,12 @@ samples</div>
 &nbsp;<span style="color:#fd0">&#9632;</span> Announce
 &nbsp;<span style="color:#f6c">&#9632;</span> Delay_Resp
 &nbsp;&nbsp;<span id="rate_now"></span></div>
+<div id="cmp_wrap" style="display:none">
+<div class="chart-title">Network PTP vs GNSS</div>
+<canvas id="ch_cmp"></canvas>
+<div class="chart-legend"><span style="color:#f96">&#9632;</span>
+network master &minus; GNSS, per Sync &nbsp;<span id="cmp_now"></span></div>
+</div>
 <script>
 function drawChart(id, series, fmt, includeZero) {
   const cv = document.getElementById(id);
@@ -2117,6 +2755,17 @@ async function poll() {
         'now: ' + last(hh.rates.sync) + '/' + last(hh.rates.fup) + '/' +
         last(hh.rates.ann) + '/' + last(hh.rates.dresp);
     const s = await fetch('/api/status').then(r => r.json());
+    const cw = document.getElementById('cmp_wrap');
+    if (hh.cmp && hh.cmp.length) {
+      cw.style.display = '';
+      drawChart('ch_cmp', [{data: hh.cmp.map(v => v / 1000), color: '#f96'}],
+                v => v.toFixed(1) + ' µs', true);
+      document.getElementById('cmp_now').textContent = s.cmp_valid
+          ? 'mean: ' + (s.cmp_ns / 1000).toFixed(1) + ' µs vs ' + s.cmp_gm
+          : '';
+    } else {
+      cw.style.display = 'none';
+    }
     document.getElementById('ts_mode').innerHTML = s.hwts
         ? '<span style="color:#6c6">&#9679;</span> hardware timestamping ('
           + s.hwts_desc + ') &mdash; t2/t3 stamped by the NIC, clock reads '
@@ -2515,6 +3164,29 @@ static void handle_client(int fd) {
             if (kv.count("acceptable_gms") &&
                 kv["acceptable_gms"].size() < 4096)
                 g_settings.acceptable_gms = kv["acceptable_gms"];
+            if (kv.count("gm_enable"))
+                g_settings.gm_enable = (kv["gm_enable"] == "1");
+            if (kv.count("gm_serial") && !kv["gm_serial"].empty() &&
+                kv["gm_serial"].size() < 64)
+                g_settings.gm_serial = kv["gm_serial"];
+            if (kv.count("gm_pps") && !kv["gm_pps"].empty() &&
+                kv["gm_pps"].size() < 64)
+                g_settings.gm_pps = kv["gm_pps"];
+            if (kv.count("gm_prio1")) {
+                int v = atoi(kv["gm_prio1"].c_str());
+                if (v >= 0 && v <= 255)
+                    g_settings.gm_prio1 = v;
+            }
+            if (kv.count("gm_prio2")) {
+                int v = atoi(kv["gm_prio2"].c_str());
+                if (v >= 0 && v <= 255)
+                    g_settings.gm_prio2 = v;
+            }
+            if (kv.count("gm_utc_offset")) {
+                int v = atoi(kv["gm_utc_offset"].c_str());
+                if (v >= 0 && v <= 99)
+                    g_settings.gm_utc_offset = v;
+            }
             if (kv.count("notify"))
                 g_settings.notify_gm_change = (kv["notify"] == "1");
             save_settings_locked();
@@ -2614,6 +3286,11 @@ int main(int argc, char **argv) {
     fcntl(sock_sync, F_SETFL, O_NONBLOCK);
     fcntl(sock_general, F_SETFL, O_NONBLOCK);
 
+    // Grandmaster mode: open the GNSS devices while still privileged
+    if (g_settings.gm_enable)
+        gnss_open_initial();
+    std::thread(gnss_thread).detach();
+
 #ifndef NO_MATRIX
     // --- Matrix options ---
     RGBMatrix::Options matrix_options;
@@ -2676,6 +3353,11 @@ int main(int argc, char **argv) {
     dreq_dst.sin_port = htons(319);
     dreq_dst.sin_addr.s_addr = inet_addr("224.0.1.129");
 
+    sockaddr_in gen_dst{};                // general messages (port 320)
+    gen_dst.sin_family = AF_INET;
+    gen_dst.sin_port = htons(320);
+    gen_dst.sin_addr.s_addr = inet_addr("224.0.1.129");
+
     std::cout << "Listening for PTP messages on " << g_settings.iface
               << " (domain ";
     if (g_settings.domain < 0)
@@ -2688,6 +3370,7 @@ int main(int argc, char **argv) {
     std::thread http_thread(http_server_thread, g_settings.http_port);
 
     uint64_t last_dreq_ns = 0;
+    uint64_t last_gm_tx_ns = 0;
     uint64_t last_bmca_ns = 0;
     struct JoinedIface { std::string name; uint32_t ip; };
     std::vector<JoinedIface> joined;      // multicast memberships we hold
@@ -2794,13 +3477,29 @@ int main(int argc, char **argv) {
         select(std::max(sock_sync, sock_general) + 1,
                &fds, nullptr, nullptr, &tv);
 
-        // --- SYNC (port 319) ---
+        // --- SYNC / Delay_Req (port 319) ---
         if (FD_ISSET(sock_sync, &fds)) {
             uint8_t buf[128];
             ssize_t len = 0;
             uint64_t ts = recv_event_packet(sock_sync, buf, sizeof(buf), &len);
-            if (len > 0)
+            if (len >= 44 && (buf[0] & 0x0F) == 0x01) {
+                // Delay_Req from a client: answer when we are the GM
+                if (g_role.load() == ROLE_GM_ACTIVE && (buf[1] & 0x0F) == 2 &&
+                    domain_ok(buf[4], false) && ts != 0) {
+                    uint8_t resp[54];
+                    build_delay_resp(resp, buf, (int64_t)ts - g_offset_ns);
+                    for (const auto &j : joined) {
+                        in_addr mif{};
+                        mif.s_addr = j.ip;
+                        setsockopt(sock_general, IPPROTO_IP, IP_MULTICAST_IF,
+                                   &mif, sizeof(mif));
+                        sendto(sock_general, resp, sizeof(resp), 0,
+                               (struct sockaddr *)&gen_dst, sizeof(gen_dst));
+                    }
+                }
+            } else if (len > 0) {
                 process_event_packet(buf, len, ts);
+            }
         }
 
         // --- ANNOUNCE / FOLLOW_UP / DELAY_RESP (port 320) ---
@@ -2812,6 +3511,23 @@ int main(int argc, char **argv) {
         }
 
         uint64_t now_ns = mono_ns();
+
+        // --- GNSS time sample (grandmaster mode): disciplines the clock ---
+        {
+            bool have = false;
+            int64_t t1 = 0, t2 = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_gnss_mutex);
+                if (g_gnss_sample_valid) {
+                    have = true;
+                    t1 = g_gnss_t1;
+                    t2 = g_gnss_t2;
+                    g_gnss_sample_valid = false;
+                }
+            }
+            if (have)
+                complete_sync_pair(t1, t2, false);
+        }
 
         // --- Auto domain: rescan when Announce stops for 15 s ---
         if (g_domain.load() < 0 && g_active_domain.load() >= 0) {
@@ -2826,7 +3542,96 @@ int main(int argc, char **argv) {
         if (now_ns - last_bmca_ns >= 1000000000ULL) {
             last_bmca_ns = now_ns;
             std::lock_guard<std::mutex> lock(g_mutex);
+
+            // Grandmaster mode: keep our own candidacy in the master
+            // list so the ordinary BMCA decides between us and the net
+            uint64_t smp = g_gnss_last_sample.load();
+            bool gnss_ok = smp != 0 && now_ns - smp < 10000000000ULL;
+            bool holdover = !gnss_ok && smp != 0 &&
+                            now_ns - smp < 300000000000ULL;
+            int role = ROLE_CLIENT;
+            if (g_settings.gm_enable) {
+                role = ROLE_GM_WAIT;
+                if (gnss_ok || holdover) {
+                    if (g_domain.load() < 0 && g_active_domain.load() < 0) {
+                        g_active_domain = 0;   // we define the domain now
+                        std::cout << "Grandmaster mode: using domain 0\n";
+                    }
+                    GMInfo self;
+                    memcpy(self.id, g_clock_id, 8);
+                    self.priority1 = (uint8_t)g_settings.gm_prio1;
+                    self.priority2 = (uint8_t)g_settings.gm_prio2;
+                    self.clock_class = gnss_ok ? 6 : 7;    // GNSS/holdover
+                    self.clock_accuracy = !gnss_ok ? 0xFE
+                                        : g_hwts ? 0x22 : 0x24;
+                    self.variance = 0xFFFF;
+                    self.steps_removed = 0;
+                    self.time_source = 0x20;               // GPS
+                    uint8_t sender[10];
+                    memcpy(sender, g_clock_id, 8);
+                    sender[8] = 0;
+                    sender[9] = 1;
+                    ForeignMaster *fm = nullptr;
+                    for (auto &m : g_masters)
+                        if (memcmp(m.sender, sender, 10) == 0) {
+                            fm = &m;
+                            break;
+                        }
+                    if (!fm) {
+                        g_masters.push_back(ForeignMaster{});
+                        fm = &g_masters.back();
+                        memcpy(fm->sender, sender, 10);
+                    }
+                    fm->gm = self;
+                    fm->last_seen = now_ns;
+                    fm->timeout_ns = 3500000000ULL;
+                    g_last_announce_mono_ns = now_ns;  // no auto rescan
+                }
+            }
+
             bmca_elect_locked(now_ns);
+
+            if (role >= ROLE_GM_WAIT && (gnss_ok || holdover)) {
+                bool self_elected = g_have_master &&
+                    memcmp(g_elected_sender, g_clock_id, 8) == 0 &&
+                    g_elected_sender[8] == 0 && g_elected_sender[9] == 1;
+                role = self_elected ? ROLE_GM_ACTIVE : ROLE_GM_PASSIVE;
+                current_utc_offset = (int16_t)g_settings.gm_utc_offset;
+
+                // Comparison target: the best FOREIGN master still
+                // sending — its Syncs are measured against GNSS
+                int best = -1;
+                for (size_t i = 0; i < g_masters.size(); ++i) {
+                    if (memcmp(g_masters[i].sender + 0, g_clock_id, 8) == 0)
+                        continue;         // that's us
+                    if (best < 0 ||
+                        compare_datasets(g_masters[i].gm,
+                                         g_masters[best].gm) < 0)
+                        best = (int)i;
+                }
+                if (best >= 0) {
+                    if (!g_cmp_target_valid.load() ||
+                        memcmp(g_cmp_target, g_masters[best].sender,
+                               10) != 0) {
+                        memcpy(g_cmp_target, g_masters[best].sender, 10);
+                        g_cmp_have = false;        // new reference: restart
+                        g_cmp_count = 0;
+                        g_cmp_target_valid = true;
+                    }
+                    snprintf(g_cmp_gm_str, sizeof(g_cmp_gm_str), "%s",
+                             format_gm(g_masters[best].gm.id).c_str());
+                } else {
+                    g_cmp_target_valid = false;
+                    g_cmp_gm_str[0] = 0;
+                }
+            } else {
+                g_cmp_target_valid = false;
+                g_cmp_have = false;
+                g_cmp_gm_str[0] = 0;
+            }
+            g_role = role;
+            g_gnss_lock = gnss_ok;
+
             g_hist_rate[g_hist_rate_i] = {
                 (uint16_t)g_cnt_sync.exchange(0),
                 (uint16_t)g_cnt_fup.exchange(0),
@@ -2838,8 +3643,10 @@ int main(int argc, char **argv) {
         }
 
         // --- Delay_Req once per second, out of every joined interface
-        //     (only the elected master answers; matched by our identity) ---
+        //     (only the elected master answers; matched by our identity).
+        //     In GNSS mode it measures the path to the comparison master ---
         if (g_have_pair && !joined.empty() &&
+            (g_role.load() < ROLE_GM_PASSIVE || g_cmp_target_valid.load()) &&
             now_ns - last_dreq_ns >= 1000000000ULL) {
             uint8_t pkt[44];
             build_delay_req(pkt, ++g_dreq_seq);
@@ -2878,6 +3685,54 @@ int main(int argc, char **argv) {
                 }
             }
             last_dreq_ns = now_ns;
+        }
+
+        // --- Grandmaster TX: Announce + two-step Sync/Follow_Up at 1 Hz ---
+        if (g_role.load() == ROLE_GM_ACTIVE && !joined.empty() &&
+            now_ns - last_gm_tx_ns >= 1000000000ULL) {
+            last_gm_tx_ns = now_ns;
+            GMInfo self;
+            int16_t utc_off;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                self = g_gm;              // our own dataset — we are elected
+                utc_off = (int16_t)g_settings.gm_utc_offset;
+            }
+            uint8_t ann[64], sync[44], fup[44];
+            build_announce(ann, ++g_ann_seq, self, utc_off,
+                           self.clock_class == 6);
+            ++g_sync_seq;
+            for (const auto &j : joined) {
+                in_addr mif{};
+                mif.s_addr = j.ip;
+                setsockopt(sock_sync, IPPROTO_IP, IP_MULTICAST_IF,
+                           &mif, sizeof(mif));
+                setsockopt(sock_general, IPPROTO_IP, IP_MULTICAST_IF,
+                           &mif, sizeof(mif));
+                sendto(sock_general, ann, sizeof(ann), 0,
+                       (struct sockaddr *)&gen_dst, sizeof(gen_dst));
+#ifdef __linux__
+                if (g_hwts)
+                    drain_errqueue(sock_sync);
+#endif
+                uint64_t ta = local_clock_ns();
+                build_sync(sync, g_sync_seq, (int64_t)ta - g_offset_ns);
+                if (sendto(sock_sync, sync, sizeof(sync), 0,
+                           (struct sockaddr *)&dreq_dst,
+                           sizeof(dreq_dst)) != (ssize_t)sizeof(sync))
+                    continue;
+                uint64_t tb = local_clock_ns();
+                uint64_t t1 = 0;
+#ifdef __linux__
+                if (g_hwts)
+                    t1 = fetch_tx_timestamp(sock_sync);
+#endif
+                if (!t1)
+                    t1 = ta + (tb - ta) / 2;
+                build_follow_up(fup, g_sync_seq, (int64_t)t1 - g_offset_ns);
+                sendto(sock_general, fup, sizeof(fup), 0,
+                       (struct sockaddr *)&gen_dst, sizeof(gen_dst));
+            }
         }
 
 #ifndef NO_MATRIX

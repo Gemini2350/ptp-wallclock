@@ -44,6 +44,15 @@ install -m 644 "$MATRIX_DIR/fonts/6x13B.bdf" "$MATRIX_DIR/fonts/4x6.bdf" "$FONT_
 # the config file must stay writable for that user.
 install -d -o daemon -g daemon "$STATE_DIR"
 
+# GNSS grandmaster mode: let the daemon user reopen the serial port and
+# the PPS device after the privilege drop (the initial open happens as
+# root, so this only matters for hotplug/reconfiguration)
+usermod -a -G dialout daemon 2>/dev/null || true
+cat > /etc/udev/rules.d/99-ptp-wallclock-pps.rules <<'EOF'
+SUBSYSTEM=="pps", MODE="0660", GROUP="dialout"
+EOF
+udevadm control --reload-rules 2>/dev/null || true
+
 echo "==> Installing systemd service"
 install -m 644 "$SCRIPT_DIR/ptp-wallclock.service" /etc/systemd/system/
 systemctl daemon-reload

@@ -49,6 +49,14 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
 - Optional second display line: date, grandmaster ID and/or priorities &
   clock quality (alternating every 4 seconds)
 - Grandmaster changes are shown on the display itself ("! NEW GM !")
+- **GNSS grandmaster mode**: with a GNSS receiver attached (NMEA + PPS),
+  the clock disciplines itself from GPS and takes part in the BMCA as a
+  clockClass 6 grandmaster — sending Announce and two-step Sync/Follow_Up
+  and answering Delay_Req. If a better grandmaster exists on the network,
+  the clock stays passive and instead *measures* that master against
+  GNSS: a live "network PTP vs GNSS" chart shows how far your house
+  grandmaster is from GPS truth. GNSS status (fix, satellites in view
+  with per-satellite signal bars, HDOP, PPS age) is shown in the web UI
 - Built-in web interface (port 8319) for settings and live status —
   grandmaster identity, priority 1/2, clock class, clock accuracy, variance,
   steps removed, time source, TAI−UTC offset, and measured path delay
@@ -155,6 +163,8 @@ Notes:
   `--cap-add NET_ADMIN --device /dev/ptp0` (matching commented lines are
   in `docker-compose.yml`). Without them the container simply uses
   software timestamps.
+- For the GNSS grandmaster mode pass the receiver in as well:
+  `--device /dev/serial0 --device /dev/pps0`.
 - The same headless binary can be built without Docker: `make headless`.
 
 ---
@@ -256,6 +266,54 @@ multicast group on every interface that has an IPv4 address (re-checked
 every 5 seconds, so interfaces that appear late — DHCP at boot, hotplug —
 are picked up automatically). Pinning it to one interface name switches
 the membership over immediately.
+
+## GNSS grandmaster mode
+
+With a GNSS receiver the wallclock can *be* the PTP grandmaster instead
+of just displaying one. It needs two signals from the receiver:
+
+- **NMEA** on a serial port (tells which second it is) — default
+  `/dev/serial0`, 9600 baud
+- **PPS** on a GPIO (tells exactly when the second starts) — default
+  `/dev/pps0`
+
+Example wiring for the Waveshare MAX-M8Q GNSS HAT (whose PPS is on
+GPIO 18 out of the box; it stacks under the LED matrix HAT with a
+stacking header and conflicts with none of its pins) — in
+`/boot/firmware/config.txt`:
+
+```
+enable_uart=1
+dtoverlay=pps-gpio,gpiopin=18
+```
+
+Then enable **PTP grandmaster (GNSS)** on the settings page. What happens
+next:
+
+- Each PPS pulse is paired with the following RMC sentence into a time
+  sample; the display and web clock run directly on GNSS time
+  (the analysis chart then shows the PPS jitter)
+- The clock joins the BMCA with clockClass 6 (GNSS locked), accuracy per
+  timestamping mode, timeSource GPS, and the configurable priorities. If
+  it wins, it transmits Announce + two-step Sync/Follow_Up once per
+  second and answers Delay_Req — with hardware TX timestamps on a Pi 5
+- If a **better** grandmaster announces (lower priority1, etc.), the
+  clock stays passive — and measures that master's Syncs against GNSS.
+  The **network PTP vs GNSS** chart and status line show the offset of
+  your grandmaster against GPS truth, per Sync, in µs (the path delay to
+  it is measured with Delay_Req as usual and subtracted)
+- Loses GNSS → clockClass 7 holdover for 5 minutes, then it returns to
+  plain client mode; the GNSS status panel shows fix quality, satellites
+  used/in view with per-satellite signal-strength bars, HDOP and PPS age
+- clockClass 6 usually beats everything on a lab network. Give the clock
+  priority1 > your real grandmaster's if you only want the measurement,
+  or < if you want it to take over
+
+TAI − UTC (37 s since 2017) is a setting: NMEA carries UTC, PTP runs on
+TAI, and the offset is announced to clients. The devices are opened
+while the service still runs as root; `install.sh` also installs a udev
+rule + group so reopening after the privilege drop works (e.g. USB
+receivers being replugged).
 
 ## Privileged ports (why sudo?)
 
