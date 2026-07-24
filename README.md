@@ -50,13 +50,14 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
   clock quality (alternating every 4 seconds)
 - Grandmaster changes are shown on the display itself ("! NEW GM !")
 - **GNSS grandmaster mode**: with a GNSS receiver attached (NMEA + PPS),
-  the clock disciplines itself from GPS and takes part in the BMCA as a
-  clockClass 6 grandmaster — sending Announce and two-step Sync/Follow_Up
-  and answering Delay_Req. If a better grandmaster exists on the network,
-  the clock stays passive and instead *measures* that master against
-  GNSS: a live "network PTP vs GNSS" chart shows how far your house
-  grandmaster is from GPS truth. GNSS status (fix, satellites in view
-  with per-satellite signal bars, HDOP, PPS age) is shown in the web UI
+  the clock disciplines itself from GPS. By default it stays **slave
+  only** and *measures* the network grandmaster against GNSS: a live
+  "network PTP vs GNSS" chart shows how far your house grandmaster is
+  from GPS truth. A separate, deliberately-confirmed **master mode**
+  switch additionally lets it take part in the BMCA as a clockClass 6
+  grandmaster — sending Announce and two-step Sync/Follow_Up and
+  answering Delay_Req. GNSS status (fix, satellites in view with
+  per-satellite signal bars, HDOP, PPS age) is shown in the web UI
 - Built-in web interface (port 8319) for settings and live status —
   grandmaster identity, priority 1/2, clock class, clock accuracy, variance,
   steps removed, time source, TAI−UTC offset, and measured path delay
@@ -293,8 +294,18 @@ enable_uart=1
 dtoverlay=pps-gpio,gpiopin=18
 ```
 
-Then enable **PTP grandmaster (GNSS)** on the settings page. What happens
-next:
+Then enable **PTP grandmaster (GNSS)** on the settings page. Activation
+is deliberately two-staged:
+
+1. **Use a GNSS receiver** — slave only (the default): the clock runs on
+   GNSS time and measures the network grandmaster against it, but never
+   transmits PTP itself. Safe on any network.
+2. **Master mode** — a separate, explicitly-confirmed switch with a
+   warning: only with it enabled does the clock join the BMCA and, if it
+   wins, actively send Announce/Sync — other PTP devices may then
+   synchronize to it.
+
+What happens with both enabled:
 
 - Each PPS pulse is paired with the following RMC sentence into a time
   sample; the display and web clock run directly on GNSS time

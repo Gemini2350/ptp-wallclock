@@ -220,7 +220,9 @@ struct Settings {
     bool notify_gm_change = false;        // notify on grandmaster change
     int http_port = 8319;
     bool hwts = true;                     // try PTP hardware timestamping
-    bool gm_enable = false;               // act as GNSS grandmaster
+    bool gm_enable = false;               // use a GNSS receiver
+    bool gm_master = false;               // MAY become grandmaster
+                                          // (default: slave only)
     std::string gm_serial = "/dev/serial0";  // NMEA source
     std::string gm_pps = "/dev/pps0";     // PPS source (pps-gpio)
     int gm_prio1 = 128, gm_prio2 = 128;   // our announce priorities
@@ -546,6 +548,7 @@ static void save_settings_locked() {
     f << "iface=" << g_settings.iface << "\n";
     f << "hwts=" << (g_settings.hwts ? 1 : 0) << "\n";
     f << "gm_enable=" << (g_settings.gm_enable ? 1 : 0) << "\n";
+    f << "gm_master=" << (g_settings.gm_master ? 1 : 0) << "\n";
     f << "gm_serial=" << g_settings.gm_serial << "\n";
     f << "gm_pps=" << g_settings.gm_pps << "\n";
     f << "gm_prio1=" << g_settings.gm_prio1 << "\n";
@@ -628,6 +631,8 @@ static void load_settings() {
             g_settings.hwts = (val != "0");
         } else if (key == "gm_enable") {
             g_settings.gm_enable = (val == "1");
+        } else if (key == "gm_master") {
+            g_settings.gm_master = (val == "1");
         } else if (key == "gm_serial") {
             if (!val.empty())
                 g_settings.gm_serial = val;
@@ -1790,6 +1795,7 @@ static std::string settings_json() {
       << "\"domain\":" << g_settings.domain << ","
       << "\"acceptable_gms\":\"" << json_escape(g_settings.acceptable_gms) << "\","
       << "\"gm_enable\":" << (g_settings.gm_enable ? "true" : "false") << ","
+      << "\"gm_master\":" << (g_settings.gm_master ? "true" : "false") << ","
       << "\"gm_serial\":\"" << json_escape(g_settings.gm_serial) << "\","
       << "\"gm_pps\":\"" << json_escape(g_settings.gm_pps) << "\","
       << "\"gm_prio1\":" << g_settings.gm_prio1 << ","
@@ -1898,6 +1904,7 @@ static std::string status_json() {
       << "\"hwts_desc\":\"" << json_escape(g_hwts_desc) << "\","
       << "\"role\":" << g_role.load() << ","
       << "\"gm_enable\":" << (g_settings.gm_enable ? "true" : "false") << ","
+      << "\"gm_master\":" << (g_settings.gm_master ? "true" : "false") << ","
       << "\"gnss_lock\":" << (g_gnss_lock ? "true" : "false") << ","
       << "\"gnss_serial_ok\":" << (g_gnss_serial_ok ? "true" : "false") << ","
       << "\"gnss_pps_ok\":" << (g_gnss_pps_ok ? "true" : "false") << ","
@@ -2168,14 +2175,24 @@ matrix:</p>
 <fieldset>
 <legend>PTP grandmaster (GNSS)</legend>
 <label>
- <input type="checkbox" id="gm_enable"> Act as PTP grandmaster when a
- GNSS receiver provides time (NMEA + PPS)
+ <input type="checkbox" id="gm_enable"> Use a GNSS receiver
+ (NMEA + PPS) — the clock then runs on GNSS time
 </label>
 <p class="hint">Needs a GNSS module with its PPS pulse on a GPIO
 (<code>dtoverlay=pps-gpio,gpiopin=18</code>) and NMEA on a serial port —
-see the README. With GNSS lock the clock announces itself with
-clockClass&nbsp;6 / GPS; a better grandmaster on the network still wins
-the BMCA, and its Syncs are then measured against GNSS (chart above).</p>
+see the README. Without master mode below this is <b>slave only</b>: the
+clock displays GNSS time and measures the network grandmaster against it
+(chart above), but never transmits PTP itself.</p>
+<label>
+ <input type="checkbox" id="gm_master"> Master mode: allow this clock to
+ become the PTP grandmaster
+</label>
+<p class="hint" style="color:#fa6">&#9888; With master mode enabled the
+clock joins the BMCA as clockClass&nbsp;6 (GNSS) and — if it wins the
+election — actively sends Announce and Sync into the network:
+<b>other PTP devices may then synchronize to this clock.</b> A better
+grandmaster still wins. Leave this off (default) for pure display and
+measurement.</p>
 <label>NMEA serial device:
  <input type="text" id="gm_serial" list="serlist" value="/dev/serial0">
  <datalist id="serlist"><option value="/dev/serial0">
@@ -2331,6 +2348,7 @@ async function loadSettings() {
   syncDomainInput();
   document.getElementById('acceptable_gms').value = s.acceptable_gms;
   document.getElementById('gm_enable').checked = s.gm_enable;
+  document.getElementById('gm_master').checked = s.gm_master;
   document.getElementById('gm_serial').value = s.gm_serial;
   document.getElementById('gm_pps').value = s.gm_pps;
   document.getElementById('gm_prio1').value = s.gm_prio1;
@@ -2358,6 +2376,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
         ? -1 : document.getElementById('domain').value,
     acceptable_gms: document.getElementById('acceptable_gms').value,
     gm_enable: document.getElementById('gm_enable').checked ? 1 : 0,
+    gm_master: document.getElementById('gm_master').checked ? 1 : 0,
     gm_serial: document.getElementById('gm_serial').value,
     gm_pps: document.getElementById('gm_pps').value,
     gm_prio1: document.getElementById('gm_prio1').value,
@@ -2587,7 +2606,9 @@ async function poll() {
     set('s_hwts', s.hwts ? 'hardware (' + s.hwts_desc + ')' : 'software');
     set('s_role', !s.gm_enable ? 'client'
         : s.role === 3 ? 'GRANDMASTER (GNSS)'
-        : s.role === 2 ? 'passive — better grandmaster on the network'
+        : s.role === 2 ? (s.gm_master
+            ? 'passive — better grandmaster on the network'
+            : 'GNSS slave only — measuring the network master')
         : 'client (waiting for GNSS)');
     const gb = document.getElementById('gnss_box');
     gb.style.display = s.gm_enable ? '' : 'none';
@@ -3241,6 +3262,8 @@ static void handle_client(int fd) {
                 g_settings.acceptable_gms = kv["acceptable_gms"];
             if (kv.count("gm_enable"))
                 g_settings.gm_enable = (kv["gm_enable"] == "1");
+            if (kv.count("gm_master"))
+                g_settings.gm_master = (kv["gm_master"] == "1");
             if (kv.count("gm_serial") && !kv["gm_serial"].empty() &&
                 kv["gm_serial"].size() < 64)
                 g_settings.gm_serial = kv["gm_serial"];
@@ -3632,7 +3655,10 @@ int main(int argc, char **argv) {
             int role = ROLE_CLIENT;
             if (g_settings.gm_enable) {
                 role = ROLE_GM_WAIT;
-                if (gnss_ok || holdover) {
+                // Slave only unless master mode is deliberately enabled:
+                // without gm_master we never enter the BMCA as a
+                // candidate, so we can never win it
+                if ((gnss_ok || holdover) && g_settings.gm_master) {
                     if (g_domain.load() < 0 && g_active_domain.load() < 0) {
                         g_active_domain = 0;   // we define the domain now
                         std::cout << "Grandmaster mode: using domain 0\n";
@@ -3667,6 +3693,16 @@ int main(int argc, char **argv) {
                     fm->timeout_ns = 3500000000ULL;
                     g_last_announce_mono_ns = now_ns;  // no auto rescan
                 }
+            }
+            if (!g_settings.gm_master) {
+                // Master mode switched off: withdraw our candidacy at
+                // once instead of waiting for the announce timeout
+                for (auto it = g_masters.begin(); it != g_masters.end();)
+                    if (memcmp(it->sender, g_clock_id, 8) == 0 &&
+                        it->sender[8] == 0 && it->sender[9] == 1)
+                        it = g_masters.erase(it);
+                    else
+                        ++it;
             }
 
             bmca_elect_locked(now_ns);
