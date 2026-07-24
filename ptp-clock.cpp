@@ -225,6 +225,7 @@ struct Settings {
     std::string gm_pps = "/dev/pps0";     // PPS source (pps-gpio)
     int gm_prio1 = 128, gm_prio2 = 128;   // our announce priorities
     int gm_utc_offset = 37;               // TAI - UTC for the announce
+    int offset_warn_us = 0;               // alert threshold in us, 0 = off
     int domain = -1;                      // PTP domain, -1 = auto detect
     std::string iface = "auto";           // interface, "auto" = all of them
     std::string acceptable_gms;           // comma-separated GM identities;
@@ -372,6 +373,11 @@ static std::atomic<uint32_t> g_cmp_count{0};
 static char g_cmp_gm_str[32] = "";        // guarded by g_mutex
 
 static uint16_t g_ann_seq = 0, g_sync_seq = 0;      // main thread
+
+// Offset warning: last time a deviation beyond the configured threshold
+// was seen (mono ns) and its value — alert shows for 10 s afterwards
+static std::atomic<unsigned long long> g_offset_warn_mono{0};
+static std::atomic<long long> g_offset_warn_val{0};
 
 static void hist_push(int32_t *buf, int &n, int &i, int64_t v) {
     if (v > 2000000000LL) v = 2000000000LL;
@@ -545,6 +551,7 @@ static void save_settings_locked() {
     f << "gm_prio1=" << g_settings.gm_prio1 << "\n";
     f << "gm_prio2=" << g_settings.gm_prio2 << "\n";
     f << "gm_utc_offset=" << g_settings.gm_utc_offset << "\n";
+    f << "offset_warn_us=" << g_settings.offset_warn_us << "\n";
     f << "acceptable_gms=" << g_settings.acceptable_gms << "\n";
 }
 
@@ -639,6 +646,10 @@ static void load_settings() {
             int v = atoi(val.c_str());
             if (v >= 0 && v <= 99)
                 g_settings.gm_utc_offset = v;
+        } else if (key == "offset_warn_us") {
+            int v = atoi(val.c_str());
+            if (v >= 0 && v <= 1000000000)
+                g_settings.offset_warn_us = v;
         } else if (key == "acceptable_gms") {
             g_settings.acceptable_gms = val;
         }
@@ -693,6 +704,7 @@ static void reset_ptp_state() {
     g_cmp_target_valid = false;
     g_cmp_have = false;
     g_cmp_count = 0;
+    g_offset_warn_mono = 0;
     g_active_domain = -1;
     g_last_announce_mono_ns = 0;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -853,6 +865,27 @@ static void bmca_elect_locked(uint64_t now) {
     g_path_delay_ns = 0;
 }
 
+// Offset warning: remember any deviation beyond the configured threshold
+// (µs, 0 = off) — the displays alert for 10 s afterwards
+static void offset_warn_check(int64_t dev_ns) {
+    int thr_us = g_settings.offset_warn_us;    // benign unlocked int read
+    if (thr_us > 0 && llabs(dev_ns) > (int64_t)thr_us * 1000LL) {
+        g_offset_warn_val = dev_ns;
+        g_offset_warn_mono = mono_ns();
+    }
+}
+
+// "+12.3us" / "-4.5ms" / "+1.20s" — short enough for the LED line
+static void format_signed_offset(char *out, size_t n, long long ns) {
+    double us = (double)ns / 1000.0;
+    if (us >= 1e6 || us <= -1e6)
+        snprintf(out, n, "%+.2fs", us / 1e6);
+    else if (us >= 1000.0 || us <= -1000.0)
+        snprintf(out, n, "%+.1fms", us / 1000.0);
+    else
+        snprintf(out, n, "%+.1fus", us);
+}
+
 // A (t1, t2) pair is complete: update the offset estimate.
 // local = master + offset  =>  offset = t2 - t1 - meanPathDelay
 // wire=false marks a GNSS sample (grandmaster mode). While GNSS drives
@@ -869,6 +902,7 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
         if (!g_have_offset)
             return;                       // no GNSS reference yet
         int64_t d = g_offset_ns - sample; // wire master - GNSS, ns
+        offset_warn_check(d);
         if (!g_cmp_have) {
             g_cmp_ns = d;
             g_cmp_have = true;
@@ -884,6 +918,8 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
     }
 
     // Analysis history: how far this sync was off the smoothed estimate
+    if (g_have_offset)
+        offset_warn_check(sample - g_offset_ns);
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         hist_push(g_hist_off, g_hist_off_n, g_hist_off_i,
@@ -1759,6 +1795,7 @@ static std::string settings_json() {
       << "\"gm_prio1\":" << g_settings.gm_prio1 << ","
       << "\"gm_prio2\":" << g_settings.gm_prio2 << ","
       << "\"gm_utc_offset\":" << g_settings.gm_utc_offset << ","
+      << "\"offset_warn_us\":" << g_settings.offset_warn_us << ","
       << "\"iface\":\"" << json_escape(g_settings.iface) << "\","
       << "\"ifaces\":[";
     std::vector<std::string> ifs = list_ifaces();
@@ -1881,6 +1918,13 @@ static std::string status_json() {
       << "\"cmp_last_ns\":" << g_cmp_last.load() << ","
       << "\"cmp_count\":" << g_cmp_count.load() << ","
       << "\"cmp_gm\":\"" << g_cmp_gm_str << "\","
+      << "\"offset_warn\":"
+      << (g_settings.offset_warn_us > 0 && g_offset_warn_mono.load() != 0 &&
+                  mono_ns() - g_offset_warn_mono.load() < 10000000000ULL
+              ? "true"
+              : "false")
+      << ","
+      << "\"offset_warn_ns\":" << g_offset_warn_val.load() << ","
       << "\"gm_id\":\"" << (g_have_gm ? format_gm(g_gm.id) : "") << "\","
       << "\"gm_vendor\":\"" << (g_have_gm ? lookup_vendor(g_gm.id) : "") << "\","
       << "\"gm_accepted\":" << (gm_acceptable_locked() ? "true" : "false") << ","
@@ -1960,7 +2004,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  table.masters td { color: #eee; text-align: right; padding: 0.15em 0.3em; }
  table.masters th:first-child, table.masters td:first-child { text-align: left; }
  table.masters tr.elected td { color: #6c6; }
- #banner, #gmwarn { display: none; background: #b33; color: #fff;
+ #banner, #gmwarn, #offwarn { display: none; background: #b33; color: #fff;
         padding: 0.6em; border-radius: 4px; margin-bottom: 1em; }
  #saved { color: #6c6; visibility: hidden; margin-left: 1em; }
  .hint { color: #888; font-size: 0.85em; margin: 0.8em 0 0.2em; }
@@ -1995,6 +2039,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <h1>PTP Wallclock &ndash; Settings</h1>
 <div id="banner"></div>
 <div id="gmwarn"></div>
+<div id="offwarn"></div>
 
 <fieldset>
 <legend>PTP time &nbsp;<a href="/clock" target="_blank" rel="noopener">fullscreen clock &rarr;</a></legend>
@@ -2162,6 +2207,13 @@ the BMCA, and its Syncs are then measured against GNSS (chart above).</p>
 <label>
  <input type="checkbox" id="notify"> Notify on grandmaster change
 </label>
+<label>Offset warning threshold (&micro;s, 0 = off):
+ <input type="number" id="offset_warn" min="0" max="1000000000" value="0">
+</label>
+<p class="hint">Shows a red alert on the LED matrix, the browser clock
+and this page for 10 s whenever a sync deviates from the smoothed offset
+by more than the threshold — or, in grandmaster/passive mode, whenever
+the network master differs from GNSS by more than it.</p>
 </fieldset>
 
 <button type="submit">Save</button><span id="saved">Saved</span>
@@ -2284,6 +2336,7 @@ async function loadSettings() {
   document.getElementById('gm_prio1').value = s.gm_prio1;
   document.getElementById('gm_prio2').value = s.gm_prio2;
   document.getElementById('gm_utc').value = s.gm_utc_offset;
+  document.getElementById('offset_warn').value = s.offset_warn_us;
   document.getElementById('iface').value = s.iface;
   document.getElementById('iflist').innerHTML =
       ['auto'].concat(s.ifaces).map(i => '<option value="' + i + '">').join('');
@@ -2310,6 +2363,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     gm_prio1: document.getElementById('gm_prio1').value,
     gm_prio2: document.getElementById('gm_prio2').value,
     gm_utc_offset: document.getElementById('gm_utc').value,
+    offset_warn_us: document.getElementById('offset_warn').value,
     iface: document.getElementById('iface').value,
     notify: document.getElementById('notify').checked ? 1 : 0
   });
@@ -2497,6 +2551,12 @@ for (const id of ['ch_off', 'ch_rate', 'ch_cmp'])
       () => window.open('/analysis', '_blank');
 
 const set = (id, text) => document.getElementById(id).textContent = text;
+function fmtOff(ns) {
+  const us = ns / 1000, sg = us >= 0 ? '+' : '';
+  if (Math.abs(us) >= 1e6) return sg + (us / 1e6).toFixed(2) + ' s';
+  if (Math.abs(us) >= 1000) return sg + (us / 1000).toFixed(1) + ' ms';
+  return sg + us.toFixed(1) + ' µs';
+}
 let lastChanges = null;
 async function poll() {
   try {
@@ -2593,6 +2653,11 @@ async function poll() {
     if (badGm)
       w.textContent = 'Unaccepted grandmaster: ' + s.gm_id +
           ' is not on the acceptable list!';
+    const ow = document.getElementById('offwarn');
+    ow.style.display = s.offset_warn ? 'block' : 'none';
+    if (s.offset_warn)
+      ow.textContent = 'Offset deviation beyond threshold: ' +
+          fmtOff(s.offset_warn_ns);
     set('s_prio', gm ? s.priority1 + ' / ' + s.priority2 : '–');
     set('s_class', gm ? s.clock_class + ' (' +
         (CLOCK_CLASS[s.clock_class] || 'reserved') + ')' : '–');
@@ -2874,13 +2939,23 @@ async function loadSettings() {
   } catch (e) {}
 }
 
+function fmtOff(ns) {
+  const us = ns / 1000, sg = us >= 0 ? '+' : '';
+  if (Math.abs(us) >= 1e6) return sg + (us / 1e6).toFixed(2) + ' s';
+  if (Math.abs(us) >= 1000) return sg + (us / 1000).toFixed(1) + ' ms';
+  return sg + us.toFixed(1) + ' µs';
+}
+
 function updateFooter(s) {
   const a = document.getElementById('alert');
   // Persistent error when the elected GM is not on the acceptable list;
-  // the transient NEW GM alert comes second.
+  // then the transient offset warning, then the NEW GM alert.
   if (s.gm_id && s.gm_accepted === false) {
     a.style.display = 'block';
     a.textContent = '! UNACCEPTED GM !  ' + s.gm_id;
+  } else if (s.offset_warn) {
+    a.style.display = 'block';
+    a.textContent = '! OFFSET ' + fmtOff(s.offset_warn_ns) + ' !';
   } else {
     const showAlert = S && S.notify_gm_change &&
         s.seconds_since_change >= 0 && s.seconds_since_change < 10;
@@ -3186,6 +3261,11 @@ static void handle_client(int fd) {
                 int v = atoi(kv["gm_utc_offset"].c_str());
                 if (v >= 0 && v <= 99)
                     g_settings.gm_utc_offset = v;
+            }
+            if (kv.count("offset_warn_us")) {
+                int v = atoi(kv["offset_warn_us"].c_str());
+                if (v >= 0 && v <= 1000000000)
+                    g_settings.offset_warn_us = v;
             }
             if (kv.count("notify"))
                 g_settings.notify_gm_change = (kv["notify"] == "1");
@@ -3793,6 +3873,22 @@ int main(int argc, char **argv) {
                 gm_recent_change = true;
         }
 
+        // Configurable offset warning (10 s after the last exceedance)
+        bool offset_warn = false;
+        char offset_warn_txt[32] = "";
+        {
+            uint64_t wt = g_offset_warn_mono.load();
+            if (s.offset_warn_us > 0 && wt != 0 &&
+                mono_ns() - wt < 10000000000ULL) {
+                offset_warn = true;
+                char val[16];
+                format_signed_offset(val, sizeof(val),
+                                     g_offset_warn_val.load());
+                snprintf(offset_warn_txt, sizeof(offset_warn_txt),
+                         "! OFFSET %s !", val);
+            }
+        }
+
         offscreen->SetBrightness((uint8_t)s.brightness);
         flip_canvas.inner = offscreen;
         flip_canvas.flip = s.rotate180;
@@ -3899,6 +3995,11 @@ int main(int argc, char **argv) {
                 line2 = "! NEW GM !";
                 line2_alert = true;
             }
+            // Offset beyond the configured threshold beats the GM change
+            if (offset_warn) {
+                line2 = offset_warn_txt;
+                line2_alert = true;
+            }
             // Persistent error state beats the transient change alert
             if (gm_unaccepted) {
                 line2 = "! UNACCEPTED GM !";
@@ -3925,7 +4026,7 @@ int main(int argc, char **argv) {
         // itself red (10 s on a GM change; while an unaccepted GM is elected).
         bool time_alert = !have_small_font &&
                           ((gm_recent_change && s.notify_gm_change) ||
-                           gm_unaccepted);
+                           gm_unaccepted || offset_warn);
         Color c_main = time_alert ? Color(255, 0, 0)
                                   : Color(s.r, s.g, s.b);
         Color c_dim(s.r / 5, s.g / 5, s.b / 5);
