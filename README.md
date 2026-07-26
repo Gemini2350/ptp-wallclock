@@ -378,8 +378,11 @@ The clock is disciplined by a small **PI servo** that estimates offset
 the status panel): a plain crystal's ppm error no longer causes a
 standing lag behind the master (offset-only smoothing lags by
 freq × time-constant — ~160 µs at 20 ppm), and the displayed time runs
-frequency-corrected between correction samples. Delay_Resp measurements
-are smoothed with a small exponential filter. Note that the LED refresh and the browser
+frequency-corrected between correction samples. Path-delay measurements
+are computed leg by leg against the same servo model — oscillator drift
+between the Sync and the Delay exchange cancels instead of adding a few
+µs of apparent delay variation — and smoothed with a small exponential
+filter. Note that the LED refresh and the browser
 rendering add their own few milliseconds — hardware timestamping makes
 the *measurements* honest (visible in the PTP analysis charts), not the
 photons faster.

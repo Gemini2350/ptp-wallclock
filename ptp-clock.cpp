@@ -280,6 +280,7 @@ static PendingSync g_pending_sync;
 static bool g_have_pair = false;          // valid (t1, t2) from last Sync
 static int64_t g_last_t1 = 0;             // master send time (TAI ns, corrected)
 static int64_t g_last_t2 = 0;             // local arrival time (mono ns)
+static bool g_last_pair_wire = true;      // false: GNSS pair (no path)
 
 struct PendingDelayReq {
     bool valid = false;
@@ -953,6 +954,7 @@ static void format_signed_offset(char *out, size_t n, long long ns) {
 static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
     g_last_t1 = t1;
     g_last_t2 = t2;
+    g_last_pair_wire = wire;
     g_have_pair = true;
 
     // A GNSS sample has no network path, so no mean path delay applies
@@ -1143,9 +1145,23 @@ static void process_general_packet(const uint8_t *buf, ssize_t len,
         int64_t t3 = (int64_t)g_pending_dreq.t3_mono;
         g_pending_dreq.valid = false;
 
-        // meanPathDelay = ((t2 - t1) + (t4 - t3)) / 2 - correction
-        int64_t sample = ((g_last_t2 - g_last_t1) + (t4 - t3)) / 2
+        // Drift-corrected mean path delay: each leg is evaluated with
+        // the servo's offset model at its own instant, so oscillator
+        // drift between the last Sync and this exchange cancels instead
+        // of leaking a few us into the measurement. A servo bias common
+        // to both instants cancels between the legs. A GNSS reference
+        // pair has no network path — then the return leg alone (whose
+        // offset IS the GNSS truth) carries the delay.
+        int64_t d_back = t4 - (t3 - offset_at((uint64_t)t3))
                          - corr_to_ns(buf + 8);
+        int64_t sample;
+        if (g_last_pair_wire) {
+            int64_t d_fwd =
+                (g_last_t2 - offset_at((uint64_t)g_last_t2)) - g_last_t1;
+            sample = (d_fwd + d_back) / 2;
+        } else {
+            sample = d_back;
+        }
         if (sample < 0)
             sample = 0;
         if (sample > 1000000000LL)        // > 1 s: bogus, discard
@@ -1940,7 +1956,16 @@ static void process_v1_general(const uint8_t *buf, ssize_t len,
             (int64_t)current_utc_offset.load() * 1000000000LL;
         int64_t t3 = (int64_t)g_pending_dreq.t3_mono;
         g_pending_dreq.valid = false;
-        int64_t sample = ((g_last_t2 - g_last_t1) + (t4 - t3)) / 2;
+        // Same drift-corrected leg-by-leg computation as the v2 handler
+        int64_t d_back = t4 - (t3 - offset_at((uint64_t)t3));
+        int64_t sample;
+        if (g_last_pair_wire) {
+            int64_t d_fwd =
+                (g_last_t2 - offset_at((uint64_t)g_last_t2)) - g_last_t1;
+            sample = (d_fwd + d_back) / 2;
+        } else {
+            sample = d_back;
+        }
         if (sample < 0)
             sample = 0;
         if (sample > 1000000000LL)
@@ -2550,11 +2575,12 @@ over this noise.</p>
 <div class="chart-title">Path delay</div>
 <canvas class="chart" id="ch_del"></canvas>
 <p class="chart-desc"><span style="color:#6cf">&#9632;</span> Raw mean
-path delay from each Delay_Req/Delay_Resp exchange,
-((t2&minus;t1)+(t4&minus;t3))/2. It should sit at the constant
-cable-and-switch latency: a step means the network path changed, spread
-means queueing &mdash; and any up/down asymmetry biases the clock by half
-of it.</p>
+path delay from each Delay_Req/Delay_Resp exchange &mdash; both legs
+evaluated against the servo's offset model at their own instants, so
+oscillator drift between Sync and exchange cancels out. It should sit at
+the constant cable-and-switch latency: a step means the network path
+changed, spread means queueing &mdash; and any up/down asymmetry biases
+the clock by half of it.</p>
 <div class="chart-title">Received message rates (per second, this domain)</div>
 <canvas class="chart" id="ch_rate"></canvas>
 <div class="chart-legend"><span style="color:#6c6">&#9632;</span> Sync
@@ -3268,11 +3294,12 @@ over this noise.</p>
 <div class="chart-title">Path delay</div>
 <canvas id="ch_del" style="height:26vh"></canvas>
 <p class="chart-desc"><span style="color:#6cf">&#9632;</span> Raw mean
-path delay from each Delay_Req/Delay_Resp exchange,
-((t2&minus;t1)+(t4&minus;t3))/2. It should sit at the constant
-cable-and-switch latency: a step means the network path changed, spread
-means queueing &mdash; and any up/down asymmetry biases the clock by half
-of it.</p>
+path delay from each Delay_Req/Delay_Resp exchange &mdash; both legs
+evaluated against the servo's offset model at their own instants, so
+oscillator drift between Sync and exchange cancels out. It should sit at
+the constant cable-and-switch latency: a step means the network path
+changed, spread means queueing &mdash; and any up/down asymmetry biases
+the clock by half of it.</p>
 <div class="chart-title">Received message rates (per second, this domain)</div>
 <canvas id="ch_rate" style="height:26vh"></canvas>
 <div class="chart-legend"><span style="color:#6c6">&#9632;</span> Sync
