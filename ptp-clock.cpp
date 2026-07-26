@@ -2613,21 +2613,19 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 last 5 minutes; grid lines mark one minute.</div>
 <div class="chart-title">Sync PDV &mdash; offset deviation per Sync</div>
 <canvas class="chart" id="ch_pdv"></canvas>
-<p class="chart-desc"><span style="color:#fd0">&#9632;</span> How far each
-incoming Sync landed off the servo's prediction: the packet delay
-variation (PDV) of the master&rarr;clock path plus timestamping noise.
-On an idle, PTP-aware network this is a flat band; queueing in ordinary
-switches, CPU load, or software timestamps widen it. The servo averages
-over this noise.</p>
+<p class="chart-desc"><span style="color:#fd0">&#9632;</span> Packet delay variation (PDV): how much each Sync message wobbles around
+its expected arrival time. Smaller is better. Rules of thumb &mdash;
+network with boundary clocks everywhere: within &plusmn;100 ns; AES67:
+&plusmn;500 ns per AES11, most devices are fine up to &plusmn;5 &micro;s;
+Dante: anything under &plusmn;500 &micro;s is great. Note that software
+timestamps (no PHC) add &micro;s-level noise of their own on top.</p>
 <div class="chart-title">Path delay</div>
 <canvas class="chart" id="ch_del"></canvas>
-<p class="chart-desc"><span style="color:#6cf">&#9632;</span> Raw mean
-path delay from each Delay_Req/Delay_Resp exchange &mdash; both legs
-evaluated against the servo's offset model at their own instants, so
-oscillator drift between Sync and exchange cancels out. It should sit at
-the constant cable-and-switch latency: a step means the network path
-changed, spread means queueing &mdash; and any up/down asymmetry biases
-the clock by half of it.</p>
+<p class="chart-desc"><span style="color:#6cf">&#9632;</span> One-way network
+delay between the grandmaster and this clock, measured once per second.
+It should be a flat line &mdash; the value itself is just cable length
+plus switch count. A sudden step means the path through the network
+changed; a widening band means queueing delay from other traffic.</p>
 <div class="chart-title">Received message rates (per second, this domain)</div>
 <canvas class="chart" id="ch_rate"></canvas>
 <div class="chart-legend"><span style="color:#6c6">&#9632;</span> Sync
@@ -3349,21 +3347,19 @@ static const char *kAnalysisHtml = R"ANA(<!DOCTYPE html>
 mark one minute.</div>
 <div class="chart-title">Sync PDV &mdash; offset deviation per Sync</div>
 <canvas id="ch_pdv" style="height:26vh"></canvas>
-<p class="chart-desc"><span style="color:#fd0">&#9632;</span> How far each
-incoming Sync landed off the servo's prediction: the packet delay
-variation (PDV) of the master&rarr;clock path plus timestamping noise.
-On an idle, PTP-aware network this is a flat band; queueing in ordinary
-switches, CPU load, or software timestamps widen it. The servo averages
-over this noise.</p>
+<p class="chart-desc"><span style="color:#fd0">&#9632;</span> Packet delay variation (PDV): how much each Sync message wobbles around
+its expected arrival time. Smaller is better. Rules of thumb &mdash;
+network with boundary clocks everywhere: within &plusmn;100 ns; AES67:
+&plusmn;500 ns per AES11, most devices are fine up to &plusmn;5 &micro;s;
+Dante: anything under &plusmn;500 &micro;s is great. Note that software
+timestamps (no PHC) add &micro;s-level noise of their own on top.</p>
 <div class="chart-title">Path delay</div>
 <canvas id="ch_del" style="height:26vh"></canvas>
-<p class="chart-desc"><span style="color:#6cf">&#9632;</span> Raw mean
-path delay from each Delay_Req/Delay_Resp exchange &mdash; both legs
-evaluated against the servo's offset model at their own instants, so
-oscillator drift between Sync and exchange cancels out. It should sit at
-the constant cable-and-switch latency: a step means the network path
-changed, spread means queueing &mdash; and any up/down asymmetry biases
-the clock by half of it.</p>
+<p class="chart-desc"><span style="color:#6cf">&#9632;</span> One-way network
+delay between the grandmaster and this clock, measured once per second.
+It should be a flat line &mdash; the value itself is just cable length
+plus switch count. A sudden step means the path through the network
+changed; a widening band means queueing delay from other traffic.</p>
 <div class="chart-title">Received message rates (per second, this domain)</div>
 <canvas id="ch_rate" style="height:26vh"></canvas>
 <div class="chart-legend"><span style="color:#6c6">&#9632;</span> Sync
