@@ -21,6 +21,12 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
 
 ## Features
 
+- Three protocol profiles, selectable in the web UI: **PTPv2**
+  (IEEE 1588 over UDP, default), **gPTP / IEEE 802.1AS** (AVB, Milan —
+  v2 messages on raw Ethernet with the peer-delay mechanism; the clock
+  answers Pdelay_Req so switches keep it asCapable) and **PTPv1**
+  (IEEE 1588-2002 legacy, mapped onto the same BMCA/UI: stratum becomes
+  clockClass, the UTC timescale is converted to TAI)
 - Real PTPv2 (IEEE 1588) client with the end-to-end delay mechanism:
   Sync / Follow_Up are correlated with their local arrival time, Delay_Req /
   Delay_Resp measure the network path delay, and the displayed time is
@@ -382,10 +388,32 @@ photons faster.
 
 [Excuse me, what precise time is It?](https://media.ccc.de/v/39c3-excuse-me-what-precise-time-is-it).
 
-## Open Issues
+## Protocol profiles
 
-- PTPv1 (IEEE 1588-2002) is not supported. The implementation targets PTPv2
-  (IEEE 1588-2008) only.
+The **Protocol profile** setting selects what the clock listens to:
+
+- **PTPv2** (default): IEEE 1588 over UDP multicast, end-to-end delay
+  mechanism. The only profile with grandmaster (transmit) support.
+- **gPTP — IEEE 802.1AS / AVB / Milan**: the same v2 message format in
+  raw Ethernet frames (EtherType 0x88F7, transportSpecific 1). Sync and
+  Follow_Up carry the accumulated per-hop corrections; the clock
+  measures its local link with Pdelay_Req and politely answers incoming
+  Pdelay_Reqs — a silent neighbor would be declared !asCapable and cut
+  off by 802.1AS bridges. Linux only (raw socket), works in Docker with
+  `--network host`.
+- **PTPv1 — IEEE 1588-2002**: the historic format on the same UDP
+  ports. There is no Announce in v1 — the Sync message carries the
+  dataset, which is mapped onto the modern UI (stratum → clockClass,
+  `GPS`/`ATOM` identifiers → time source). v1 runs on UTC; the
+  telegram's currentUTCOffset (or the configured TAI−UTC) converts it
+  to the TAI timescale used everywhere else.
+
+Switching profiles applies immediately (fresh election, no restart).
+
+## Open Issues
 
 - Hardware timestamping is probed once at startup; after changing the
   interface setting, restart the service to re-probe.
+
+- gPTP and PTPv1 are receive/measure profiles; grandmaster mode
+  transmits PTPv2 only.

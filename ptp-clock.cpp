@@ -25,6 +25,7 @@
 #include <linux/sockios.h>
 #include <linux/ethtool.h>
 #include <linux/errqueue.h>
+#include <linux/if_packet.h>
 #endif
 #include <cstring>
 #include <cstdlib>
@@ -219,6 +220,7 @@ struct Settings {
     int date_format = DATE_DMY;           // DD.MM.YYYY / ISO / MM/DD/YYYY
     bool notify_gm_change = false;        // notify on grandmaster change
     int http_port = 8319;
+    std::string ptp_mode = "v2";          // "v2", "gptp" (802.1AS), "v1"
     bool hwts = true;                     // try PTP hardware timestamping
     bool gm_enable = false;               // use a GNSS receiver
     bool gm_master = false;               // MAY become grandmaster
@@ -342,6 +344,19 @@ static std::atomic<uint32_t> g_cnt_ann{0}, g_cnt_dresp{0};
 static bool g_hwts = false;
 static int g_phc_fd = -1;
 static std::string g_hwts_desc;           // e.g. "eth0 via /dev/ptp0"
+
+// ---- Protocol profile ----
+// PTPv2 (IEEE 1588-2008, UDP) is the default. gPTP (IEEE 802.1AS — AVB,
+// Milan) carries v2-format messages in raw Ethernet frames and uses the
+// peer-delay mechanism; PTPv1 (IEEE 1588-2002) shares the UDP ports but
+// has an entirely different message layout.
+enum { MODE_V2 = 0, MODE_GPTP = 1, MODE_V1 = 2 };
+static std::atomic<int> g_ptp_mode{MODE_V2};
+static int g_l2_sock = -1;                // gPTP raw socket (Linux)
+
+static int ptp_mode_int(const std::string &m) {
+    return m == "gptp" ? MODE_GPTP : m == "v1" ? MODE_V1 : MODE_V2;
+}
 static std::atomic<unsigned long long> g_last_sync_age_ns{0};  // mono, for UI
 
 // ---- PTP grandmaster mode (GNSS-disciplined) ----
@@ -564,6 +579,7 @@ static void save_settings_locked() {
                             "dmy") << "\n";
     f << "notify_gm_change=" << (g_settings.notify_gm_change ? 1 : 0) << "\n";
     f << "http_port=" << g_settings.http_port << "\n";
+    f << "ptp_mode=" << g_settings.ptp_mode << "\n";
     if (g_settings.domain < 0)
         f << "domain=auto\n";
     else
@@ -650,6 +666,9 @@ static void load_settings() {
         } else if (key == "iface") {
             if (!val.empty())
                 g_settings.iface = val;
+        } else if (key == "ptp_mode") {
+            if (val == "v2" || val == "gptp" || val == "v1")
+                g_settings.ptp_mode = val;
         } else if (key == "hwts") {
             g_settings.hwts = (val != "0");
         } else if (key == "gm_enable") {
@@ -1654,6 +1673,9 @@ static void try_enable_hw_timestamping(int sock_event) {
             close(fd);
             continue;
         }
+        if (g_l2_sock >= 0)               // gPTP frames get hw stamps too
+            setsockopt(g_l2_sock, SOL_SOCKET, SO_TIMESTAMPING,
+                       &flags, sizeof(flags));
 
         g_phc_fd = fd;
         g_hwts_desc = name + " via " + path;
@@ -1758,6 +1780,378 @@ static uint64_t fetch_tx_timestamp(int sock) {
 }
 #endif
 
+// ---- PTPv1 (IEEE 1588-2002, UDP) ----
+// Same UDP ports and multicast group as v2, entirely different layout:
+// 40-byte header, and the Sync message itself carries the whole BMCA
+// dataset (there is no Announce). Field offsets verified against the
+// Wireshark dissector. v1 runs on the UTC timescale; we convert to TAI
+// with the telegram's currentUTCOffset (or the configured TAI-UTC when
+// the master doesn't know it).
+
+// 10-byte sender key: EUI-64 from the 6-byte UUID + port id — the same
+// shape the v2 code uses, so the BMCA machinery is shared
+static void v1_sender_key(const uint8_t *uuid, const uint8_t *port,
+                          uint8_t out[10]) {
+    out[0] = uuid[0]; out[1] = uuid[1]; out[2] = uuid[2];
+    out[3] = 0xFF; out[4] = 0xFE;
+    out[5] = uuid[3]; out[6] = uuid[4]; out[7] = uuid[5];
+    out[8] = port[0]; out[9] = port[1];
+}
+
+static int16_t v1_utc_offset(const uint8_t *b) {
+    int16_t off = (int16_t)((b[50] << 8) | b[51]);
+    if (off < 10 || off > 90)             // master doesn't know TAI-UTC
+        off = (int16_t)g_settings.gm_utc_offset;
+    return off;
+}
+
+// Port 319: v1 Sync (control 0). Delay_Req from other slaves is ignored.
+static void process_v1_event(const uint8_t *buf, ssize_t len,
+                             uint64_t now_local) {
+    if (len < 124 || ((buf[0] << 8) | buf[1]) != 1)
+        return;
+    if (buf[32] != 0)                     // controlField: only Sync
+        return;
+    g_cnt_sync++;
+    if (now_local == 0)
+        return;
+
+    // Map the v1 dataset onto the v2 GMInfo so BMCA/UI just work:
+    // stratum -> clockClass, preferred flag -> priority1
+    GMInfo gm;
+    uint8_t gmid[10];
+    v1_sender_key(buf + 54, buf + 60, gmid);
+    memcpy(gm.id, gmid, 8);
+    gm.priority1 = buf[77] ? 0 : 128;     // grandmasterPreferred
+    gm.clock_class = buf[67];             // grandmasterClockStratum
+    gm.clock_accuracy = 0xFE;
+    gm.variance =
+        (uint16_t)((int16_t)((buf[74] << 8) | buf[75]) + 0x8000);
+    gm.priority2 = 128;
+    gm.steps_removed = (uint16_t)((buf[90] << 8) | buf[91]);
+    gm.time_source = !memcmp(buf + 68, "GPS", 3) ? 0x20
+                   : !memcmp(buf + 68, "ATOM", 4) ? 0x10
+                   : !memcmp(buf + 68, "NTP", 3) ? 0x50
+                   : !memcmp(buf + 68, "HAND", 4) ? 0x60 : 0xA0;
+
+    uint8_t sender[10];
+    v1_sender_key(buf + 22, buf + 28, sender);
+
+    // Sync doubles as the announce: refresh the master entry with a
+    // timeout of 3 sync intervals
+    int8_t si = (int8_t)buf[83];
+    if (si < -4) si = -4;
+    if (si > 6) si = 6;
+    uint64_t timeout = (uint64_t)(3e9 * ldexp(1.0, si));
+    if (timeout < 1000000000ULL) timeout = 1000000000ULL;
+    if (timeout > 30000000000ULL) timeout = 30000000000ULL;
+
+    uint64_t now_mono = mono_ns();
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_last_announce_mono_ns = now_mono;
+        if (g_active_domain.load() < 0)
+            g_active_domain = 0;
+        ForeignMaster *fm = nullptr;
+        for (auto &m : g_masters)
+            if (memcmp(m.sender, sender, 10) == 0) {
+                fm = &m;
+                break;
+            }
+        if (!fm) {
+            g_masters.push_back(ForeignMaster{});
+            fm = &g_masters.back();
+            memcpy(fm->sender, sender, 10);
+        }
+        fm->gm = gm;
+        fm->last_seen = now_mono;
+        fm->timeout_ns = timeout;
+        bmca_elect_locked(now_mono);
+        if (g_have_master && memcmp(g_elected_sender, sender, 10) == 0) {
+            g_gm = gm;
+            current_utc_offset = v1_utc_offset(buf);
+        }
+    }
+
+    // Timing: only the elected master (or the GNSS comparison target)
+    if (g_role.load() >= ROLE_GM_PASSIVE) {
+        if (!g_cmp_target_valid.load() ||
+            memcmp(sender, g_cmp_target, 10) != 0)
+            return;
+    } else if (!g_have_master ||
+               memcmp(sender, g_elected_sender, 10) != 0) {
+        return;
+    }
+
+    uint16_t seq = (uint16_t)((buf[30] << 8) | buf[31]);
+    int64_t utc_ns = (int64_t)v1_utc_offset(buf) * 1000000000LL;
+    uint16_t flags = (uint16_t)((buf[34] << 8) | buf[35]);
+    if (flags & 0x0008) {                 // PTP_ASSIST: Follow_Up comes
+        g_pending_sync.valid = true;
+        g_pending_sync.seq = seq;
+        memcpy(g_pending_sync.src, sender, 10);
+        g_pending_sync.t2_mono = now_local;
+        g_pending_sync.corr_ns = utc_ns;  // carries the UTC->TAI shift
+    } else {
+        uint64_t secs = ((uint64_t)((buf[48] << 8) | buf[49]) << 32) |
+                        be_bytes(buf + 40, 4);
+        complete_sync_pair(
+            (int64_t)(secs * 1000000000ULL + be_bytes(buf + 44, 4)) +
+                utc_ns,
+            (int64_t)now_local);
+    }
+}
+
+// Port 320: v1 Follow_Up (control 2) and Delay_Resp (control 3)
+static void process_v1_general(const uint8_t *buf, ssize_t len,
+                               uint64_t now_local) {
+    (void)now_local;
+    if (len < 52 || ((buf[0] << 8) | buf[1]) != 1)
+        return;
+    uint8_t control = buf[32];
+    if (control == 2) {                   // Follow_Up
+        g_cnt_fup++;
+        uint8_t sender[10];
+        v1_sender_key(buf + 22, buf + 28, sender);
+        uint16_t aseq = (uint16_t)((buf[42] << 8) | buf[43]);
+        if (g_pending_sync.valid && g_pending_sync.seq == aseq &&
+            memcmp(g_pending_sync.src, sender, 10) == 0) {
+            int64_t t1 =
+                (int64_t)(be_bytes(buf + 44, 4) * 1000000000ULL +
+                          be_bytes(buf + 48, 4)) +
+                g_pending_sync.corr_ns;
+            complete_sync_pair(t1, (int64_t)g_pending_sync.t2_mono);
+            g_pending_sync.valid = false;
+        }
+    } else if (control == 3 && len >= 60) {   // Delay_Resp
+        g_cnt_dresp++;
+        if (!g_pending_dreq.valid || !g_have_pair)
+            return;
+        uint8_t my_uuid[6] = {g_clock_id[0], g_clock_id[1], g_clock_id[2],
+                              g_clock_id[5], g_clock_id[6], g_clock_id[7]};
+        if (memcmp(buf + 50, my_uuid, 6) != 0)
+            return;                       // not addressed to us
+        uint16_t seq = (uint16_t)((buf[58] << 8) | buf[59]);
+        if (seq != g_pending_dreq.seq)
+            return;
+        int64_t t4 =
+            (int64_t)(be_bytes(buf + 40, 4) * 1000000000ULL +
+                      be_bytes(buf + 44, 4)) +
+            (int64_t)current_utc_offset.load() * 1000000000LL;
+        int64_t t3 = (int64_t)g_pending_dreq.t3_mono;
+        g_pending_dreq.valid = false;
+        int64_t sample = ((g_last_t2 - g_last_t1) + (t4 - t3)) / 2;
+        if (sample < 0)
+            sample = 0;
+        if (sample > 1000000000LL)
+            return;
+        if (!g_have_mpd) {
+            g_mpd_ns = sample;
+            g_have_mpd = true;
+        } else {
+            g_mpd_ns += (sample - g_mpd_ns) / 8;
+        }
+        g_path_delay_ns = g_mpd_ns;
+        g_dresp_received++;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        hist_push(g_hist_del, g_hist_del_n, g_hist_del_i, sample);
+    }
+}
+
+// v1 Delay_Req: a Sync-format 124-byte message with control = 1
+static void build_v1_delay_req(uint8_t *buf, uint16_t seq) {
+    memset(buf, 0, 124);
+    buf[1] = 1;                           // versionPTP
+    buf[3] = 1;                           // versionNetwork
+    memcpy(buf + 4, "_DFLT", 5);          // default subdomain
+    buf[20] = 1;                          // messageType: event
+    buf[21] = 1;                          // sourceCommTech: Ethernet
+    buf[22] = g_clock_id[0]; buf[23] = g_clock_id[1];
+    buf[24] = g_clock_id[2]; buf[25] = g_clock_id[5];
+    buf[26] = g_clock_id[6]; buf[27] = g_clock_id[7];
+    buf[29] = 1;                          // sourcePortId
+    buf[30] = (uint8_t)(seq >> 8);
+    buf[31] = (uint8_t)(seq & 0xFF);
+    buf[32] = 1;                          // control: Delay_Req
+}
+
+// ---- gPTP / IEEE 802.1AS (AVB, Milan) ----
+// v2-format messages in raw Ethernet frames (EtherType 0x88F7, multicast
+// 01:80:C2:00:00:0E, transportSpecific nibble 1). Sync/Follow_Up carry
+// the accumulated link+residence corrections, so a listener only adds
+// its own link delay — measured with the peer-delay mechanism. We answer
+// Pdelay_Req (a silent neighbor is declared !asCapable and cut off) and
+// send our own to measure the local link.
+static const uint8_t kGptpDstMac[6] = {0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E};
+
+struct PendingPdelay {
+    bool valid = false;
+    uint16_t seq = 0;
+    uint64_t t1 = 0;                      // our Pdelay_Req TX time
+    uint64_t t4 = 0;                      // Pdelay_Resp RX time
+    int64_t t2p = 0;                      // peer's requestReceiptTimestamp
+    int64_t corr = 0;                     // Pdelay_Resp correction
+    bool have_resp = false;
+};
+static PendingPdelay g_pending_pd;
+static uint16_t g_pd_seq = 0;
+
+#ifdef __linux__
+static int g_l2_ifindex = 0;              // iface for our own Pdelay_Req
+
+static void l2_membership(const std::string &ifname, bool add) {
+    if (g_l2_sock < 0)
+        return;
+    struct packet_mreq mr{};
+    mr.mr_ifindex = (int)if_nametoindex(ifname.c_str());
+    if (!mr.mr_ifindex)
+        return;
+    mr.mr_type = PACKET_MR_MULTICAST;
+    mr.mr_alen = 6;
+    memcpy(mr.mr_address, kGptpDstMac, 6);
+    setsockopt(g_l2_sock, SOL_PACKET,
+               add ? PACKET_ADD_MEMBERSHIP : PACKET_DROP_MEMBERSHIP,
+               &mr, sizeof(mr));
+    if (add)
+        g_l2_ifindex = mr.mr_ifindex;
+}
+
+static void l2_send(int ifindex, const uint8_t *buf, size_t len) {
+    if (g_l2_sock < 0 || !ifindex)
+        return;
+    struct sockaddr_ll sll{};
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(0x88F7);
+    sll.sll_ifindex = ifindex;
+    sll.sll_halen = 6;
+    memcpy(sll.sll_addr, kGptpDstMac, 6);
+    sendto(g_l2_sock, buf, len, 0, (struct sockaddr *)&sll, sizeof(sll));
+}
+
+// Receive one gPTP frame (SOCK_DGRAM packet socket: payload only) with
+// its local timestamp and arrival interface
+static uint64_t recv_l2_packet(uint8_t *buf, size_t buflen,
+                               ssize_t *len_out, int *ifindex_out) {
+    struct iovec iov{buf, buflen};
+    union { char buf[256]; struct cmsghdr align; } ctrl;
+    struct sockaddr_ll sll{};
+    struct msghdr msg{};
+    msg.msg_name = &sll;
+    msg.msg_namelen = sizeof(sll);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctrl.buf;
+    msg.msg_controllen = sizeof(ctrl.buf);
+    ssize_t len = recvmsg(g_l2_sock, &msg, 0);
+    *len_out = len;
+    *ifindex_out = sll.sll_ifindex;
+    if (len <= 0)
+        return 0;
+    if (!g_hwts)
+        return mono_ns();
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c;
+         c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPING) {
+            struct scm_timestamping tss;
+            memcpy(&tss, CMSG_DATA(c), sizeof(tss));
+            if (tss.ts[2].tv_sec || tss.ts[2].tv_nsec)
+                return (uint64_t)tss.ts[2].tv_sec * 1000000000ULL +
+                       tss.ts[2].tv_nsec;
+        }
+    }
+    return 0;
+}
+#endif
+
+// Dispatch one gPTP frame. Sync/Follow_Up/Announce are plain v2 format
+// and reuse the v2 parsers; the peer-delay messages are handled here.
+static void process_gptp_frame(const uint8_t *buf, ssize_t len,
+                               uint64_t ts, int ifindex) {
+    if (len < 34 || (buf[1] & 0x0F) != 2)
+        return;
+    if ((buf[0] >> 4) != 1)               // transportSpecific: 802.1AS
+        return;
+    uint8_t type = buf[0] & 0x0F;
+    switch (type) {
+    case 0x00:                            // Sync
+        process_event_packet(buf, len, ts);
+        break;
+    case 0x08:                            // Follow_Up (TLV ignored)
+    case 0x0B:                            // Announce
+        process_general_packet(buf, len, mono_ns());
+        break;
+    case 0x02: {                          // Pdelay_Req: answer it
+#ifdef __linux__
+        if (len < 54 || ts == 0 || !ifindex)
+            break;
+        uint8_t resp[54];
+        ptp_master_header(resp, 0x13, 54, 0x0200, 0, 5, 0x7F);
+        memcpy(resp + 30, buf + 30, 2);   // sequenceId
+        put_ptp_ts(resp + 34, (int64_t)ts - offset_at(ts));
+        memcpy(resp + 44, buf + 20, 10);  // requestingPortIdentity
+        if (g_hwts)
+            drain_errqueue(g_l2_sock);
+        uint64_t ta = local_clock_ns();
+        l2_send(ifindex, resp, sizeof(resp));
+        uint64_t tb = local_clock_ns();
+        uint64_t t3 = 0;
+        if (g_hwts)
+            t3 = fetch_tx_timestamp(g_l2_sock);
+        if (!t3)
+            t3 = ta + (tb - ta) / 2;
+        uint8_t fu[54];
+        ptp_master_header(fu, 0x1A, 54, 0, 0, 5, 0x7F);
+        memcpy(fu + 30, buf + 30, 2);
+        put_ptp_ts(fu + 34, (int64_t)t3 - offset_at(t3));
+        memcpy(fu + 44, buf + 20, 10);
+        l2_send(ifindex, fu, sizeof(fu));
+#else
+        (void)ifindex;
+#endif
+        break;
+    }
+    case 0x03:                            // Pdelay_Resp to our request
+        if (len >= 54 && g_pending_pd.valid && ts != 0 &&
+            memcmp(buf + 44, g_clock_id, 8) == 0 &&
+            buf[52] == 0 && buf[53] == 1 &&
+            (uint16_t)((buf[30] << 8) | buf[31]) == g_pending_pd.seq) {
+            g_pending_pd.t4 = ts;
+            g_pending_pd.t2p = (int64_t)ts_to_ns(buf + 34);
+            g_pending_pd.corr = corr_to_ns(buf + 8);
+            g_pending_pd.have_resp = true;
+        }
+        break;
+    case 0x0A:                            // Pdelay_Resp_Follow_Up
+        if (len >= 54 && g_pending_pd.valid && g_pending_pd.have_resp &&
+            memcmp(buf + 44, g_clock_id, 8) == 0 &&
+            buf[52] == 0 && buf[53] == 1 &&
+            (uint16_t)((buf[30] << 8) | buf[31]) == g_pending_pd.seq) {
+            int64_t t3p = (int64_t)ts_to_ns(buf + 34);
+            int64_t d =
+                ((int64_t)(g_pending_pd.t4 - g_pending_pd.t1) -
+                 (t3p - g_pending_pd.t2p) - g_pending_pd.corr -
+                 corr_to_ns(buf + 8)) / 2;
+            g_pending_pd.valid = false;
+            if (d >= 0 && d < 1000000000LL) {
+                if (!g_have_mpd) {
+                    g_mpd_ns = d;
+                    g_have_mpd = true;
+                } else {
+                    g_mpd_ns += (d - g_mpd_ns) / 8;
+                }
+                g_path_delay_ns = g_mpd_ns;
+                g_dresp_received++;
+                g_cnt_dresp++;
+                std::lock_guard<std::mutex> lock(g_mutex);
+                hist_push(g_hist_del, g_hist_del_n, g_hist_del_i, d);
+            }
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 // Add/drop the PTP multicast membership on one interface (both sockets).
 // op is IP_ADD_MEMBERSHIP or IP_DROP_MEMBERSHIP.
 static void membership(int sock_event, int sock_gen, uint32_t ip, int op) {
@@ -1845,6 +2239,7 @@ static std::string settings_json() {
       << "\"notify_gm_change\":" << (g_settings.notify_gm_change ? "true" : "false") << ","
       << "\"domain\":" << g_settings.domain << ","
       << "\"acceptable_gms\":\"" << json_escape(g_settings.acceptable_gms) << "\","
+      << "\"ptp_mode\":\"" << g_settings.ptp_mode << "\","
       << "\"gm_enable\":" << (g_settings.gm_enable ? "true" : "false") << ","
       << "\"gm_master\":" << (g_settings.gm_master ? "true" : "false") << ","
       << "\"gm_serial\":\"" << json_escape(g_settings.gm_serial) << "\","
@@ -1955,6 +2350,7 @@ static std::string status_json() {
       << "\"hwts\":" << (g_hwts ? "true" : "false") << ","
       << "\"hwts_desc\":\"" << json_escape(g_hwts_desc) << "\","
       << "\"role\":" << g_role.load() << ","
+      << "\"ptp_mode\":\"" << g_settings.ptp_mode << "\","
       << "\"gm_enable\":" << (g_settings.gm_enable ? "true" : "false") << ","
       << "\"gm_master\":" << (g_settings.gm_master ? "true" : "false") << ","
       << "\"gnss_lock\":" << (g_gnss_lock ? "true" : "false") << ","
@@ -2074,6 +2470,8 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  .chart-title { color: #aaa; font-size: 0.85em; margin: 0.7em 0 0.2em; }
  .chart-legend { color: #888; font-size: 0.8em; margin: 0.2em 0 0.4em;
         font-family: monospace; }
+ .chart-desc { color: #777; font-size: 0.78em; margin: 0.25em 0 0.9em;
+        line-height: 1.45; }
  .snrwrap { display: flex; align-items: flex-end; gap: 3px; height: 52px;
         margin: 0.3em 0 1.4em; }
  .snrbar { width: 11px; border-radius: 2px 2px 0 0; position: relative; }
@@ -2112,6 +2510,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <legend>Status</legend>
 <table class="status">
  <tr><td>PTP</td><td id="s_ptp">&ndash;</td></tr>
+ <tr><td>Profile</td><td id="s_profile">&ndash;</td></tr>
  <tr><td>Role</td><td id="s_role">&ndash;</td></tr>
  <tr><td>Interface</td><td id="s_iface">&ndash;</td></tr>
  <tr><td>Timestamping</td><td id="s_hwts">&ndash;</td></tr>
@@ -2140,11 +2539,22 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <legend>PTP analysis &nbsp;<a href="/analysis" target="_blank"
  rel="noopener">large view &rarr;</a></legend>
 <div class="chart-legend" id="ts_mode" style="margin:0 0 0.5em">&ndash;</div>
-<div class="chart-title">Sync offset jitter &amp; path delay</div>
-<canvas class="chart" id="ch_off"></canvas>
-<div class="chart-legend"><span style="color:#fd0">&#9632;</span> offset
-deviation per Sync &nbsp;<span style="color:#6cf">&#9632;</span> path delay
-samples</div>
+<div class="chart-title">Sync PDV &mdash; offset deviation per Sync</div>
+<canvas class="chart" id="ch_pdv"></canvas>
+<p class="chart-desc"><span style="color:#fd0">&#9632;</span> How far each
+incoming Sync landed off the servo's prediction: the packet delay
+variation (PDV) of the master&rarr;clock path plus timestamping noise.
+On an idle, PTP-aware network this is a flat band; queueing in ordinary
+switches, CPU load, or software timestamps widen it. The servo averages
+over this noise.</p>
+<div class="chart-title">Path delay</div>
+<canvas class="chart" id="ch_del"></canvas>
+<p class="chart-desc"><span style="color:#6cf">&#9632;</span> Raw mean
+path delay from each Delay_Req/Delay_Resp exchange,
+((t2&minus;t1)+(t4&minus;t3))/2. It should sit at the constant
+cable-and-switch latency: a step means the network path changed, spread
+means queueing &mdash; and any up/down asymmetry biases the clock by half
+of it.</p>
 <div class="chart-title">Received message rates (per second, this domain)</div>
 <canvas class="chart" id="ch_rate"></canvas>
 <div class="chart-legend"><span style="color:#6c6">&#9632;</span> Sync
@@ -2152,12 +2562,21 @@ samples</div>
 &nbsp;<span style="color:#fd0">&#9632;</span> Announce
 &nbsp;<span style="color:#f6c">&#9632;</span> Delay_Resp
 &nbsp;&nbsp;<span id="rate_now"></span></div>
+<p class="chart-desc">Every PTP message received in the active domain
+(all masters, before any filtering). Sync and Follow_Up should run at the
+grandmaster's rate &mdash; a gap between the two lines means lost
+Follow_Ups; Announce is the masters' heartbeat for the BMCA, and
+Delay_Resp answers our one Delay_Req per second.</p>
 <div id="cmp_wrap" style="display:none">
 <div class="chart-title">Network PTP vs GNSS (per Sync of the network
 master)</div>
 <canvas class="chart" id="ch_cmp"></canvas>
 <div class="chart-legend"><span style="color:#f96">&#9632;</span>
 <span id="cmp_info">network master &minus; GNSS</span></div>
+<p class="chart-desc">Each Sync of the network grandmaster measured
+against our GNSS reference (path delay subtracted): the real error of
+the network's time distribution as seen from GPS. Positive = the network
+master is ahead of GNSS.</p>
 </div>
 </fieldset>
 
@@ -2210,6 +2629,17 @@ matrix:</p>
 
 <fieldset>
 <legend>PTP</legend>
+<label>Protocol profile:
+ <select id="ptp_mode">
+  <option value="v2">PTPv2 &mdash; IEEE 1588 over UDP (default)</option>
+  <option value="gptp">gPTP &mdash; IEEE 802.1AS / AVB / Milan (layer 2)</option>
+  <option value="v1">PTPv1 &mdash; IEEE 1588-2002 (legacy)</option>
+ </select>
+</label>
+<p class="hint">gPTP listens on raw Ethernet (EtherType 0x88F7) and uses
+the peer-delay mechanism; PTPv1 shares the UDP ports with v2 but speaks
+the 2002 message format. Domain and grandmaster mode apply to PTPv2
+only.</p>
 <label>
  <input type="checkbox" id="domain_auto" checked> Detect domain automatically
 </label>
@@ -2401,6 +2831,7 @@ async function loadSettings() {
   document.getElementById('domain').value = (s.domain === -1) ? 0 : s.domain;
   syncDomainInput();
   document.getElementById('acceptable_gms').value = s.acceptable_gms;
+  document.getElementById('ptp_mode').value = s.ptp_mode;
   document.getElementById('gm_enable').checked = s.gm_enable;
   document.getElementById('gm_master').checked = s.gm_master;
   document.getElementById('gm_serial').value = s.gm_serial;
@@ -2429,6 +2860,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     domain: document.getElementById('domain_auto').checked
         ? -1 : document.getElementById('domain').value,
     acceptable_gms: document.getElementById('acceptable_gms').value,
+    ptp_mode: document.getElementById('ptp_mode').value,
     gm_enable: document.getElementById('gm_enable').checked ? 1 : 0,
     gm_master: document.getElementById('gm_master').checked ? 1 : 0,
     gm_serial: document.getElementById('gm_serial').value,
@@ -2600,10 +3032,8 @@ function fmtNs(v) {
 async function pollHistory() {
   try {
     const hh = await fetch('/api/history').then(r => r.json());
-    drawChart('ch_off', [
-      {data: hh.offset, color: '#fd0'},
-      {data: hh.delay, color: '#6cf'}
-    ], fmtNs, true);
+    drawChart('ch_pdv', [{data: hh.offset, color: '#fd0'}], fmtNs, true);
+    drawChart('ch_del', [{data: hh.delay, color: '#6cf'}], fmtNs, false);
     drawChart('ch_rate', [
       {data: hh.rates.sync, color: '#6c6'},
       {data: hh.rates.fup, color: '#6cf'},
@@ -2625,7 +3055,7 @@ async function pollHistory() {
 }
 pollHistory();
 setInterval(pollHistory, 2000);
-for (const id of ['ch_off', 'ch_rate', 'ch_cmp'])
+for (const id of ['ch_pdv', 'ch_del', 'ch_rate', 'ch_cmp'])
   document.getElementById(id).onclick =
       () => window.open('/analysis', '_blank');
 
@@ -2662,6 +3092,10 @@ async function poll() {
                           : 'auto (searching...)')
         : s.iface + (s.iface_up ? '' : ' (not connected)'));
     set('s_hwts', s.hwts ? 'hardware (' + s.hwts_desc + ')' : 'software');
+    set('s_profile', s.ptp_mode === 'gptp'
+        ? 'gPTP / 802.1AS (AVB, Milan) — layer 2'
+        : s.ptp_mode === 'v1' ? 'PTPv1 (IEEE 1588-2002)'
+        : 'PTPv2 (IEEE 1588)');
     set('s_role', !s.gm_enable ? 'client'
         : s.role === 3 ? 'GRANDMASTER (GNSS)'
         : s.role === 2 ? (s.gm_master
@@ -2816,28 +3250,50 @@ static const char *kAnalysisHtml = R"ANA(<!DOCTYPE html>
  canvas { width: 100%; height: 34vh; display: block; background: #0a0a0a;
           border: 1px solid #222; border-radius: 4px; }
  .chart-legend { color: #888; font-size: 0.9em; margin: 0.3em 0 0.6em; }
+ .chart-desc { color: #777; font-size: 0.85em; margin: 0.25em 0 0.9em;
+        line-height: 1.5; max-width: 75em; }
 </style>
 </head>
 <body>
 <h1>PTP analysis &nbsp;<a href="/">&larr; settings</a></h1>
 <div id="ts_mode">&ndash;</div>
-<div class="chart-title">Sync offset jitter &amp; path delay</div>
-<canvas id="ch_off"></canvas>
-<div class="chart-legend"><span style="color:#fd0">&#9632;</span> offset
-deviation per Sync &nbsp;<span style="color:#6cf">&#9632;</span> path delay
-samples</div>
+<div class="chart-title">Sync PDV &mdash; offset deviation per Sync</div>
+<canvas id="ch_pdv" style="height:26vh"></canvas>
+<p class="chart-desc"><span style="color:#fd0">&#9632;</span> How far each
+incoming Sync landed off the servo's prediction: the packet delay
+variation (PDV) of the master&rarr;clock path plus timestamping noise.
+On an idle, PTP-aware network this is a flat band; queueing in ordinary
+switches, CPU load, or software timestamps widen it. The servo averages
+over this noise.</p>
+<div class="chart-title">Path delay</div>
+<canvas id="ch_del" style="height:26vh"></canvas>
+<p class="chart-desc"><span style="color:#6cf">&#9632;</span> Raw mean
+path delay from each Delay_Req/Delay_Resp exchange,
+((t2&minus;t1)+(t4&minus;t3))/2. It should sit at the constant
+cable-and-switch latency: a step means the network path changed, spread
+means queueing &mdash; and any up/down asymmetry biases the clock by half
+of it.</p>
 <div class="chart-title">Received message rates (per second, this domain)</div>
-<canvas id="ch_rate"></canvas>
+<canvas id="ch_rate" style="height:26vh"></canvas>
 <div class="chart-legend"><span style="color:#6c6">&#9632;</span> Sync
 &nbsp;<span style="color:#6cf">&#9632;</span> Follow_Up
 &nbsp;<span style="color:#fd0">&#9632;</span> Announce
 &nbsp;<span style="color:#f6c">&#9632;</span> Delay_Resp
 &nbsp;&nbsp;<span id="rate_now"></span></div>
+<p class="chart-desc">Every PTP message received in the active domain
+(all masters, before any filtering). Sync and Follow_Up should run at the
+grandmaster's rate &mdash; a gap between the two lines means lost
+Follow_Ups; Announce is the masters' heartbeat for the BMCA, and
+Delay_Resp answers our one Delay_Req per second.</p>
 <div id="cmp_wrap" style="display:none">
 <div class="chart-title">Network PTP vs GNSS</div>
-<canvas id="ch_cmp"></canvas>
+<canvas id="ch_cmp" style="height:26vh"></canvas>
 <div class="chart-legend"><span style="color:#f96">&#9632;</span>
 network master &minus; GNSS, per Sync &nbsp;<span id="cmp_now"></span></div>
+<p class="chart-desc">Each Sync of the network grandmaster measured
+against our GNSS reference (path delay subtracted): the real error of
+the network's time distribution as seen from GPS. Positive = the network
+master is ahead of GNSS.</p>
 </div>
 <script>
 function drawChart(id, series, fmt, includeZero) {
@@ -2894,10 +3350,8 @@ function fmtNs(v) {
 async function poll() {
   try {
     const hh = await fetch('/api/history').then(r => r.json());
-    drawChart('ch_off', [
-      {data: hh.offset, color: '#fd0'},
-      {data: hh.delay, color: '#6cf'}
-    ], fmtNs, true);
+    drawChart('ch_pdv', [{data: hh.offset, color: '#fd0'}], fmtNs, true);
+    drawChart('ch_del', [{data: hh.delay, color: '#6cf'}], fmtNs, false);
     drawChart('ch_rate', [
       {data: hh.rates.sync, color: '#6c6'},
       {data: hh.rates.fup, color: '#6cf'},
@@ -3329,6 +3783,15 @@ static void handle_client(int fd) {
             if (kv.count("acceptable_gms") &&
                 kv["acceptable_gms"].size() < 4096)
                 g_settings.acceptable_gms = kv["acceptable_gms"];
+            if (kv.count("ptp_mode")) {
+                const std::string &m = kv["ptp_mode"];
+                if ((m == "v2" || m == "gptp" || m == "v1") &&
+                    m != g_settings.ptp_mode) {
+                    g_settings.ptp_mode = m;
+                    g_ptp_mode = ptp_mode_int(m);
+                    g_reset_ptp = true;   // fresh election on the new wire
+                }
+            }
             if (kv.count("gm_enable"))
                 g_settings.gm_enable = (kv["gm_enable"] == "1");
             if (kv.count("gm_master"))
@@ -3416,6 +3879,7 @@ int main(int argc, char **argv) {
         g_settings.iface = env_iface;
     load_settings();
     apply_timezone(g_settings.timezone);
+    g_ptp_mode = ptp_mode_int(g_settings.ptp_mode);
 
     // --- Multicast sockets ---
     int sock_sync = socket(AF_INET, SOCK_DGRAM, 0);
@@ -3444,6 +3908,17 @@ int main(int argc, char **argv) {
             "  sudo setcap cap_net_bind_service+ep ./ptp-clock\n";
         return 1;
     }
+
+#ifdef __linux__
+    // gPTP raw socket (needs CAP_NET_RAW — we are still privileged).
+    // Created regardless of the active profile so switching to gPTP in
+    // the web UI works without a restart.
+    g_l2_sock = socket(AF_PACKET, SOCK_DGRAM, htons(0x88F7));
+    if (g_l2_sock >= 0)
+        fcntl(g_l2_sock, F_SETFL, O_NONBLOCK);
+    else if (g_ptp_mode.load() == MODE_GPTP)
+        std::cerr << "gPTP: cannot open the layer-2 socket\n";
+#endif
 
     // Hardware timestamping setup needs privileges — do it now, before
     // the matrix library drops them
@@ -3557,8 +4032,12 @@ int main(int argc, char **argv) {
             reset_ptp_state();            // e.g. domain changed via web UI
 
         if (g_iface_changed.exchange(false)) {
-            for (const auto &j : joined)
+            for (const auto &j : joined) {
                 membership(sock_sync, sock_general, j.ip, IP_DROP_MEMBERSHIP);
+#ifdef __linux__
+                l2_membership(j.name, false);
+#endif
+            }
             joined.clear();
             identity_set = false;
             g_iface_up = false;
@@ -3593,6 +4072,9 @@ int main(int argc, char **argv) {
                 if (!keep) {
                     membership(sock_sync, sock_general, it->ip,
                                IP_DROP_MEMBERSHIP);
+#ifdef __linux__
+                    l2_membership(it->name, false);
+#endif
                     std::cout << "PTP multicast left on " << it->name << "\n";
                     it = joined.erase(it);
                 } else {
@@ -3611,6 +4093,9 @@ int main(int argc, char **argv) {
                 if (ip == 0)
                     continue;
                 membership(sock_sync, sock_general, ip, IP_ADD_MEMBERSHIP);
+#ifdef __linux__
+                l2_membership(t, true);   // gPTP frames on this iface too
+#endif
                 joined.push_back({t, ip});
                 if (!identity_set) {
                     init_clock_identity(sock_sync, t);
@@ -3644,17 +4129,27 @@ int main(int argc, char **argv) {
         FD_ZERO(&fds);
         FD_SET(sock_sync, &fds);
         FD_SET(sock_general, &fds);
+        int nfds = std::max(sock_sync, sock_general);
+        if (g_l2_sock >= 0) {
+            FD_SET(g_l2_sock, &fds);
+            nfds = std::max(nfds, g_l2_sock);
+        }
 
         struct timeval tv{0, 20000}; // 20 ms
-        select(std::max(sock_sync, sock_general) + 1,
-               &fds, nullptr, nullptr, &tv);
+        select(nfds + 1, &fds, nullptr, nullptr, &tv);
+
+        int mode = g_ptp_mode.load();
 
         // --- SYNC / Delay_Req (port 319) ---
         if (FD_ISSET(sock_sync, &fds)) {
-            uint8_t buf[128];
+            uint8_t buf[160];
             ssize_t len = 0;
             uint64_t ts = recv_event_packet(sock_sync, buf, sizeof(buf), &len);
-            if (len >= 44 && (buf[0] & 0x0F) == 0x01) {
+            if (mode == MODE_V1) {
+                if (len > 0)
+                    process_v1_event(buf, len, ts);
+            } else if (mode == MODE_V2 &&
+                       len >= 44 && (buf[0] & 0x0F) == 0x01) {
                 // Delay_Req from a client: answer when we are the GM
                 if (g_role.load() == ROLE_GM_ACTIVE && (buf[1] & 0x0F) == 2 &&
                     domain_ok(buf[4], false) && ts != 0) {
@@ -3669,18 +4164,34 @@ int main(int argc, char **argv) {
                                (struct sockaddr *)&gen_dst, sizeof(gen_dst));
                     }
                 }
-            } else if (len > 0) {
+            } else if (mode == MODE_V2 && len > 0) {
                 process_event_packet(buf, len, ts);
             }
         }
 
         // --- ANNOUNCE / FOLLOW_UP / DELAY_RESP (port 320) ---
         if (FD_ISSET(sock_general, &fds)) {
-            uint8_t buf[128];
+            uint8_t buf[160];
             ssize_t len = recv(sock_general, buf, sizeof(buf), 0);
-            if (len > 0)
-                process_general_packet(buf, len, mono_ns());
+            if (len > 0) {
+                if (mode == MODE_V1)
+                    process_v1_general(buf, len, mono_ns());
+                else if (mode == MODE_V2)
+                    process_general_packet(buf, len, mono_ns());
+            }
         }
+
+#ifdef __linux__
+        // --- gPTP frames (layer 2, EtherType 0x88F7) ---
+        if (g_l2_sock >= 0 && FD_ISSET(g_l2_sock, &fds)) {
+            uint8_t buf[256];
+            ssize_t len = 0;
+            int ifx = 0;
+            uint64_t ts = recv_l2_packet(buf, sizeof(buf), &len, &ifx);
+            if (len > 0 && mode == MODE_GPTP)
+                process_gptp_frame(buf, len, ts, ifx);
+        }
+#endif
 
         uint64_t now_ns = mono_ns();
 
@@ -3726,8 +4237,10 @@ int main(int argc, char **argv) {
                 role = ROLE_GM_WAIT;
                 // Slave only unless master mode is deliberately enabled:
                 // without gm_master we never enter the BMCA as a
-                // candidate, so we can never win it
-                if ((gnss_ok || holdover) && g_settings.gm_master) {
+                // candidate, so we can never win it. Master mode itself
+                // is PTPv2-only.
+                if ((gnss_ok || holdover) && g_settings.gm_master &&
+                    g_ptp_mode.load() == MODE_V2) {
                     if (g_domain.load() < 0 && g_active_domain.load() < 0) {
                         g_active_domain = 0;   // we define the domain now
                         std::cout << "Grandmaster mode: using domain 0\n";
@@ -3827,54 +4340,88 @@ int main(int argc, char **argv) {
                 g_hist_rate_n++;
         }
 
-        // --- Delay_Req once per second, out of every joined interface
-        //     (only the elected master answers; matched by our identity).
-        //     In GNSS mode it measures the path to the comparison master ---
+        // --- Delay measurement once per second. v2/v1: Delay_Req out of
+        //     every joined interface (only the elected master answers);
+        //     gPTP: Pdelay_Req on the local link. In GNSS mode this
+        //     measures the path to the comparison master ---
         if (g_have_pair && !joined.empty() &&
             (g_role.load() < ROLE_GM_PASSIVE || g_cmp_target_valid.load()) &&
             now_ns - last_dreq_ns >= 1000000000ULL) {
-            uint8_t pkt[44];
-            build_delay_req(pkt, ++g_dreq_seq);
+            last_dreq_ns = now_ns;
 #ifdef __linux__
-            if (g_hwts)
-                drain_errqueue(sock_sync);
-#endif
-            uint64_t t_a = mono_ns();
-            int sent_ok = 0;
-            for (const auto &j : joined) {
-                in_addr mif{};
-                mif.s_addr = j.ip;
-                setsockopt(sock_sync, IPPROTO_IP, IP_MULTICAST_IF,
-                           &mif, sizeof(mif));
-                if (sendto(sock_sync, pkt, sizeof(pkt), 0,
-                           (struct sockaddr*)&dreq_dst,
-                           sizeof(dreq_dst)) == (ssize_t)sizeof(pkt))
-                    sent_ok++;
-            }
-            uint64_t t_b = mono_ns();
-            if (sent_ok > 0) {
-                uint64_t t3 = 0;
-#ifdef __linux__
-                if (g_hwts)
-                    // PHC send time from the error queue; if the NIC gives
-                    // none, skip this round (never mix in software times)
-                    t3 = fetch_tx_timestamp(sock_sync);
-                else
-#endif
-                    t3 = t_a + (t_b - t_a) / 2;
-                if (t3) {
-                    g_pending_dreq.valid = true;
-                    g_pending_dreq.seq = g_dreq_seq;
-                    g_pending_dreq.t3_mono = t3;
+            if (mode == MODE_GPTP) {
+                if (g_l2_sock >= 0 && g_l2_ifindex) {
+                    uint8_t pd[54];
+                    ptp_master_header(pd, 0x12, 54, 0, ++g_pd_seq, 5, 0);
+                    if (g_hwts)
+                        drain_errqueue(g_l2_sock);
+                    uint64_t t_a = local_clock_ns();
+                    l2_send(g_l2_ifindex, pd, sizeof(pd));
+                    uint64_t t_b = local_clock_ns();
+                    uint64_t t1 = 0;
+                    if (g_hwts)
+                        t1 = fetch_tx_timestamp(g_l2_sock);
+                    if (!t1)
+                        t1 = t_a + (t_b - t_a) / 2;
+                    g_pending_pd = PendingPdelay{};
+                    g_pending_pd.valid = true;
+                    g_pending_pd.seq = g_pd_seq;
+                    g_pending_pd.t1 = t1;
                     g_dreq_sent++;
                 }
+            } else
+#endif
+            {
+                uint8_t pkt[124];
+                size_t pkt_len;
+                if (mode == MODE_V1) {
+                    build_v1_delay_req(pkt, ++g_dreq_seq);
+                    pkt_len = 124;
+                } else {
+                    build_delay_req(pkt, ++g_dreq_seq);
+                    pkt_len = 44;
+                }
+#ifdef __linux__
+                if (g_hwts)
+                    drain_errqueue(sock_sync);
+#endif
+                uint64_t t_a = mono_ns();
+                int sent_ok = 0;
+                for (const auto &j : joined) {
+                    in_addr mif{};
+                    mif.s_addr = j.ip;
+                    setsockopt(sock_sync, IPPROTO_IP, IP_MULTICAST_IF,
+                               &mif, sizeof(mif));
+                    if (sendto(sock_sync, pkt, pkt_len, 0,
+                               (struct sockaddr*)&dreq_dst,
+                               sizeof(dreq_dst)) == (ssize_t)pkt_len)
+                        sent_ok++;
+                }
+                uint64_t t_b = mono_ns();
+                if (sent_ok > 0) {
+                    uint64_t t3 = 0;
+#ifdef __linux__
+                    if (g_hwts)
+                        // PHC send time from the error queue; if the NIC
+                        // gives none, skip this round (never mix clocks)
+                        t3 = fetch_tx_timestamp(sock_sync);
+                    else
+#endif
+                        t3 = t_a + (t_b - t_a) / 2;
+                    if (t3) {
+                        g_pending_dreq.valid = true;
+                        g_pending_dreq.seq = g_dreq_seq;
+                        g_pending_dreq.t3_mono = t3;
+                        g_dreq_sent++;
+                    }
+                }
             }
-            last_dreq_ns = now_ns;
         }
 
-        // --- Grandmaster TX: Announce + two-step Sync/Follow_Up at 1 Hz ---
-        if (g_role.load() == ROLE_GM_ACTIVE && !joined.empty() &&
-            now_ns - last_gm_tx_ns >= 1000000000ULL) {
+        // --- Grandmaster TX: Announce + two-step Sync/Follow_Up at 1 Hz
+        //     (PTPv2 only) ---
+        if (g_role.load() == ROLE_GM_ACTIVE && mode == MODE_V2 &&
+            !joined.empty() && now_ns - last_gm_tx_ns >= 1000000000ULL) {
             last_gm_tx_ns = now_ns;
             GMInfo self;
             int16_t utc_off;
