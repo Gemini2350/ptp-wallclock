@@ -343,9 +343,6 @@ static int g_hist_cmp_n = 0, g_hist_cmp_i = 0;
 struct RateSample { uint16_t sync, fup, ann, dresp; uint32_t t_ms; };
 static RateSample g_hist_rate[kHistSlow];      // received msgs per second
 static int g_hist_rate_n = 0, g_hist_rate_i = 0;
-// per-second counters (domain-filtered wire view), reset every second
-static std::atomic<uint32_t> g_cnt_sync{0}, g_cnt_fup{0};
-static std::atomic<uint32_t> g_cnt_ann{0}, g_cnt_dresp{0};
 
 // ---- PTP hardware timestamping (Linux, optional) ----
 // When available, the NIC's PHC becomes the local timing clock: Sync
@@ -444,6 +441,51 @@ static uint64_t local_clock_ns() {
     }
 #endif
     return mono_ns();
+}
+
+// Forward declaration (defined right below)
+static int64_t offset_at(uint64_t t_local);
+
+// Received-message counters, binned on exact PTP seconds. A master
+// sends its 8 Sync/s aligned to ITS second — so an exact PTP-second bin
+// always counts exactly 8, with no tick-phase artifacts (wall-clock
+// bins of ~1.02 s wobbled between 8 and 9). Each message is assigned to
+// the PTP second of its own arrival; completed bins go into the ring as
+// rate * 100. Main thread only; the ring push takes g_mutex.
+static int64_t g_rate_cur_sec = -1;
+static uint32_t g_rate_cur[4] = {0, 0, 0, 0};
+
+static void count_msg(int kind) {
+    uint64_t lc = local_clock_ns();
+    int64_t sec = ((int64_t)lc - offset_at(lc)) / 1000000000LL;
+    if (g_rate_cur_sec < 0) {
+        g_rate_cur_sec = sec;
+    } else if (sec != g_rate_cur_sec) {
+        int64_t gap = sec - g_rate_cur_sec;
+        if (gap < 0 || gap > 10) {
+            // The clock stepped (first sync, master change): restart
+            g_rate_cur_sec = sec;
+            memset(g_rate_cur, 0, sizeof(g_rate_cur));
+        } else {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            uint32_t now_ms = (uint32_t)(mono_ns() / 1000000ULL);
+            for (int64_t s2 = g_rate_cur_sec; s2 < sec; ++s2) {
+                auto c100 = [](uint32_t n) {
+                    return (uint16_t)std::min<uint32_t>(65535, n * 100);
+                };
+                g_hist_rate[g_hist_rate_i] = {
+                    c100(g_rate_cur[0]), c100(g_rate_cur[1]),
+                    c100(g_rate_cur[2]), c100(g_rate_cur[3]),
+                    now_ms - (uint32_t)((sec - 1 - s2) * 1000)};
+                g_hist_rate_i = (g_hist_rate_i + 1) % kHistSlow;
+                if (g_hist_rate_n < kHistSlow)
+                    g_hist_rate_n++;
+                memset(g_rate_cur, 0, sizeof(g_rate_cur));
+            }
+            g_rate_cur_sec = sec;
+        }
+    }
+    g_rate_cur[kind]++;
 }
 
 // Servo readout: offset of the local timing clock vs master TAI at local
@@ -1050,7 +1092,7 @@ static void process_event_packet(const uint8_t *buf, ssize_t len,
     uint8_t msg_type = buf[0] & 0x0F;
     if (msg_type != 0x00)                 // only Sync
         return;
-    g_cnt_sync++;
+    count_msg(0);
 
     // Hardware mode: a Sync without a hardware timestamp (arrived on a
     // non-PHC interface) is useless for timing
@@ -1096,7 +1138,7 @@ static void process_general_packet(const uint8_t *buf, ssize_t len,
 
     // --- Announce (0x0B): feed the BMCA master list ---
     if (msg_type == 0x0B && len >= 64) {
-        g_cnt_ann++;
+        count_msg(2);
         g_last_announce_mono_ns = now_mono;
 
         GMInfo gm;
@@ -1147,7 +1189,7 @@ static void process_general_packet(const uint8_t *buf, ssize_t len,
     }
     // --- Follow_Up (0x08): precise origin timestamp (t1) ---
     else if (msg_type == 0x08) {
-        g_cnt_fup++;
+        count_msg(1);
         uint16_t seq = (buf[30] << 8) | buf[31];
         if (g_pending_sync.valid && g_pending_sync.seq == seq &&
             memcmp(g_pending_sync.src, buf + 20, 10) == 0) {
@@ -1159,7 +1201,7 @@ static void process_general_packet(const uint8_t *buf, ssize_t len,
     }
     // --- Delay_Resp (0x09): t4 for our Delay_Req ---
     else if (msg_type == 0x09 && len >= 54) {
-        g_cnt_dresp++;
+        count_msg(3);
         if (!g_pending_dreq.valid || !g_have_pair)
             return;
         if (memcmp(buf + 44, g_clock_id, 8) != 0 ||
@@ -1856,7 +1898,7 @@ static void process_v1_event(const uint8_t *buf, ssize_t len,
         return;
     if (buf[32] != 0)                     // controlField: only Sync
         return;
-    g_cnt_sync++;
+    count_msg(0);
     if (now_local == 0)
         return;
 
@@ -1954,7 +1996,7 @@ static void process_v1_general(const uint8_t *buf, ssize_t len,
         return;
     uint8_t control = buf[32];
     if (control == 2) {                   // Follow_Up
-        g_cnt_fup++;
+        count_msg(1);
         uint8_t sender[10];
         v1_sender_key(buf + 22, buf + 28, sender);
         uint16_t aseq = (uint16_t)((buf[42] << 8) | buf[43]);
@@ -1968,7 +2010,7 @@ static void process_v1_general(const uint8_t *buf, ssize_t len,
             g_pending_sync.valid = false;
         }
     } else if (control == 3 && len >= 60) {   // Delay_Resp
-        g_cnt_dresp++;
+        count_msg(3);
         if (!g_pending_dreq.valid || !g_have_pair)
             return;
         uint8_t my_uuid[6] = {g_clock_id[0], g_clock_id[1], g_clock_id[2],
@@ -2194,7 +2236,7 @@ static void process_gptp_frame(const uint8_t *buf, ssize_t len,
                 }
                 g_path_delay_ns = g_mpd_ns;
                 g_dresp_received++;
-                g_cnt_dresp++;
+                count_msg(3);
                 std::lock_guard<std::mutex> lock(g_mutex);
                 hist_push(g_hist_del, kHistSlow, g_hist_del_n, g_hist_del_i, d);
             }
@@ -4359,13 +4401,9 @@ int main(int argc, char **argv) {
             }
         }
 
-        // --- BMCA housekeeping + per-second analysis tick ---
+        // --- BMCA housekeeping tick (message rates are binned on PTP
+        //     seconds in count_msg, not here) ---
         if (now_ns - last_bmca_ns >= 1000000000ULL) {
-            // The tick fires on a ~20 ms grid, so a "second" bin is
-            // 1 s +- a few % — remember its true length to normalize
-            // the message rates (a switch sending exactly 8 Sync/s must
-            // not read as 7..9)
-            uint64_t bin_ns = last_bmca_ns ? now_ns - last_bmca_ns : 0;
             last_bmca_ns = now_ns;
             std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -4473,24 +4511,6 @@ int main(int argc, char **argv) {
             g_role = role;
             g_gnss_lock = gnss_ok;
 
-            uint32_t cnt[4] = {g_cnt_sync.exchange(0),
-                               g_cnt_fup.exchange(0),
-                               g_cnt_ann.exchange(0),
-                               g_cnt_dresp.exchange(0)};
-            if (bin_ns >= 500000000ULL && bin_ns <= 5000000000ULL) {
-                // Store rates in 1/100 per second, normalized to the
-                // real bin length
-                auto cr = [&](uint32_t n) {
-                    uint64_t r = (uint64_t)n * 100000000000ULL / bin_ns;
-                    return (uint16_t)std::min<uint64_t>(65535, r);
-                };
-                g_hist_rate[g_hist_rate_i] = {
-                    cr(cnt[0]), cr(cnt[1]), cr(cnt[2]), cr(cnt[3]),
-                    (uint32_t)(now_ns / 1000000ULL)};
-                g_hist_rate_i = (g_hist_rate_i + 1) % kHistSlow;
-                if (g_hist_rate_n < kHistSlow)
-                    g_hist_rate_n++;
-            }
         }
 
         // --- Delay measurement once per second. v2/v1: Delay_Req out of
