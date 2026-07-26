@@ -3946,7 +3946,7 @@ static void http_server_thread(int port) {
     close(listen_fd);
 }
 
-int main(int argc, char **argv) {
+int ptp_unused_main(int argc, char **argv) {
     (void)argc; (void)argv;
     // Under systemd stdout is a block-buffered pipe — without this the
     // startup messages only reach journald when the process exits
