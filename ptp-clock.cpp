@@ -137,7 +137,7 @@ struct ClockEntry {
 };
 
 static const char *kStyles[] = {"24h", "12h", "unix", "bcd", "flip",
-                                "dcf77", "graph", "rates"};
+                                "dcf77", "pdv", "delay"};
 
 static bool style_valid(const std::string &st) {
     for (const char *k : kStyles)
@@ -187,6 +187,8 @@ static std::vector<ClockEntry> clocks_parse(const std::string &in,
         if (e.zone.empty() || e.zone.size() > 48)
             e.zone = "UTC";
         e.style = item.substr(c1 + 1, c2 - c1 - 1);
+        if (e.style == "graph" || e.style == "rates")
+            e.style = "pdv";              // pre-split chart styles
         if (!style_valid(e.style))
             e.style = "24h";
         e.name = item.substr(c2 + 1);
@@ -320,6 +322,7 @@ static std::atomic<int> g_domain{-1};          // configured, -1 = auto
 static std::atomic<int> g_active_domain{-1};   // detected in auto mode
 static std::atomic<unsigned long long> g_last_announce_mono_ns{0};
 static std::atomic<bool> g_reset_ptp{false};   // web thread requests state reset
+static std::atomic<bool> g_hist_reset{false};  // web thread: clear the charts
 static std::atomic<bool> g_iface_changed{false};  // web thread changed iface
 static std::atomic<bool> g_iface_up{false};    // multicast currently joined
 
@@ -2597,7 +2600,8 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 
 <fieldset>
 <legend>PTP analysis &nbsp;<a href="/analysis" target="_blank"
- rel="noopener">large view &rarr;</a></legend>
+ rel="noopener">large view &rarr;</a> &nbsp;&middot;&nbsp;
+ <a href="#" id="hist_reset">reset</a></legend>
 <div class="chart-legend" id="ts_mode" style="margin:0 0 0.2em">&ndash;</div>
 <div class="chart-legend" style="margin:0 0 0.5em">All charts show the
 last 5 minutes; grid lines mark one minute.</div>
@@ -2808,7 +2812,7 @@ document.getElementById('domain_auto').addEventListener('change', syncDomainInpu
 const STYLES = [['24h', 'digital 24h'], ['12h', 'digital 12h (AM/PM)'],
   ['unix', 'Unix timestamp'], ['bcd', 'binary (BCD)'],
   ['flip', 'flip clock'], ['dcf77', 'DCF77 telegram'],
-  ['graph', 'PTP graph (jitter/delay)'], ['rates', 'PTP message rates']];
+  ['pdv', 'Sync PDV graph'], ['delay', 'path delay graph']];
 const ZONES = ['UTC', 'TAI', 'Europe/Berlin', 'Europe/Zurich',
   'Europe/Vienna', 'Europe/London', 'Europe/Paris', 'Europe/Moscow',
   'America/New_York', 'America/Chicago', 'America/Denver',
@@ -3128,6 +3132,11 @@ setInterval(pollHistory, 2000);
 for (const id of ['ch_pdv', 'ch_del', 'ch_rate', 'ch_cmp'])
   document.getElementById(id).onclick =
       () => window.open('/analysis', '_blank');
+document.getElementById('hist_reset').onclick = async (e) => {
+  e.preventDefault();
+  await fetch('/api/reset_history', { method: 'POST' });
+  setTimeout(pollHistory, 200);
+};
 
 const set = (id, text) => document.getElementById(id).textContent = text;
 function fmtOff(ns) {
@@ -3325,7 +3334,8 @@ static const char *kAnalysisHtml = R"ANA(<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>PTP analysis &nbsp;<a href="/">&larr; settings</a></h1>
+<h1>PTP analysis &nbsp;<a href="/">&larr; settings</a>
+&nbsp;<a href="#" id="hist_reset">reset</a></h1>
 <div id="ts_mode">&ndash;</div>
 <div class="chart-legend">All charts show the last 5 minutes; grid lines
 mark one minute.</div>
@@ -3465,6 +3475,11 @@ async function poll() {
 poll();
 setInterval(poll, 2000);
 window.addEventListener('resize', poll);
+document.getElementById('hist_reset').onclick = async (e) => {
+  e.preventDefault();
+  await fetch('/api/reset_history', { method: 'POST' });
+  setTimeout(poll, 200);
+};
 </script>
 </body>
 </html>
@@ -3785,6 +3800,9 @@ static void handle_client(int fd) {
         send_response(fd, "200 OK", "application/json", status_json());
     } else if (method == "GET" && path == "/api/history") {
         send_response(fd, "200 OK", "application/json", history_json());
+    } else if (method == "POST" && path == "/api/reset_history") {
+        g_hist_reset = true;              // main loop clears the rings
+        send_response(fd, "200 OK", "application/json", "{\"ok\":true}");
     } else if (method == "POST" && path == "/api/settings") {
         auto kv = parse_form(body);
         {
@@ -4110,6 +4128,18 @@ int main(int argc, char **argv) {
 
         if (g_reset_ptp.exchange(false))
             reset_ptp_state();            // e.g. domain changed via web UI
+
+        if (g_hist_reset.exchange(false)) {
+            // Chart reset from the web UI: empty the analysis rings and
+            // restart the PTP-vs-GNSS statistics
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_hist_off_n = g_hist_off_i = 0;
+            g_hist_del_n = g_hist_del_i = 0;
+            g_hist_cmp_n = g_hist_cmp_i = 0;
+            g_hist_rate_n = g_hist_rate_i = 0;
+            g_cmp_have = false;
+            g_cmp_count = 0;
+        }
 
         if (g_iface_changed.exchange(false)) {
             for (const auto &j : joined) {
@@ -4558,15 +4588,13 @@ int main(int argc, char **argv) {
         // ages in seconds) for the graph styles
         int32_t hoff[kHistFast], hdel[kHistSlow];
         uint16_t hoff_age[kHistFast], hdel_age[kHistSlow];
-        uint16_t hrate[4][kHistSlow];
-        uint16_t hrate_age[kHistSlow];
-        int hoff_n = 0, hdel_n = 0, hrate_n = 0;
+        int hoff_n = 0, hdel_n = 0;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             s = g_settings;
             bool want_hist = false;
             for (const auto &ce : s.clocks)
-                if (ce.style == "graph" || ce.style == "rates")
+                if (ce.style == "pdv" || ce.style == "delay")
                     want_hist = true;
             if (want_hist) {
                 uint32_t led_now_ms = (uint32_t)(mono_ns() / 1000000ULL);
@@ -4589,19 +4617,6 @@ int main(int argc, char **argv) {
                             g_hist_off_i, hoff, hoff_age);
                 hdel_n = cp(g_hist_del, kHistSlow, g_hist_del_n,
                             g_hist_del_i, hdel, hdel_age);
-                for (int k = 0; k < g_hist_rate_n; ++k) {
-                    int idx = (g_hist_rate_i - g_hist_rate_n + k +
-                               2 * kHistSlow) % kHistSlow;
-                    const RateSample &r = g_hist_rate[idx];
-                    uint32_t age = (uint32_t)(led_now_ms - r.t_ms) / 1000;
-                    if (age > 300)
-                        continue;
-                    hrate[0][hrate_n] = r.sync;
-                    hrate[1][hrate_n] = r.fup;
-                    hrate[2][hrate_n] = r.ann;
-                    hrate[3][hrate_n] = r.dresp;
-                    hrate_age[hrate_n++] = (uint16_t)age;
-                }
             }
             gm_unaccepted = g_have_gm && !gm_acceptable_locked();
             if (g_have_gm) {
@@ -4946,49 +4961,34 @@ int main(int argc, char **argv) {
                     for (int dx = 0; dx < 3; ++dx)
                         cv->SetPixel(cx + dx, cy + 2 - dy, cc.r, cc.g, cc.b);
             }
-        } else if (style == "graph" || style == "rates") {
-            // PTP analysis on the matrix — same data as the web charts.
-            // "graph" plots the offset deviation per Sync plus the path
-            // delay samples, "rates" the received messages per second.
-            struct Series {
-                const int32_t *v;
-                const uint16_t *age;
-                int n;
-                Color col;
-            };
-            int32_t r32[4][kHistSlow];
-            std::vector<Series> series;
-            if (style == "graph") {
-                series.push_back({hdel, hdel_age, hdel_n,
-                                  Color(40, 140, 255)});
-                series.push_back({hoff, hoff_age, hoff_n, c_main});
-            } else {
-                const Color rc[4] = {Color(60, 220, 100),
-                                     Color(80, 190, 255),
-                                     Color(255, 210, 0),
-                                     Color(255, 90, 190)};
-                for (int f = 0; f < 4; ++f) {
-                    for (int k = 0; k < hrate_n; ++k)
-                        r32[f][k] = hrate[f][k];
-                    series.push_back({r32[f], hrate_age, hrate_n, rc[f]});
-                }
-            }
-            std::vector<int32_t> all;
-            for (const auto &sr : series)
-                all.insert(all.end(), sr.v, sr.v + sr.n);
+        } else if (style == "pdv" || style == "delay") {
+            // PTP analysis on the matrix — same data and 5-minute time
+            // axis as the web charts. "pdv" plots the offset deviation
+            // per Sync (zero-centered), "delay" the raw path delay
+            // samples (scaled around the data).
+            bool is_pdv = style == "pdv";
+            const int32_t *sv = is_pdv ? hoff : hdel;
+            const uint16_t *sage = is_pdv ? hoff_age : hdel_age;
+            int sn = is_pdv ? hoff_n : hdel_n;
+            Color scol = is_pdv ? c_main : Color(40, 140, 255);
+            std::vector<int32_t> all(sv, sv + sn);
             if ((int)all.size() < 2) {
                 if (have_small_font)
                     draw_center(small_font, "COLLECTING...",
                                 band_h / 2 + 3, c_dim);
             } else {
-                // Robust autoscale like the web charts: percentiles with
-                // zero included, outliers clip at the band edge
+                // Robust autoscale like the web charts: percentiles,
+                // outliers clip at the band edge. PDV is zero-centered,
+                // the delay chart scales around its data.
                 std::sort(all.begin(), all.end());
                 auto q = [&](double f) {
                     return (int64_t)all[(size_t)(f * (all.size() - 1))];
                 };
-                int64_t mn = std::min<int64_t>(q(0.03), 0);
-                int64_t mx = std::max<int64_t>(q(0.97), 0);
+                int64_t mn = q(0.03), mx = q(0.97);
+                if (is_pdv) {
+                    mn = std::min<int64_t>(mn, 0);
+                    mx = std::max<int64_t>(mx, 0);
+                }
                 if (mx == mn) { mx += 1; mn -= 1; }
                 int64_t margin = (mx - mn) * 12 / 100;
                 int64_t lo = mn - margin, hi = mx + margin;
@@ -5009,9 +5009,11 @@ int main(int argc, char **argv) {
                     return (int)((int64_t)(band_h - 1) -
                                  (v - lo) * (band_h - 1) / (hi - lo));
                 };
-                int yz = ypix(0);
-                for (int x = 0; x < W; ++x)
-                    cv->SetPixel(x, yz, c_dim.r, c_dim.g, c_dim.b);
+                if (is_pdv) {             // zero line
+                    int yz = ypix(0);
+                    for (int x = 0; x < W; ++x)
+                        cv->SetPixel(x, yz, c_dim.r, c_dim.g, c_dim.b);
+                }
                 // Connected polyline segment between two chart points
                 auto seg = [&](int x0, int y0, int x1, int y1,
                                const Color &col) {
@@ -5031,18 +5033,16 @@ int main(int argc, char **argv) {
                         prev = cy;
                     }
                 };
-                for (const auto &sr : series) {
-                    int px = -1, py = -1;
-                    for (int k = 0; k < sr.n; ++k) {
-                        int x = xpos(sr.age[k]);
-                        int y = ypix(sr.v[k]);
-                        if (px < 0)
-                            seg(x, y, x, y, sr.col);
-                        else
-                            seg(px, py, x, y, sr.col);
-                        px = x;
-                        py = y;
-                    }
+                int px = -1, py = -1;
+                for (int k = 0; k < sn; ++k) {
+                    int x = xpos(sage[k]);
+                    int y = ypix(sv[k]);
+                    if (px < 0)
+                        seg(x, y, x, y, scol);
+                    else
+                        seg(px, py, x, y, scol);
+                    px = x;
+                    py = y;
                 }
                 // Scale labels, scope-style on a black backing
                 if (have_small_font) {
@@ -5058,15 +5058,10 @@ int main(int argc, char **argv) {
                                  nullptr, txt, 1);
                     };
                     char lab[12];
-                    if (style == "rates") {
-                        snprintf(lab, sizeof(lab), "%d/s", (int)mx);
-                        scale_label(lab, true);
-                    } else {
-                        format_compact_ns(lab, sizeof(lab), mx);
-                        scale_label(lab, true);
-                        format_compact_ns(lab, sizeof(lab), mn);
-                        scale_label(lab, false);
-                    }
+                    format_compact_ns(lab, sizeof(lab), mx);
+                    scale_label(lab, true);
+                    format_compact_ns(lab, sizeof(lab), mn);
+                    scale_label(lab, false);
                 }
             }
         } else {
