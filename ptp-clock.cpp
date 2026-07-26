@@ -137,7 +137,7 @@ struct ClockEntry {
 };
 
 static const char *kStyles[] = {"24h", "12h", "unix", "bcd", "flip",
-                                "dcf77", "pdv", "delay"};
+                                "dcf77", "stats"};
 
 static bool style_valid(const std::string &st) {
     for (const char *k : kStyles)
@@ -187,8 +187,9 @@ static std::vector<ClockEntry> clocks_parse(const std::string &in,
         if (e.zone.empty() || e.zone.size() > 48)
             e.zone = "UTC";
         e.style = item.substr(c1 + 1, c2 - c1 - 1);
-        if (e.style == "graph" || e.style == "rates")
-            e.style = "pdv";              // pre-split chart styles
+        if (e.style == "graph" || e.style == "rates" ||
+            e.style == "pdv" || e.style == "delay")
+            e.style = "stats";            // former LED chart styles
         if (!style_valid(e.style))
             e.style = "24h";
         e.name = item.substr(c2 + 1);
@@ -943,7 +944,7 @@ static void format_compact_ns(char *out, size_t n, int64_t ns) {
         snprintf(out, n, "%+.1fs", (double)ns / 1e9);
     else if (a >= 1000000LL)
         snprintf(out, n, "%+.1fm", (double)ns / 1e6);
-    else if (a >= 10000LL)
+    else if (a >= 100000LL)
         snprintf(out, n, "%+du", (int)(ns / 1000));
     else if (a >= 1000LL)
         snprintf(out, n, "%+.1fu", (double)ns / 1e3);
@@ -2812,7 +2813,7 @@ document.getElementById('domain_auto').addEventListener('change', syncDomainInpu
 const STYLES = [['24h', 'digital 24h'], ['12h', 'digital 12h (AM/PM)'],
   ['unix', 'Unix timestamp'], ['bcd', 'binary (BCD)'],
   ['flip', 'flip clock'], ['dcf77', 'DCF77 telegram'],
-  ['pdv', 'Sync PDV graph'], ['delay', 'path delay graph']];
+  ['stats', 'PTP stats (delay/jitter/rates)']];
 const ZONES = ['UTC', 'TAI', 'Europe/Berlin', 'Europe/Zurich',
   'Europe/Vienna', 'Europe/London', 'Europe/Paris', 'Europe/Moscow',
   'America/New_York', 'America/Chicago', 'America/Denver',
@@ -4584,39 +4585,37 @@ int main(int argc, char **argv) {
         std::string id_line, detail_line;
         bool gm_recent_change = false;
         bool gm_unaccepted = false;
-        // Analysis history copies (oldest first, window-filtered, with
-        // ages in seconds) for the graph styles
-        int32_t hoff[kHistFast], hdel[kHistSlow];
-        uint16_t hoff_age[kHistFast], hdel_age[kHistSlow];
-        int hoff_n = 0, hdel_n = 0;
+        // For the stats style: last minute of PDV samples (jitter RMS)
+        // and the most recent per-second message counts
+        int32_t hoff[kHistFast];
+        int hoff_n = 0;
+        uint16_t rate_now[4] = {0, 0, 0, 0};
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             s = g_settings;
             bool want_hist = false;
             for (const auto &ce : s.clocks)
-                if (ce.style == "pdv" || ce.style == "delay")
+                if (ce.style == "stats")
                     want_hist = true;
             if (want_hist) {
                 uint32_t led_now_ms = (uint32_t)(mono_ns() / 1000000ULL);
-                auto cp = [&](const HistPoint *buf, int cap, int n, int i,
-                              int32_t *dst, uint16_t *dage) {
-                    int out = 0;
-                    for (int k = 0; k < n; ++k) {
-                        const HistPoint &p =
-                            buf[(i - n + k + 2 * cap) % cap];
-                        uint32_t age = (uint32_t)(led_now_ms - p.t_ms)
-                                       / 1000;
-                        if (age > 300)
-                            continue;
-                        dst[out] = p.v;
-                        dage[out++] = (uint16_t)age;
-                    }
-                    return out;
-                };
-                hoff_n = cp(g_hist_off, kHistFast, g_hist_off_n,
-                            g_hist_off_i, hoff, hoff_age);
-                hdel_n = cp(g_hist_del, kHistSlow, g_hist_del_n,
-                            g_hist_del_i, hdel, hdel_age);
+                for (int k = 0; k < g_hist_off_n; ++k) {
+                    const HistPoint &p =
+                        g_hist_off[(g_hist_off_i - g_hist_off_n + k +
+                                    2 * kHistFast) % kHistFast];
+                    if ((uint32_t)(led_now_ms - p.t_ms) > 60000)
+                        continue;         // jitter over the last minute
+                    hoff[hoff_n++] = p.v;
+                }
+                if (g_hist_rate_n) {
+                    const RateSample &r =
+                        g_hist_rate[(g_hist_rate_i - 1 + kHistSlow) %
+                                    kHistSlow];
+                    rate_now[0] = r.sync;
+                    rate_now[1] = r.fup;
+                    rate_now[2] = r.ann;
+                    rate_now[3] = r.dresp;
+                }
             }
             gm_unaccepted = g_have_gm && !gm_acceptable_locked();
             if (g_have_gm) {
@@ -4961,108 +4960,51 @@ int main(int argc, char **argv) {
                     for (int dx = 0; dx < 3; ++dx)
                         cv->SetPixel(cx + dx, cy + 2 - dy, cc.r, cc.g, cc.b);
             }
-        } else if (style == "pdv" || style == "delay") {
-            // PTP analysis on the matrix — same data and 5-minute time
-            // axis as the web charts. "pdv" plots the offset deviation
-            // per Sync (zero-centered), "delay" the raw path delay
-            // samples (scaled around the data).
-            bool is_pdv = style == "pdv";
-            const int32_t *sv = is_pdv ? hoff : hdel;
-            const uint16_t *sage = is_pdv ? hoff_age : hdel_age;
-            int sn = is_pdv ? hoff_n : hdel_n;
-            Color scol = is_pdv ? c_main : Color(40, 140, 255);
-            std::vector<int32_t> all(sv, sv + sn);
-            if ((int)all.size() < 2) {
-                if (have_small_font)
-                    draw_center(small_font, "COLLECTING...",
-                                band_h / 2 + 3, c_dim);
-            } else {
-                // Robust autoscale like the web charts: percentiles,
-                // outliers clip at the band edge. PDV is zero-centered,
-                // the delay chart scales around its data.
-                std::sort(all.begin(), all.end());
-                auto q = [&](double f) {
-                    return (int64_t)all[(size_t)(f * (all.size() - 1))];
-                };
-                int64_t mn = q(0.03), mx = q(0.97);
-                if (is_pdv) {
-                    mn = std::min<int64_t>(mn, 0);
-                    mx = std::max<int64_t>(mx, 0);
+        } else if (style == "stats") {
+            // Numeric PTP view — the honest alternative to a 128x32
+            // chart: smoothed path delay, sync jitter (RMS of the last
+            // minute of PDV samples) and the received message rates
+            char pd_s[12] = "-", jt_s[12] = "-";
+            if (g_have_mpd) {
+                char tmp[12];
+                format_compact_ns(tmp, sizeof(tmp), g_mpd_ns);
+                snprintf(pd_s, sizeof(pd_s), "%s",
+                         tmp[0] == '+' ? tmp + 1 : tmp);
+            }
+            if (hoff_n >= 3) {
+                double acc = 0;
+                for (int k = 0; k < hoff_n; ++k)
+                    acc += (double)hoff[k] * (double)hoff[k];
+                char tmp[12];
+                format_compact_ns(tmp, sizeof(tmp),
+                                  (int64_t)sqrt(acc / hoff_n));
+                snprintf(jt_s, sizeof(jt_s), "%s",
+                         tmp[0] == '+' ? tmp + 1 : tmp);
+            }
+            if (have_small_font) {
+                char rows_txt[3][28];
+                int rows;
+                if (band_h >= 18) {
+                    rows = 3;
+                    snprintf(rows_txt[0], sizeof(rows_txt[0]),
+                             "DELAY %s", pd_s);
+                    snprintf(rows_txt[1], sizeof(rows_txt[1]),
+                             "JITTER %s", jt_s);
+                    snprintf(rows_txt[2], sizeof(rows_txt[2]),
+                             "MSG %u/%u/%u/%u", rate_now[0], rate_now[1],
+                             rate_now[2], rate_now[3]);
+                } else {
+                    rows = 2;
+                    snprintf(rows_txt[0], sizeof(rows_txt[0]),
+                             "D %s J %s", pd_s, jt_s);
+                    snprintf(rows_txt[1], sizeof(rows_txt[1]),
+                             "MSG %u/%u/%u/%u", rate_now[0], rate_now[1],
+                             rate_now[2], rate_now[3]);
                 }
-                if (mx == mn) { mx += 1; mn -= 1; }
-                int64_t margin = (mx - mn) * 12 / 100;
-                int64_t lo = mn - margin, hi = mx + margin;
-                int W = matrix_options.cols;
-                // Same time axis as the web charts: 5 minutes, newest
-                // at the right edge, one faint grid line per minute
-                auto xpos = [&](int age) {
-                    return (W - 1) - age * (W - 1) / 300;
-                };
-                for (int m = 1; m < 5; ++m) {
-                    int gx = xpos(m * 60);
-                    for (int yy = 0; yy < band_h; ++yy)
-                        cv->SetPixel(gx, yy, 16, 16, 20);
-                }
-                auto ypix = [&](int64_t v) {
-                    if (v < lo) v = lo;
-                    if (v > hi) v = hi;
-                    return (int)((int64_t)(band_h - 1) -
-                                 (v - lo) * (band_h - 1) / (hi - lo));
-                };
-                if (is_pdv) {             // zero line
-                    int yz = ypix(0);
-                    for (int x = 0; x < W; ++x)
-                        cv->SetPixel(x, yz, c_dim.r, c_dim.g, c_dim.b);
-                }
-                // Connected polyline segment between two chart points
-                auto seg = [&](int x0, int y0, int x1, int y1,
-                               const Color &col) {
-                    if (x1 <= x0) {
-                        int a = std::min(y0, y1), b = std::max(y0, y1);
-                        for (int yy = a; yy <= b; ++yy)
-                            cv->SetPixel(x1, yy, col.r, col.g, col.b);
-                        return;
-                    }
-                    int prev = y0;
-                    for (int cx = x0 + 1; cx <= x1; ++cx) {
-                        int cy = y0 + (int)((int64_t)(y1 - y0) *
-                                            (cx - x0) / (x1 - x0));
-                        int a = std::min(prev, cy), b = std::max(prev, cy);
-                        for (int yy = a; yy <= b; ++yy)
-                            cv->SetPixel(cx, yy, col.r, col.g, col.b);
-                        prev = cy;
-                    }
-                };
-                int px = -1, py = -1;
-                for (int k = 0; k < sn; ++k) {
-                    int x = xpos(sage[k]);
-                    int y = ypix(sv[k]);
-                    if (px < 0)
-                        seg(x, y, x, y, scol);
-                    else
-                        seg(px, py, x, y, scol);
-                    px = x;
-                    py = y;
-                }
-                // Scale labels, scope-style on a black backing
-                if (have_small_font) {
-                    auto scale_label = [&](const char *txt, bool top) {
-                        int wl = (small_font.CharacterWidth('0') + 1) *
-                                 (int)strlen(txt) - 1;
-                        int y0 = top ? 0 : band_h - 6;
-                        for (int yy = y0; yy < y0 + 6; ++yy)
-                            for (int xx = 0; xx <= wl + 1; ++xx)
-                                cv->SetPixel(xx, yy, 0, 0, 0);
-                        DrawText(cv, small_font, 0, y0 + 5,
-                                 Color(s.r / 2, s.g / 2, s.b / 2),
-                                 nullptr, txt, 1);
-                    };
-                    char lab[12];
-                    format_compact_ns(lab, sizeof(lab), mx);
-                    scale_label(lab, true);
-                    format_compact_ns(lab, sizeof(lab), mn);
-                    scale_label(lab, false);
-                }
+                int step = band_h / rows;
+                for (int i = 0; i < rows; ++i)
+                    draw_center(small_font, rows_txt[i],
+                                i * step + (step - 6) / 2 + 5, c_main);
             }
         } else {
             // Digital 24h (default) / 12h — always all nine fractional
