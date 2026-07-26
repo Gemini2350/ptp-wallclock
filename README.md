@@ -226,10 +226,11 @@ is an ordered acceleration instead of uniform flicker. Settings:
   shows `! NEW GM !` in red on the matrix (and on the browser clock) for
   10 seconds and triggers a browser notification / banner on the settings
   page:
-- **Offset warning threshold** — optional limit in µs (0 = off). Whenever
-  a sync deviates from the smoothed offset by more than the threshold —
-  or, in grandmaster/passive mode, whenever the network master differs
-  from GNSS by more than it — a red `! OFFSET +12.3us !` alert (with the
+- **Offset warning threshold** — optional limit in nanoseconds (0 =
+  off; a legacy µs config value is converted on load). Whenever a sync
+  deviates from the smoothed offset by more than the threshold — or, in
+  grandmaster/passive mode, whenever the network master differs from
+  GNSS by more than it — a red `! OFFSET +12.3us !` alert (with the
   actual value) shows on the LED matrix, the browser clock, and as a
   banner on the settings page for 10 seconds
 

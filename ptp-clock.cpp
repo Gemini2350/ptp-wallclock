@@ -232,7 +232,7 @@ struct Settings {
     std::string gm_pps = "/dev/pps0";     // PPS source (pps-gpio)
     int gm_prio1 = 128, gm_prio2 = 128;   // our announce priorities
     int gm_utc_offset = 37;               // TAI - UTC for the announce
-    int offset_warn_us = 0;               // alert threshold in us, 0 = off
+    long long offset_warn_ns = 0;         // alert threshold in ns, 0 = off
     int domain = -1;                      // PTP domain, -1 = auto detect
     std::string iface = "auto";           // interface, "auto" = all of them
     std::string acceptable_gms;           // comma-separated GM identities;
@@ -603,7 +603,7 @@ static void save_settings_locked() {
     f << "gm_prio1=" << g_settings.gm_prio1 << "\n";
     f << "gm_prio2=" << g_settings.gm_prio2 << "\n";
     f << "gm_utc_offset=" << g_settings.gm_utc_offset << "\n";
-    f << "offset_warn_us=" << g_settings.offset_warn_us << "\n";
+    f << "offset_warn_ns=" << g_settings.offset_warn_ns << "\n";
     f << "acceptable_gms=" << g_settings.acceptable_gms << "\n";
 }
 
@@ -703,10 +703,14 @@ static void load_settings() {
             int v = atoi(val.c_str());
             if (v >= 0 && v <= 99)
                 g_settings.gm_utc_offset = v;
-        } else if (key == "offset_warn_us") {
-            int v = atoi(val.c_str());
-            if (v >= 0 && v <= 1000000000)
-                g_settings.offset_warn_us = v;
+        } else if (key == "offset_warn_ns") {
+            long long v = atoll(val.c_str());
+            if (v >= 0 && v <= 10000000000LL)
+                g_settings.offset_warn_ns = v;
+        } else if (key == "offset_warn_us") {   // legacy key: convert
+            long long v = atoll(val.c_str());
+            if (v >= 0 && v <= 10000000LL)
+                g_settings.offset_warn_ns = v * 1000;
         } else if (key == "acceptable_gms") {
             g_settings.acceptable_gms = val;
         }
@@ -929,8 +933,8 @@ static void bmca_elect_locked(uint64_t now) {
 // Offset warning: remember any deviation beyond the configured threshold
 // (µs, 0 = off) — the displays alert for 10 s afterwards
 static void offset_warn_check(int64_t dev_ns) {
-    int thr_us = g_settings.offset_warn_us;    // benign unlocked int read
-    if (thr_us > 0 && llabs(dev_ns) > (int64_t)thr_us * 1000LL) {
+    long long thr = g_settings.offset_warn_ns;  // benign unlocked read
+    if (thr > 0 && llabs(dev_ns) > thr) {
         g_offset_warn_val = dev_ns;
         g_offset_warn_mono = mono_ns();
     }
@@ -2296,7 +2300,7 @@ static std::string settings_json() {
       << "\"gm_prio1\":" << g_settings.gm_prio1 << ","
       << "\"gm_prio2\":" << g_settings.gm_prio2 << ","
       << "\"gm_utc_offset\":" << g_settings.gm_utc_offset << ","
-      << "\"offset_warn_us\":" << g_settings.offset_warn_us << ","
+      << "\"offset_warn_ns\":" << g_settings.offset_warn_ns << ","
       << "\"iface\":\"" << json_escape(g_settings.iface) << "\","
       << "\"ifaces\":[";
     std::vector<std::string> ifs = list_ifaces();
@@ -2438,7 +2442,7 @@ static std::string status_json() {
       << "\"cmp_count\":" << g_cmp_count.load() << ","
       << "\"cmp_gm\":\"" << g_cmp_gm_str << "\","
       << "\"offset_warn\":"
-      << (g_settings.offset_warn_us > 0 && g_offset_warn_mono.load() != 0 &&
+      << (g_settings.offset_warn_ns > 0 && g_offset_warn_mono.load() != 0 &&
                   mono_ns() - g_offset_warn_mono.load() < 10000000000ULL
               ? "true"
               : "false")
@@ -2776,8 +2780,8 @@ measurement.</p>
 <label>
  <input type="checkbox" id="notify"> Notify on grandmaster change
 </label>
-<label>Offset warning threshold (&micro;s, 0 = off):
- <input type="number" id="offset_warn" min="0" max="1000000000" value="0">
+<label>Offset warning threshold (ns, 0 = off):
+ <input type="number" id="offset_warn" min="0" max="10000000000" value="0">
 </label>
 <p class="hint">Shows a red alert on the LED matrix, the browser clock
 and this page for 10 s whenever a sync deviates from the smoothed offset
@@ -2907,7 +2911,7 @@ async function loadSettings() {
   document.getElementById('gm_prio1').value = s.gm_prio1;
   document.getElementById('gm_prio2').value = s.gm_prio2;
   document.getElementById('gm_utc').value = s.gm_utc_offset;
-  document.getElementById('offset_warn').value = s.offset_warn_us;
+  document.getElementById('offset_warn').value = s.offset_warn_ns;
   document.getElementById('iface').value = s.iface;
   document.getElementById('iflist').innerHTML =
       ['auto'].concat(s.ifaces).map(i => '<option value="' + i + '">').join('');
@@ -2936,7 +2940,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     gm_prio1: document.getElementById('gm_prio1').value,
     gm_prio2: document.getElementById('gm_prio2').value,
     gm_utc_offset: document.getElementById('gm_utc').value,
-    offset_warn_us: document.getElementById('offset_warn').value,
+    offset_warn_ns: document.getElementById('offset_warn').value,
     iface: document.getElementById('iface').value,
     notify: document.getElementById('notify').checked ? 1 : 0
   });
@@ -3916,10 +3920,10 @@ static void handle_client(int fd) {
                 if (v >= 0 && v <= 99)
                     g_settings.gm_utc_offset = v;
             }
-            if (kv.count("offset_warn_us")) {
-                int v = atoi(kv["offset_warn_us"].c_str());
-                if (v >= 0 && v <= 1000000000)
-                    g_settings.offset_warn_us = v;
+            if (kv.count("offset_warn_ns")) {
+                long long v = atoll(kv["offset_warn_ns"].c_str());
+                if (v >= 0 && v <= 10000000000LL)
+                    g_settings.offset_warn_ns = v;
             }
             if (kv.count("notify"))
                 g_settings.notify_gm_change = (kv["notify"] == "1");
@@ -4645,7 +4649,7 @@ int main(int argc, char **argv) {
         char offset_warn_txt[32] = "";
         {
             uint64_t wt = g_offset_warn_mono.load();
-            if (s.offset_warn_us > 0 && wt != 0 &&
+            if (s.offset_warn_ns > 0 && wt != 0 &&
                 mono_ns() - wt < 10000000000ULL) {
                 offset_warn = true;
                 char val[16];
