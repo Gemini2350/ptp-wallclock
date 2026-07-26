@@ -4907,13 +4907,21 @@ int main(int argc, char **argv) {
 
         const std::string &style = entry.style;
         if (style == "unix") {
-            // Seconds since the epoch, big — all nine fractional digits
-            // follow in the small font on the same baseline
+            // Seconds since the epoch. With room for two big lines the
+            // nine fractional digits go below the seconds at the SAME
+            // size; with a second display line active the compact
+            // big-seconds + small-fraction layout is used instead.
             char bsec[24], bfrac[16];
             snprintf(bsec, sizeof(bsec), "%lld", (long long)sec);
             bfrac[0] = '.';
             format_fraction(bfrac + 1, display_ns);
-            if (have_small_font) {
+            int fh = font.height();
+            if (band_h >= 2 * fh) {
+                int lead = (band_h - 2 * fh) / 3;
+                draw_center(font, bsec, lead + font.baseline(), c_main);
+                draw_center(font, bfrac,
+                            2 * lead + fh + font.baseline(), c_main);
+            } else if (have_small_font) {
                 int wbig = (font.CharacterWidth('0') + 1) *
                            (int)strlen(bsec) - 1;
                 int wsm = (small_font.CharacterWidth('0') + 1) *
