@@ -914,8 +914,10 @@ static void format_signed_offset(char *out, size_t n, long long ns) {
         snprintf(out, n, "%+.2fs", us / 1e6);
     else if (us >= 1000.0 || us <= -1000.0)
         snprintf(out, n, "%+.1fms", us / 1000.0);
-    else
+    else if (ns >= 1000 || ns <= -1000)
         snprintf(out, n, "%+.1fus", us);
+    else
+        snprintf(out, n, "%+lldns", ns);
 }
 
 // A (t1, t2) pair is complete: feed the clock servo.
@@ -2588,13 +2590,20 @@ function drawChart(id, series, fmt, includeZero) {
   g.fillText(fmt(mn), 6, h - 8);
 }
 
+function fmtNs(v) {
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(2) + ' s';
+  if (a >= 1e6) return (v / 1e6).toFixed(2) + ' ms';
+  if (a >= 1000) return (v / 1000).toFixed(1) + ' µs';
+  return Math.round(v) + ' ns';
+}
 async function pollHistory() {
   try {
     const hh = await fetch('/api/history').then(r => r.json());
     drawChart('ch_off', [
-      {data: hh.offset.map(v => v / 1000), color: '#fd0'},
-      {data: hh.delay.map(v => v / 1000), color: '#6cf'}
-    ], v => v.toFixed(1) + ' µs', true);
+      {data: hh.offset, color: '#fd0'},
+      {data: hh.delay, color: '#6cf'}
+    ], fmtNs, true);
     drawChart('ch_rate', [
       {data: hh.rates.sync, color: '#6c6'},
       {data: hh.rates.fup, color: '#6cf'},
@@ -2608,8 +2617,7 @@ async function pollHistory() {
     const cw = document.getElementById('cmp_wrap');
     if (hh.cmp && hh.cmp.length) {
       cw.style.display = '';
-      drawChart('ch_cmp', [{data: hh.cmp.map(v => v / 1000), color: '#f96'}],
-                v => v.toFixed(1) + ' µs', true);
+      drawChart('ch_cmp', [{data: hh.cmp, color: '#f96'}], fmtNs, true);
     } else {
       cw.style.display = 'none';
     }
@@ -2623,10 +2631,8 @@ for (const id of ['ch_off', 'ch_rate', 'ch_cmp'])
 
 const set = (id, text) => document.getElementById(id).textContent = text;
 function fmtOff(ns) {
-  const us = ns / 1000, sg = us >= 0 ? '+' : '';
-  if (Math.abs(us) >= 1e6) return sg + (us / 1e6).toFixed(2) + ' s';
-  if (Math.abs(us) >= 1000) return sg + (us / 1000).toFixed(1) + ' ms';
-  return sg + us.toFixed(1) + ' µs';
+  const sg = ns >= 0 ? '+' : '';
+  return sg + fmtNs(ns);
 }
 let lastChanges = null;
 async function poll() {
@@ -2700,8 +2706,8 @@ async function poll() {
                    '"><span>' + t.prn + '</span></div>';
           }).join('');
       document.getElementById('gnss_cmp').textContent = s.cmp_valid
-        ? 'network PTP vs GNSS: ' + (s.cmp_ns / 1000).toFixed(1) +
-          ' µs (last ' + (s.cmp_last_ns / 1000).toFixed(1) + ' µs, ' +
+        ? 'network PTP vs GNSS: ' + fmtOff(s.cmp_ns) +
+          ' (last ' + fmtOff(s.cmp_last_ns) + ', ' +
           s.cmp_count + ' Syncs, vs ' + s.cmp_gm + ')'
         : 'network PTP vs GNSS: no comparison master';
     }
@@ -2742,7 +2748,7 @@ async function poll() {
         ' (' + hex(s.time_source, 2) + ')' : '–');
     set('s_off', s.utc_offset + ' s');
     set('s_delay', s.path_delay_ns > 0
-        ? (s.path_delay_ns / 1000).toFixed(1) + ' µs (' +
+        ? fmtNs(s.path_delay_ns) + ' (' +
           s.dresp_received + '/' + s.dreq_sent + ' responses)'
         : s.dreq_sent > 0
           ? 'no response (' + s.dreq_sent + ' requests)'
@@ -2878,13 +2884,20 @@ function drawChart(id, series, fmt, includeZero) {
   g.fillText(fmt(mx), 8, 28);
   g.fillText(fmt(mn), 8, h - 10);
 }
+function fmtNs(v) {
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(2) + ' s';
+  if (a >= 1e6) return (v / 1e6).toFixed(2) + ' ms';
+  if (a >= 1000) return (v / 1000).toFixed(1) + ' µs';
+  return Math.round(v) + ' ns';
+}
 async function poll() {
   try {
     const hh = await fetch('/api/history').then(r => r.json());
     drawChart('ch_off', [
-      {data: hh.offset.map(v => v / 1000), color: '#fd0'},
-      {data: hh.delay.map(v => v / 1000), color: '#6cf'}
-    ], v => v.toFixed(1) + ' µs', true);
+      {data: hh.offset, color: '#fd0'},
+      {data: hh.delay, color: '#6cf'}
+    ], fmtNs, true);
     drawChart('ch_rate', [
       {data: hh.rates.sync, color: '#6c6'},
       {data: hh.rates.fup, color: '#6cf'},
@@ -2899,10 +2912,10 @@ async function poll() {
     const cw = document.getElementById('cmp_wrap');
     if (hh.cmp && hh.cmp.length) {
       cw.style.display = '';
-      drawChart('ch_cmp', [{data: hh.cmp.map(v => v / 1000), color: '#f96'}],
-                v => v.toFixed(1) + ' µs', true);
+      drawChart('ch_cmp', [{data: hh.cmp, color: '#f96'}], fmtNs, true);
       document.getElementById('cmp_now').textContent = s.cmp_valid
-          ? 'mean: ' + (s.cmp_ns / 1000).toFixed(1) + ' µs vs ' + s.cmp_gm
+          ? 'mean: ' + (s.cmp_ns >= 0 ? '+' : '') + fmtNs(s.cmp_ns) +
+            ' vs ' + s.cmp_gm
           : '';
     } else {
       cw.style.display = 'none';
@@ -3016,10 +3029,11 @@ async function loadSettings() {
 }
 
 function fmtOff(ns) {
-  const us = ns / 1000, sg = us >= 0 ? '+' : '';
-  if (Math.abs(us) >= 1e6) return sg + (us / 1e6).toFixed(2) + ' s';
-  if (Math.abs(us) >= 1000) return sg + (us / 1000).toFixed(1) + ' ms';
-  return sg + us.toFixed(1) + ' µs';
+  const a = Math.abs(ns), sg = ns >= 0 ? '+' : '-';
+  if (a >= 1e9) return sg + (a / 1e9).toFixed(2) + ' s';
+  if (a >= 1e6) return sg + (a / 1e6).toFixed(2) + ' ms';
+  if (a >= 1000) return sg + (a / 1000).toFixed(1) + ' µs';
+  return sg + Math.round(a) + ' ns';
 }
 
 function updateFooter(s) {
