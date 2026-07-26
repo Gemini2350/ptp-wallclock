@@ -2350,7 +2350,8 @@ static std::string history_json() {
                 continue;
             uint16_t v = f == 0 ? r.sync : f == 1 ? r.fup
                        : f == 2 ? r.ann : r.dresp;
-            j << (first ? "" : ",") << "[" << age << "," << v << "]";
+            j << (first ? "" : ",") << "[" << age << ","
+              << (double)v / 100.0 << "]";     // stored as rate * 100
             first = false;
         }
         j << "]";
@@ -3121,8 +3122,10 @@ async function pollHistory() {
     ], v => Math.round(v) + '/s', true);
     const last = a => a.length ? a[a.length - 1][1] : 0;
     document.getElementById('rate_now').textContent =
-        'now: ' + last(hh.rates.sync) + '/' + last(hh.rates.fup) + '/' +
-        last(hh.rates.ann) + '/' + last(hh.rates.dresp);
+        'now: ' + Math.round(last(hh.rates.sync)) + '/' +
+        Math.round(last(hh.rates.fup)) + '/' +
+        Math.round(last(hh.rates.ann)) + '/' +
+        Math.round(last(hh.rates.dresp));
     const cw = document.getElementById('cmp_wrap');
     if (hh.cmp && hh.cmp.length) {
       cw.style.display = '';
@@ -3455,8 +3458,10 @@ async function poll() {
     ], v => Math.round(v) + '/s', true);
     const last = a => a.length ? a[a.length - 1][1] : 0;
     document.getElementById('rate_now').textContent =
-        'now: ' + last(hh.rates.sync) + '/' + last(hh.rates.fup) + '/' +
-        last(hh.rates.ann) + '/' + last(hh.rates.dresp);
+        'now: ' + Math.round(last(hh.rates.sync)) + '/' +
+        Math.round(last(hh.rates.fup)) + '/' +
+        Math.round(last(hh.rates.ann)) + '/' +
+        Math.round(last(hh.rates.dresp));
     const s = await fetch('/api/status').then(r => r.json());
     const cw = document.getElementById('cmp_wrap');
     if (hh.cmp && hh.cmp.length) {
@@ -4338,6 +4343,11 @@ int main(int argc, char **argv) {
 
         // --- BMCA housekeeping + per-second analysis tick ---
         if (now_ns - last_bmca_ns >= 1000000000ULL) {
+            // The tick fires on a ~20 ms grid, so a "second" bin is
+            // 1 s +- a few % — remember its true length to normalize
+            // the message rates (a switch sending exactly 8 Sync/s must
+            // not read as 7..9)
+            uint64_t bin_ns = last_bmca_ns ? now_ns - last_bmca_ns : 0;
             last_bmca_ns = now_ns;
             std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -4445,15 +4455,24 @@ int main(int argc, char **argv) {
             g_role = role;
             g_gnss_lock = gnss_ok;
 
-            g_hist_rate[g_hist_rate_i] = {
-                (uint16_t)g_cnt_sync.exchange(0),
-                (uint16_t)g_cnt_fup.exchange(0),
-                (uint16_t)g_cnt_ann.exchange(0),
-                (uint16_t)g_cnt_dresp.exchange(0),
-                (uint32_t)(now_ns / 1000000ULL)};
-            g_hist_rate_i = (g_hist_rate_i + 1) % kHistSlow;
-            if (g_hist_rate_n < kHistSlow)
-                g_hist_rate_n++;
+            uint32_t cnt[4] = {g_cnt_sync.exchange(0),
+                               g_cnt_fup.exchange(0),
+                               g_cnt_ann.exchange(0),
+                               g_cnt_dresp.exchange(0)};
+            if (bin_ns >= 500000000ULL && bin_ns <= 5000000000ULL) {
+                // Store rates in 1/100 per second, normalized to the
+                // real bin length
+                auto cr = [&](uint32_t n) {
+                    uint64_t r = (uint64_t)n * 100000000000ULL / bin_ns;
+                    return (uint16_t)std::min<uint64_t>(65535, r);
+                };
+                g_hist_rate[g_hist_rate_i] = {
+                    cr(cnt[0]), cr(cnt[1]), cr(cnt[2]), cr(cnt[3]),
+                    (uint32_t)(now_ns / 1000000ULL)};
+                g_hist_rate_i = (g_hist_rate_i + 1) % kHistSlow;
+                if (g_hist_rate_n < kHistSlow)
+                    g_hist_rate_n++;
+            }
         }
 
         // --- Delay measurement once per second. v2/v1: Delay_Req out of
@@ -4995,15 +5014,21 @@ int main(int argc, char **argv) {
                     snprintf(rows_txt[1], sizeof(rows_txt[1]),
                              "JITTER %s", jt_s);
                     snprintf(rows_txt[2], sizeof(rows_txt[2]),
-                             "MSG %u/%u/%u/%u", rate_now[0], rate_now[1],
-                             rate_now[2], rate_now[3]);
+                             "MSG %u/%u/%u/%u",
+                             (rate_now[0] + 50) / 100,
+                             (rate_now[1] + 50) / 100,
+                             (rate_now[2] + 50) / 100,
+                             (rate_now[3] + 50) / 100);
                 } else {
                     rows = 2;
                     snprintf(rows_txt[0], sizeof(rows_txt[0]),
                              "D %s J %s", pd_s, jt_s);
                     snprintf(rows_txt[1], sizeof(rows_txt[1]),
-                             "MSG %u/%u/%u/%u", rate_now[0], rate_now[1],
-                             rate_now[2], rate_now[3]);
+                             "MSG %u/%u/%u/%u",
+                             (rate_now[0] + 50) / 100,
+                             (rate_now[1] + 50) / 100,
+                             (rate_now[2] + 50) / 100,
+                             (rate_now[3] + 50) / 100);
                 }
                 int step = band_h / rows;
                 for (int i = 0; i < rows; ++i)
