@@ -326,9 +326,11 @@ What happens with both enabled:
   second and answers Delay_Req — with hardware TX timestamps on a Pi 5
 - If a **better** grandmaster announces (lower priority1, etc.), the
   clock stays passive — and measures that master's Syncs against GNSS.
-  The **network PTP vs GNSS** chart and status line show the offset of
-  your grandmaster against GPS truth, per Sync, in µs (the path delay to
-  it is measured with Delay_Req as usual and subtracted)
+  The **Time Error** chart and status line show the offset of your
+  grandmaster against GPS truth, per Sync (the path delay to it is
+  measured with Delay_Req as usual and subtracted). The **GNSS PPS
+  offset** setting (ns) calibrates out the antenna cable delay
+  (≈5 ns per meter of coax) and receiver bias
 - Loses GNSS → clockClass 7 holdover for 5 minutes, then it returns to
   plain client mode; the GNSS status panel shows fix quality, satellites
   used/in view with per-satellite signal-strength bars, HDOP and PPS age

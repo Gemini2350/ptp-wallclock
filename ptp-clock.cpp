@@ -232,6 +232,8 @@ struct Settings {
     std::string gm_pps = "/dev/pps0";     // PPS source (pps-gpio)
     int gm_prio1 = 128, gm_prio2 = 128;   // our announce priorities
     int gm_utc_offset = 37;               // TAI - UTC for the announce
+    long long gm_pps_offset_ns = 0;       // antenna/cable delay compensation
+                                          // (subtracted from each pulse)
     long long offset_warn_ns = 0;         // alert threshold in ns, 0 = off
     int domain = -1;                      // PTP domain, -1 = auto detect
     std::string iface = "auto";           // interface, "auto" = all of them
@@ -645,6 +647,7 @@ static void save_settings_locked() {
     f << "gm_prio1=" << g_settings.gm_prio1 << "\n";
     f << "gm_prio2=" << g_settings.gm_prio2 << "\n";
     f << "gm_utc_offset=" << g_settings.gm_utc_offset << "\n";
+    f << "gm_pps_offset_ns=" << g_settings.gm_pps_offset_ns << "\n";
     f << "offset_warn_ns=" << g_settings.offset_warn_ns << "\n";
     f << "acceptable_gms=" << g_settings.acceptable_gms << "\n";
 }
@@ -745,6 +748,10 @@ static void load_settings() {
             int v = atoi(val.c_str());
             if (v >= 0 && v <= 99)
                 g_settings.gm_utc_offset = v;
+        } else if (key == "gm_pps_offset_ns") {
+            long long v = atoll(val.c_str());
+            if (v >= -1000000 && v <= 1000000)
+                g_settings.gm_pps_offset_ns = v;
         } else if (key == "offset_warn_ns") {
             long long v = atoll(val.c_str());
             if (v >= 0 && v <= 10000000000LL)
@@ -1492,12 +1499,14 @@ static void gnss_thread() {
         bool enabled;
         std::string cfg_ser, cfg_pps;
         int utc_off;
+        long long pps_off;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             enabled = g_settings.gm_enable;
             cfg_ser = g_settings.gm_serial;
             cfg_pps = g_settings.gm_pps;
             utc_off = g_settings.gm_utc_offset;
+            pps_off = g_settings.gm_pps_offset_ns;
         }
         if (!enabled) {
             usleep(500000);
@@ -1600,7 +1609,9 @@ static void gnss_thread() {
                                 std::lock_guard<std::mutex> lk(g_gnss_mutex);
                                 g_gnss_t1 =
                                     ((int64_t)utc + utc_off) * 1000000000LL;
-                                g_gnss_t2 = (int64_t)pulse_local;
+                                // antenna/cable delay: the pulse arrives
+                                // late by the configured offset
+                                g_gnss_t2 = (int64_t)pulse_local - pps_off;
                                 g_gnss_sample_valid = true;
                                 g_gnss_last_sample = n2;
                                 g_gnss_sample_count++;
@@ -2342,6 +2353,7 @@ static std::string settings_json() {
       << "\"gm_prio1\":" << g_settings.gm_prio1 << ","
       << "\"gm_prio2\":" << g_settings.gm_prio2 << ","
       << "\"gm_utc_offset\":" << g_settings.gm_utc_offset << ","
+      << "\"gm_pps_offset_ns\":" << g_settings.gm_pps_offset_ns << ","
       << "\"offset_warn_ns\":" << g_settings.offset_warn_ns << ","
       << "\"iface\":\"" << json_escape(g_settings.iface) << "\","
       << "\"ifaces\":[";
@@ -2691,13 +2703,14 @@ second.</span></span></div>
 &nbsp;<span style="color:#f6c">&#9632;</span> Delay_Resp
 &nbsp;&nbsp;<span id="rate_now"></span></div>
 <div id="cmp_wrap" style="display:none">
-<div class="chart-title">Network PTP vs GNSS (per Sync of the network
-master)
+<div class="chart-title">Time Error &mdash; network PTP vs GNSS (per
+Sync of the network master)
 <span class="info">&#9432;<span class="tip">Each Sync of the network
 grandmaster measured against our GNSS reference (path delay
-subtracted): the real error of the network's time distribution as seen
-from GPS. Positive = the network master is ahead of
-GNSS.</span></span></div>
+subtracted): the classic time-error (TE) measurement — the real error
+of the network's time distribution as seen from GPS. Positive = the
+network master is ahead of GNSS. Use the GNSS PPS offset setting to
+calibrate out the antenna cable delay.</span></span></div>
 <canvas class="chart" id="ch_cmp"></canvas>
 <div class="chart-legend"><span style="color:#f96">&#9632;</span>
 <span id="cmp_info">network master &minus; GNSS</span></div>
@@ -2819,6 +2832,14 @@ measurement.</p>
 <label>TAI &minus; UTC:
  <input type="number" id="gm_utc" min="0" max="99" value="37">
 </label>
+<label>GNSS PPS offset (ns):
+ <input type="number" id="gm_pps_off" min="-1000000" max="1000000"
+        value="0">
+</label>
+<p class="hint">Compensates the antenna cable delay (&asymp;5 ns per
+meter of coax) and receiver bias: the entered value is subtracted from
+every PPS timestamp. Calibrate against a trusted reference until the
+time-error chart centers on zero.</p>
 <div id="gnss_box" style="display:none">
  <div class="chart-title">GNSS receiver</div>
  <div class="chart-legend" id="gnss_sum">&ndash;</div>
@@ -2963,6 +2984,7 @@ async function loadSettings() {
   document.getElementById('gm_prio1').value = s.gm_prio1;
   document.getElementById('gm_prio2').value = s.gm_prio2;
   document.getElementById('gm_utc').value = s.gm_utc_offset;
+  document.getElementById('gm_pps_off').value = s.gm_pps_offset_ns;
   document.getElementById('offset_warn').value = s.offset_warn_ns;
   document.getElementById('iface').value = s.iface;
   document.getElementById('iflist').innerHTML =
@@ -2992,6 +3014,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     gm_prio1: document.getElementById('gm_prio1').value,
     gm_prio2: document.getElementById('gm_prio2').value,
     gm_utc_offset: document.getElementById('gm_utc').value,
+    gm_pps_offset_ns: document.getElementById('gm_pps_off').value,
     offset_warn_ns: document.getElementById('offset_warn').value,
     iface: document.getElementById('iface').value,
     notify: document.getElementById('notify').checked ? 1 : 0
@@ -3278,10 +3301,10 @@ async function poll() {
                    '"><span>' + t.prn + '</span></div>';
           }).join('');
       document.getElementById('gnss_cmp').textContent = s.cmp_valid
-        ? 'network PTP vs GNSS: ' + fmtOff(s.cmp_ns) +
+        ? 'time error (PTP − GNSS): ' + fmtOff(s.cmp_ns) +
           ' (last ' + fmtOff(s.cmp_last_ns) + ', ' +
           s.cmp_count + ' Syncs, vs ' + s.cmp_gm + ')'
-        : 'network PTP vs GNSS: no comparison master';
+        : 'time error (PTP − GNSS): no comparison master';
     }
     document.getElementById('ts_mode').innerHTML = s.hwts
         ? '<span style="color:#6c6">&#9679;</span> hardware timestamping ('
@@ -3436,12 +3459,13 @@ second.</span></span></div>
 &nbsp;<span style="color:#f6c">&#9632;</span> Delay_Resp
 &nbsp;&nbsp;<span id="rate_now"></span></div>
 <div id="cmp_wrap" style="display:none">
-<div class="chart-title">Network PTP vs GNSS
+<div class="chart-title">Time Error &mdash; network PTP vs GNSS
 <span class="info">&#9432;<span class="tip">Each Sync of the network
 grandmaster measured against our GNSS reference (path delay
-subtracted): the real error of the network's time distribution as seen
-from GPS. Positive = the network master is ahead of
-GNSS.</span></span></div>
+subtracted): the classic time-error (TE) measurement — the real error
+of the network's time distribution as seen from GPS. Positive = the
+network master is ahead of GNSS. Use the GNSS PPS offset setting to
+calibrate out the antenna cable delay.</span></span></div>
 <canvas id="ch_cmp" style="height:26vh"></canvas>
 <div class="chart-legend"><span style="color:#f96">&#9632;</span>
 network master &minus; GNSS, per Sync &nbsp;<span id="cmp_now"></span></div>
@@ -3984,6 +4008,11 @@ static void handle_client(int fd) {
                 int v = atoi(kv["gm_utc_offset"].c_str());
                 if (v >= 0 && v <= 99)
                     g_settings.gm_utc_offset = v;
+            }
+            if (kv.count("gm_pps_offset_ns")) {
+                long long v = atoll(kv["gm_pps_offset_ns"].c_str());
+                if (v >= -1000000 && v <= 1000000)
+                    g_settings.gm_pps_offset_ns = v;
             }
             if (kv.count("offset_warn_ns")) {
                 long long v = atoll(kv["offset_warn_ns"].c_str());
