@@ -365,9 +365,15 @@ to force software timestamps.
 
 Without a PHC, packets are timestamped in user space and the achievable
 accuracy is in the sub-millisecond range — plenty for a wall clock
-display, but this is a visualization tool, not a reference clock. In both
-modes Sync/Follow_Up and Delay_Resp measurements are smoothed with a
-small exponential filter. Note that the LED refresh and the browser
+display, but this is a visualization tool, not a reference clock.
+
+The clock is disciplined by a small **PI servo** that estimates offset
+*and* the local oscillator's frequency error (shown as "Clock drift" in
+the status panel): a plain crystal's ppm error no longer causes a
+standing lag behind the master (offset-only smoothing lags by
+freq × time-constant — ~160 µs at 20 ppm), and the displayed time runs
+frequency-corrected between correction samples. Delay_Resp measurements
+are smoothed with a small exponential filter. Note that the LED refresh and the browser
 rendering add their own few milliseconds — hardware timestamping makes
 the *measurements* honest (visible in the PTP analysis charts), not the
 photons faster.

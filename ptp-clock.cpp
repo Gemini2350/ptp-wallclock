@@ -290,7 +290,18 @@ static uint16_t g_dreq_seq = 0;
 static bool g_have_mpd = false;
 static int64_t g_mpd_ns = 0;              // mean path delay (EMA)
 static bool g_have_offset = false;
-static int64_t g_offset_ns = 0;           // local(mono) - master(TAI), EMA
+static int64_t g_offset_ns = 0;           // legacy mirror: servo offset at
+                                          // the last reference time
+
+// Clock servo (PI): offset AND frequency of the local timing clock vs
+// the master. Written by the main thread, read from any thread; the
+// three values are stored as independent atomics — a torn read across
+// an update mixes two states that differ by nanoseconds, which is fine.
+static std::atomic<long long> g_srv_off{0};          // offset at t_ref, ns
+static std::atomic<unsigned long long> g_srv_tref{0};  // local ref time
+static std::atomic<double> g_srv_freq{0.0};   // local freq error, fraction
+static const double kServoKp = 0.12;          // phase gain per sample
+static const double kServoKi = 0.02;          // frequency gain per sample
 
 static uint8_t g_clock_id[8] = {0};       // our clockIdentity (EUI-64 from MAC)
 
@@ -408,6 +419,18 @@ static uint64_t local_clock_ns() {
     }
 #endif
     return mono_ns();
+}
+
+// Servo readout: offset of the local timing clock vs master TAI at local
+// time t, extrapolated with the estimated frequency error.
+// master = local - offset_at(local)
+static int64_t offset_at(uint64_t t_local) {
+    long long off = g_srv_off.load(std::memory_order_relaxed);
+    unsigned long long tref = g_srv_tref.load(std::memory_order_relaxed);
+    if (!tref)
+        return off;
+    double f = g_srv_freq.load(std::memory_order_relaxed);
+    return off + (int64_t)(f * (double)(int64_t)(t_local - tref));
 }
 
 static uint64_t be_bytes(const uint8_t *p, int n) {
@@ -709,6 +732,10 @@ static void reset_ptp_state() {
     g_cmp_target_valid = false;
     g_cmp_have = false;
     g_cmp_count = 0;
+    g_srv_off = 0;
+    g_srv_tref = 0;
+    g_srv_freq = 0.0;
+    g_offset_ns = 0;
     g_offset_warn_mono = 0;
     g_active_domain = -1;
     g_last_announce_mono_ns = 0;
@@ -891,11 +918,17 @@ static void format_signed_offset(char *out, size_t n, long long ns) {
         snprintf(out, n, "%+.1fus", us);
 }
 
-// A (t1, t2) pair is complete: update the offset estimate.
+// A (t1, t2) pair is complete: feed the clock servo.
 // local = master + offset  =>  offset = t2 - t1 - meanPathDelay
 // wire=false marks a GNSS sample (grandmaster mode). While GNSS drives
 // the clock, wire pairs are not used for discipline — they are measured
 // AGAINST the GNSS reference instead (positive = network master ahead).
+//
+// The servo is a small PI controller: it tracks not just the offset but
+// also the local oscillator's frequency error, so a plain crystal's ppm
+// error no longer produces a standing lag (offset-only smoothing lags by
+// freq * time constant — ~160 us for 20 ppm), and the displayed time
+// runs frequency-corrected between samples.
 static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
     g_last_t1 = t1;
     g_last_t2 = t2;
@@ -906,7 +939,7 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
     if (wire && g_role.load() >= ROLE_GM_PASSIVE) {
         if (!g_have_offset)
             return;                       // no GNSS reference yet
-        int64_t d = g_offset_ns - sample; // wire master - GNSS, ns
+        int64_t d = offset_at((uint64_t)t2) - sample;  // master - GNSS
         offset_warn_check(d);
         if (!g_cmp_have) {
             g_cmp_ns = d;
@@ -922,21 +955,37 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
         return;
     }
 
-    // Analysis history: how far this sync was off the smoothed estimate
+    int64_t pred = offset_at((uint64_t)t2);
+    int64_t e = sample - pred;            // prediction error of the servo
+    int64_t dt = t2 - (int64_t)g_srv_tref.load(std::memory_order_relaxed);
+
     if (g_have_offset)
-        offset_warn_check(sample - g_offset_ns);
+        offset_warn_check(e);
     {
+        // Analysis history: how far this sync was off the prediction
         std::lock_guard<std::mutex> lock(g_mutex);
         hist_push(g_hist_off, g_hist_off_n, g_hist_off_i,
-                  g_have_offset ? sample - g_offset_ns : 0);
+                  g_have_offset ? e : 0);
     }
-    if (!g_have_offset || llabs(sample - g_offset_ns) > 100000000LL) {
-        g_offset_ns = sample;             // first sample or step: jump
+
+    if (!g_have_offset || llabs(e) > 100000000LL || dt <= 0 ||
+        dt > 60000000000LL) {
+        // First sample, step, or stale reference: jump the phase, keep
+        // the frequency estimate (the oscillator didn't change)
+        g_srv_off = sample;
+        g_srv_tref = (uint64_t)t2;
         g_have_offset = true;
     } else {
-        g_offset_ns += (sample - g_offset_ns) / 8;
+        double freq = g_srv_freq.load(std::memory_order_relaxed);
+        freq += kServoKi * (double)e / (double)dt;
+        if (freq > 500e-6) freq = 500e-6;
+        if (freq < -500e-6) freq = -500e-6;
+        g_srv_freq = freq;
+        g_srv_off = pred + (int64_t)(kServoKp * (double)e);
+        g_srv_tref = (uint64_t)t2;
     }
-    g_offset_atomic = g_offset_ns;
+    g_offset_ns = g_srv_off.load();       // legacy mirrors (offset at the
+    g_offset_atomic = g_offset_ns;        // reference time)
     g_last_sync_mono_ns = (uint64_t)t2;
     g_last_sync_age_ns = mono_ns();       // housekeeping clock, not t2:
     have_ptp_ref = true;                  // t2 may be PHC time (hw mode)
@@ -1882,7 +1931,8 @@ static std::string status_json() {
     // Current PTP time (TAI), split so the values stay exact in JS doubles
     long long tai_sec = -1, tai_nsec = 0;
     if (have_ptp_ref) {
-        long long tai = (long long)local_clock_ns() - g_offset_atomic.load();
+        uint64_t now_local = local_clock_ns();
+        long long tai = (long long)now_local - offset_at(now_local);
         if (tai > 0) {
             tai_sec = tai / 1000000000LL;
             tai_nsec = tai % 1000000000LL;
@@ -1944,6 +1994,7 @@ static std::string status_json() {
       << "\"time_source\":" << (int)g_gm.time_source << ","
       << "\"utc_offset\":" << current_utc_offset << ","
       << "\"path_delay_ns\":" << g_path_delay_ns.load() << ","
+      << "\"freq_ppb\":" << (long long)(g_srv_freq.load() * 1e9) << ","
       << "\"dreq_sent\":" << g_dreq_sent.load() << ","
       << "\"dresp_received\":" << g_dresp_received.load() << ","
       << "\"gm_changes\":" << g_gm_changes << ","
@@ -2073,6 +2124,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  <tr><td>Time source</td><td id="s_src">&ndash;</td></tr>
  <tr><td>TAI&minus;UTC offset</td><td id="s_off">&ndash;</td></tr>
  <tr><td>Path delay</td><td id="s_delay">&ndash;</td></tr>
+ <tr><td>Clock drift</td><td id="s_drift">&ndash;</td></tr>
  <tr><td>GM changes</td><td id="s_changes">0</td></tr>
 </table>
 </fieldset>
@@ -2695,6 +2747,9 @@ async function poll() {
         : s.dreq_sent > 0
           ? 'no response (' + s.dreq_sent + ' requests)'
           : '–');
+    set('s_drift', s.have_ptp
+        ? (s.freq_ppb / 1000).toFixed(2) + ' ppm (servo estimate)'
+        : '–');
     set('s_changes', s.gm_changes);
     if (s.blackout !== blackout) {
       blackout = s.blackout;             // changed from another browser
@@ -3590,7 +3645,7 @@ int main(int argc, char **argv) {
                 if (g_role.load() == ROLE_GM_ACTIVE && (buf[1] & 0x0F) == 2 &&
                     domain_ok(buf[4], false) && ts != 0) {
                     uint8_t resp[54];
-                    build_delay_resp(resp, buf, (int64_t)ts - g_offset_ns);
+                    build_delay_resp(resp, buf, (int64_t)ts - offset_at(ts));
                     for (const auto &j : joined) {
                         in_addr mif{};
                         mif.s_addr = j.ip;
@@ -3832,7 +3887,7 @@ int main(int argc, char **argv) {
                     drain_errqueue(sock_sync);
 #endif
                 uint64_t ta = local_clock_ns();
-                build_sync(sync, g_sync_seq, (int64_t)ta - g_offset_ns);
+                build_sync(sync, g_sync_seq, (int64_t)ta - offset_at(ta));
                 if (sendto(sock_sync, sync, sizeof(sync), 0,
                            (struct sockaddr *)&dreq_dst,
                            sizeof(dreq_dst)) != (ssize_t)sizeof(sync))
@@ -3845,7 +3900,7 @@ int main(int argc, char **argv) {
 #endif
                 if (!t1)
                     t1 = ta + (tb - ta) / 2;
-                build_follow_up(fup, g_sync_seq, (int64_t)t1 - g_offset_ns);
+                build_follow_up(fup, g_sync_seq, (int64_t)t1 - offset_at(t1));
                 sendto(sock_general, fup, sizeof(fup), 0,
                        (struct sockaddr *)&gen_dst, sizeof(gen_dst));
             }
@@ -3937,7 +3992,8 @@ int main(int argc, char **argv) {
         }
 
         // --- Smooth time: master(TAI) = local(mono) - offset ---
-        int64_t display_signed = (int64_t)local_clock_ns() - g_offset_ns;
+        uint64_t frame_local = local_clock_ns();
+        int64_t display_signed = (int64_t)frame_local - offset_at(frame_local);
         if (display_signed < 0)
             display_signed = 0;
         uint64_t display_ns = (uint64_t)display_signed;
