@@ -5005,35 +5005,42 @@ int main(int argc, char **argv) {
                          tmp[0] == '+' ? tmp + 1 : tmp);
             }
             if (have_small_font) {
-                char rows_txt[3][28];
+                // Instrument-style table: dim label left, bright value
+                // right-aligned; rows spread evenly over the band
+                char msg_s[20], pj_s[24];
+                snprintf(msg_s, sizeof(msg_s), "%u/%u/%u/%u",
+                         (rate_now[0] + 50) / 100,
+                         (rate_now[1] + 50) / 100,
+                         (rate_now[2] + 50) / 100,
+                         (rate_now[3] + 50) / 100);
+                const char *labs[3];
+                const char *vals[3];
                 int rows;
                 if (band_h >= 18) {
                     rows = 3;
-                    snprintf(rows_txt[0], sizeof(rows_txt[0]),
-                             "DELAY %s", pd_s);
-                    snprintf(rows_txt[1], sizeof(rows_txt[1]),
-                             "JITTER %s", jt_s);
-                    snprintf(rows_txt[2], sizeof(rows_txt[2]),
-                             "MSG %u/%u/%u/%u",
-                             (rate_now[0] + 50) / 100,
-                             (rate_now[1] + 50) / 100,
-                             (rate_now[2] + 50) / 100,
-                             (rate_now[3] + 50) / 100);
+                    labs[0] = "PATH DELAY"; vals[0] = pd_s;
+                    labs[1] = "JITTER";     vals[1] = jt_s;
+                    labs[2] = "MSG RATES";  vals[2] = msg_s;
                 } else {
                     rows = 2;
-                    snprintf(rows_txt[0], sizeof(rows_txt[0]),
-                             "D %s J %s", pd_s, jt_s);
-                    snprintf(rows_txt[1], sizeof(rows_txt[1]),
-                             "MSG %u/%u/%u/%u",
-                             (rate_now[0] + 50) / 100,
-                             (rate_now[1] + 50) / 100,
-                             (rate_now[2] + 50) / 100,
-                             (rate_now[3] + 50) / 100);
+                    snprintf(pj_s, sizeof(pj_s), "%s %s", pd_s, jt_s);
+                    labs[0] = "PD JIT";     vals[0] = pj_s;
+                    labs[1] = "MSG RATES";  vals[1] = msg_s;
                 }
-                int step = band_h / rows;
-                for (int i = 0; i < rows; ++i)
-                    draw_center(small_font, rows_txt[i],
-                                i * step + (step - 6) / 2 + 5, c_main);
+                int cw = small_font.CharacterWidth('0') + 1;
+                int lead = (band_h - rows * 6) / (rows + 1);
+                if (lead < 0)
+                    lead = 0;
+                Color c_lab(s.r / 2, s.g / 2, s.b / 2);
+                for (int i = 0; i < rows; ++i) {
+                    int ybase = lead * (i + 1) + 6 * i + 5;
+                    DrawText(cv, small_font, 2, ybase, c_lab, nullptr,
+                             labs[i], 1);
+                    int wv = cw * (int)strlen(vals[i]) - 1;
+                    DrawText(cv, small_font,
+                             matrix_options.cols - 2 - wv, ybase,
+                             c_main, nullptr, vals[i], 1);
+                }
             }
         } else {
             // Digital 24h (default) / 12h — always all nine fractional
