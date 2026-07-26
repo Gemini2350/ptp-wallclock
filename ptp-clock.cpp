@@ -324,15 +324,20 @@ static std::atomic<bool> g_iface_changed{false};  // web thread changed iface
 static std::atomic<bool> g_iface_up{false};    // multicast currently joined
 
 // ---- PTP analysis history (rings guarded by g_mutex) ----
-static const int kHistN = 150;
-static int32_t g_hist_off[kHistN];             // offset deviation per Sync, ns
+// Every point carries its capture time so the charts can show a true
+// 5-minute window regardless of the sample rate (a Sync stream at 8/s
+// fills a per-Sync ring 8x faster than the per-second rings).
+struct HistPoint { int32_t v; uint32_t t_ms; };  // value + mono ms
+static const int kHistFast = 2560;   // per-Sync series: 5 min at ~8/s
+static const int kHistSlow = 384;    // per-second series: 5 min + slack
+static HistPoint g_hist_off[kHistFast];        // offset dev per Sync, ns
 static int g_hist_off_n = 0, g_hist_off_i = 0;
-static int32_t g_hist_del[kHistN];             // path delay samples, ns
+static HistPoint g_hist_del[kHistSlow];        // path delay samples, ns
 static int g_hist_del_n = 0, g_hist_del_i = 0;
-static int32_t g_hist_cmp[kHistN];             // wire PTP - GNSS, ns
+static HistPoint g_hist_cmp[kHistFast];        // wire PTP - GNSS, ns
 static int g_hist_cmp_n = 0, g_hist_cmp_i = 0;
-struct RateSample { uint16_t sync, fup, ann, dresp; };
-static RateSample g_hist_rate[kHistN];         // received messages per second
+struct RateSample { uint16_t sync, fup, ann, dresp; uint32_t t_ms; };
+static RateSample g_hist_rate[kHistSlow];      // received msgs per second
 static int g_hist_rate_n = 0, g_hist_rate_i = 0;
 // per-second counters (domain-filtered wire view), reset every second
 static std::atomic<uint32_t> g_cnt_sync{0}, g_cnt_fup{0};
@@ -408,19 +413,19 @@ static uint16_t g_ann_seq = 0, g_sync_seq = 0;      // main thread
 static std::atomic<unsigned long long> g_offset_warn_mono{0};
 static std::atomic<long long> g_offset_warn_val{0};
 
-static void hist_push(int32_t *buf, int &n, int &i, int64_t v) {
-    if (v > 2000000000LL) v = 2000000000LL;
-    if (v < -2000000000LL) v = -2000000000LL;
-    buf[i] = (int32_t)v;
-    i = (i + 1) % kHistN;
-    if (n < kHistN) n++;
-}
-
 // ---- Helpers ----
 static uint64_t mono_ns() {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void hist_push(HistPoint *buf, int cap, int &n, int &i, int64_t v) {
+    if (v > 2000000000LL) v = 2000000000LL;
+    if (v < -2000000000LL) v = -2000000000LL;
+    buf[i] = {(int32_t)v, (uint32_t)(mono_ns() / 1000000ULL)};
+    i = (i + 1) % cap;
+    if (n < cap) n++;
 }
 
 // The local timing clock: the NIC's PHC when hardware timestamping is
@@ -974,7 +979,7 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
         g_cmp_last = d;
         g_cmp_count++;
         std::lock_guard<std::mutex> lock(g_mutex);
-        hist_push(g_hist_cmp, g_hist_cmp_n, g_hist_cmp_i, d);
+        hist_push(g_hist_cmp, kHistFast, g_hist_cmp_n, g_hist_cmp_i, d);
         return;
     }
 
@@ -987,7 +992,7 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
     {
         // Analysis history: how far this sync was off the prediction
         std::lock_guard<std::mutex> lock(g_mutex);
-        hist_push(g_hist_off, g_hist_off_n, g_hist_off_i,
+        hist_push(g_hist_off, kHistFast, g_hist_off_n, g_hist_off_i,
                   g_have_offset ? e : 0);
     }
 
@@ -1176,7 +1181,7 @@ static void process_general_packet(const uint8_t *buf, ssize_t len,
         g_dresp_received++;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            hist_push(g_hist_del, g_hist_del_n, g_hist_del_i, sample);
+            hist_push(g_hist_del, kHistSlow, g_hist_del_n, g_hist_del_i, sample);
         }
     }
 }
@@ -1979,7 +1984,7 @@ static void process_v1_general(const uint8_t *buf, ssize_t len,
         g_path_delay_ns = g_mpd_ns;
         g_dresp_received++;
         std::lock_guard<std::mutex> lock(g_mutex);
-        hist_push(g_hist_del, g_hist_del_n, g_hist_del_i, sample);
+        hist_push(g_hist_del, kHistSlow, g_hist_del_n, g_hist_del_i, sample);
     }
 }
 
@@ -2168,7 +2173,7 @@ static void process_gptp_frame(const uint8_t *buf, ssize_t len,
                 g_dresp_received++;
                 g_cnt_dresp++;
                 std::lock_guard<std::mutex> lock(g_mutex);
-                hist_push(g_hist_del, g_hist_del_n, g_hist_del_i, d);
+                hist_push(g_hist_del, kHistSlow, g_hist_del_n, g_hist_del_i, d);
             }
         }
         break;
@@ -2282,33 +2287,48 @@ static std::string settings_json() {
     return j.str();
 }
 
-// Analysis history for the settings-page charts (oldest first)
+// Analysis history for the charts: [age_seconds, value] pairs, oldest
+// first, limited to the 5-minute window the charts draw
 static std::string history_json() {
     std::lock_guard<std::mutex> lock(g_mutex);
+    uint32_t now_ms = (uint32_t)(mono_ns() / 1000000ULL);
     std::ostringstream j;
-    auto ring = [&](const int32_t *buf, int n, int i) {
+    j.setf(std::ios::fixed);
+    j.precision(1);
+    auto ring = [&](const HistPoint *buf, int cap, int n, int i) {
+        bool first = true;
         for (int k = 0; k < n; ++k) {
-            int idx = (i - n + k + 2 * kHistN) % kHistN;
-            j << (k ? "," : "") << buf[idx];
+            int idx = (i - n + k + 2 * cap) % cap;
+            double age = (double)(uint32_t)(now_ms - buf[idx].t_ms) / 1e3;
+            if (age > 310.0)
+                continue;
+            j << (first ? "" : ",") << "[" << age << ","
+              << buf[idx].v << "]";
+            first = false;
         }
     };
     j << "{\"offset\":[";
-    ring(g_hist_off, g_hist_off_n, g_hist_off_i);
+    ring(g_hist_off, kHistFast, g_hist_off_n, g_hist_off_i);
     j << "],\"delay\":[";
-    ring(g_hist_del, g_hist_del_n, g_hist_del_i);
+    ring(g_hist_del, kHistSlow, g_hist_del_n, g_hist_del_i);
     j << "],\"cmp\":[";
-    ring(g_hist_cmp, g_hist_cmp_n, g_hist_cmp_i);
+    ring(g_hist_cmp, kHistFast, g_hist_cmp_n, g_hist_cmp_i);
     j << "],\"rates\":{";
     const char *names[4] = {"sync", "fup", "ann", "dresp"};
     for (int f = 0; f < 4; ++f) {
         j << (f ? "," : "") << "\"" << names[f] << "\":[";
+        bool first = true;
         for (int k = 0; k < g_hist_rate_n; ++k) {
-            int idx = (g_hist_rate_i - g_hist_rate_n + k + 2 * kHistN)
-                      % kHistN;
+            int idx = (g_hist_rate_i - g_hist_rate_n + k + 2 * kHistSlow)
+                      % kHistSlow;
             const RateSample &r = g_hist_rate[idx];
+            double age = (double)(uint32_t)(now_ms - r.t_ms) / 1e3;
+            if (age > 310.0)
+                continue;
             uint16_t v = f == 0 ? r.sync : f == 1 ? r.fup
                        : f == 2 ? r.ann : r.dresp;
-            j << (k ? "," : "") << v;
+            j << (first ? "" : ",") << "[" << age << "," << v << "]";
+            first = false;
         }
         j << "]";
     }
@@ -2563,7 +2583,9 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <fieldset>
 <legend>PTP analysis &nbsp;<a href="/analysis" target="_blank"
  rel="noopener">large view &rarr;</a></legend>
-<div class="chart-legend" id="ts_mode" style="margin:0 0 0.5em">&ndash;</div>
+<div class="chart-legend" id="ts_mode" style="margin:0 0 0.2em">&ndash;</div>
+<div class="chart-legend" style="margin:0 0 0.5em">All charts show the
+last 5 minutes; grid lines mark one minute.</div>
 <div class="chart-title">Sync PDV &mdash; offset deviation per Sync</div>
 <canvas class="chart" id="ch_pdv"></canvas>
 <p class="chart-desc"><span style="color:#fd0">&#9632;</span> How far each
@@ -3007,8 +3029,15 @@ function drawChart(id, series, fmt, includeZero) {
   const h = cv.height = 220;
   const g = cv.getContext('2d');
   g.clearRect(0, 0, w, h);
+  const SPAN = 300;                             // all charts: last 5 min
+  g.strokeStyle = '#222';
+  g.lineWidth = 1;
+  for (let m = 1; m < 5; m++) {                 // minute grid
+    const gx = (1 - m * 60 / SPAN) * w;
+    g.beginPath(); g.moveTo(gx, 0); g.lineTo(gx, h); g.stroke();
+  }
   let all = [];
-  series.forEach(s => { all = all.concat(s.data); });
+  series.forEach(s => { all = all.concat(s.data.map(p => p[1])); });
   if (!all.length) {
     g.fillStyle = '#666';
     g.font = '20px sans-serif';
@@ -3036,9 +3065,9 @@ function drawChart(id, series, fmt, includeZero) {
     g.strokeStyle = s.color;
     g.lineWidth = 2;
     g.beginPath();
-    s.data.forEach((v, k) => {
-      const x = k / Math.max(1, s.data.length - 1) * w;
-      k ? g.lineTo(x, y(v)) : g.moveTo(x, y(v));
+    s.data.forEach((p, k) => {
+      const px = (1 - p[0] / SPAN) * w;
+      k ? g.lineTo(px, y(p[1])) : g.moveTo(px, y(p[1]));
     });
     g.stroke();
   });
@@ -3066,7 +3095,7 @@ async function pollHistory() {
       {data: hh.rates.ann, color: '#fd0'},
       {data: hh.rates.dresp, color: '#f6c'}
     ], v => Math.round(v) + '/s', true);
-    const last = a => a.length ? a[a.length - 1] : 0;
+    const last = a => a.length ? a[a.length - 1][1] : 0;
     document.getElementById('rate_now').textContent =
         'now: ' + last(hh.rates.sync) + '/' + last(hh.rates.fup) + '/' +
         last(hh.rates.ann) + '/' + last(hh.rates.dresp);
@@ -3283,6 +3312,8 @@ static const char *kAnalysisHtml = R"ANA(<!DOCTYPE html>
 <body>
 <h1>PTP analysis &nbsp;<a href="/">&larr; settings</a></h1>
 <div id="ts_mode">&ndash;</div>
+<div class="chart-legend">All charts show the last 5 minutes; grid lines
+mark one minute.</div>
 <div class="chart-title">Sync PDV &mdash; offset deviation per Sync</div>
 <canvas id="ch_pdv" style="height:26vh"></canvas>
 <p class="chart-desc"><span style="color:#fd0">&#9632;</span> How far each
@@ -3329,8 +3360,15 @@ function drawChart(id, series, fmt, includeZero) {
   const h = cv.height = cv.clientHeight * 2;
   const g = cv.getContext('2d');
   g.clearRect(0, 0, w, h);
+  const SPAN = 300;                             // all charts: last 5 min
+  g.strokeStyle = '#1e1e1e';
+  g.lineWidth = 1;
+  for (let m = 1; m < 5; m++) {                 // minute grid
+    const gx = (1 - m * 60 / SPAN) * w;
+    g.beginPath(); g.moveTo(gx, 0); g.lineTo(gx, h); g.stroke();
+  }
   let all = [];
-  series.forEach(s => { all = all.concat(s.data); });
+  series.forEach(s => { all = all.concat(s.data.map(p => p[1])); });
   if (!all.length) {
     g.fillStyle = '#666';
     g.font = '28px sans-serif';
@@ -3356,9 +3394,9 @@ function drawChart(id, series, fmt, includeZero) {
     g.strokeStyle = s.color;
     g.lineWidth = 3;
     g.beginPath();
-    s.data.forEach((v, k) => {
-      const x = k / Math.max(1, s.data.length - 1) * w;
-      k ? g.lineTo(x, y(v)) : g.moveTo(x, y(v));
+    s.data.forEach((p, k) => {
+      const px = (1 - p[0] / SPAN) * w;
+      k ? g.lineTo(px, y(p[1])) : g.moveTo(px, y(p[1]));
     });
     g.stroke();
   });
@@ -3385,7 +3423,7 @@ async function poll() {
       {data: hh.rates.ann, color: '#fd0'},
       {data: hh.rates.dresp, color: '#f6c'}
     ], v => Math.round(v) + '/s', true);
-    const last = a => a.length ? a[a.length - 1] : 0;
+    const last = a => a.length ? a[a.length - 1][1] : 0;
     document.getElementById('rate_now').textContent =
         'now: ' + last(hh.rates.sync) + '/' + last(hh.rates.fup) + '/' +
         last(hh.rates.ann) + '/' + last(hh.rates.dresp);
@@ -4361,9 +4399,10 @@ int main(int argc, char **argv) {
                 (uint16_t)g_cnt_sync.exchange(0),
                 (uint16_t)g_cnt_fup.exchange(0),
                 (uint16_t)g_cnt_ann.exchange(0),
-                (uint16_t)g_cnt_dresp.exchange(0)};
-            g_hist_rate_i = (g_hist_rate_i + 1) % kHistN;
-            if (g_hist_rate_n < kHistN)
+                (uint16_t)g_cnt_dresp.exchange(0),
+                (uint32_t)(now_ns / 1000000ULL)};
+            g_hist_rate_i = (g_hist_rate_i + 1) % kHistSlow;
+            if (g_hist_rate_n < kHistSlow)
                 g_hist_rate_n++;
         }
 
@@ -4501,8 +4540,8 @@ int main(int argc, char **argv) {
         bool gm_recent_change = false;
         bool gm_unaccepted = false;
         // Analysis history copies (oldest first) for the graph styles
-        int32_t hoff[kHistN], hdel[kHistN];
-        uint16_t hrate[4][kHistN];
+        int32_t hoff[kHistFast], hdel[kHistSlow];
+        uint16_t hrate[4][kHistSlow];
         int hoff_n = 0, hdel_n = 0, hrate_n = 0;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -4512,17 +4551,20 @@ int main(int argc, char **argv) {
                 if (ce.style == "graph" || ce.style == "rates")
                     want_hist = true;
             if (want_hist) {
-                auto cp = [](const int32_t *buf, int n, int i, int32_t *dst) {
+                auto cp = [](const HistPoint *buf, int cap, int n, int i,
+                             int32_t *dst) {
                     for (int k = 0; k < n; ++k)
-                        dst[k] = buf[(i - n + k + 2 * kHistN) % kHistN];
+                        dst[k] = buf[(i - n + k + 2 * cap) % cap].v;
                     return n;
                 };
-                hoff_n = cp(g_hist_off, g_hist_off_n, g_hist_off_i, hoff);
-                hdel_n = cp(g_hist_del, g_hist_del_n, g_hist_del_i, hdel);
+                hoff_n = cp(g_hist_off, kHistFast, g_hist_off_n,
+                            g_hist_off_i, hoff);
+                hdel_n = cp(g_hist_del, kHistSlow, g_hist_del_n,
+                            g_hist_del_i, hdel);
                 hrate_n = g_hist_rate_n;
                 for (int k = 0; k < hrate_n; ++k) {
-                    int idx = (g_hist_rate_i - hrate_n + k + 2 * kHistN)
-                              % kHistN;
+                    int idx = (g_hist_rate_i - hrate_n + k + 2 * kHistSlow)
+                              % kHistSlow;
                     hrate[0][k] = g_hist_rate[idx].sync;
                     hrate[1][k] = g_hist_rate[idx].fup;
                     hrate[2][k] = g_hist_rate[idx].ann;
@@ -4877,7 +4919,7 @@ int main(int argc, char **argv) {
             // "graph" plots the offset deviation per Sync plus the path
             // delay samples, "rates" the received messages per second.
             struct Series { const int32_t *v; int n; Color col; };
-            int32_t r32[4][kHistN];
+            int32_t r32[4][kHistSlow];
             std::vector<Series> series;
             if (style == "graph") {
                 series.push_back({hdel, hdel_n, Color(40, 140, 255)});
