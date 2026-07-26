@@ -2539,8 +2539,14 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  .chart-title { color: #aaa; font-size: 0.85em; margin: 0.7em 0 0.2em; }
  .chart-legend { color: #888; font-size: 0.8em; margin: 0.2em 0 0.4em;
         font-family: monospace; }
- .chart-desc { color: #777; font-size: 0.78em; margin: 0.25em 0 0.9em;
-        line-height: 1.45; }
+ .info { position: relative; display: inline-block; cursor: help;
+        color: #58a6ff; margin-left: 0.35em; }
+ .info .tip { display: none; position: absolute; left: 0; top: 1.5em;
+        z-index: 10; width: 34em; max-width: 80vw; background: #1d1d1d;
+        border: 1px solid #444; border-radius: 6px; padding: 0.6em 0.9em;
+        color: #aaa; font-size: 0.95em; line-height: 1.5;
+        text-align: left; }
+ .info:hover .tip { display: block; }
  .snrwrap { display: flex; align-items: flex-end; gap: 3px; height: 52px;
         margin: 0.3em 0 1.4em; }
  .snrbar { width: 11px; border-radius: 2px 2px 0 0; position: relative; }
@@ -2611,43 +2617,48 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 <div class="chart-legend" id="ts_mode" style="margin:0 0 0.2em">&ndash;</div>
 <div class="chart-legend" style="margin:0 0 0.5em">All charts show the
 last 5 minutes; grid lines mark one minute.</div>
-<div class="chart-title">Sync PDV &mdash; offset deviation per Sync</div>
+<div class="chart-title">Sync PDV &mdash; offset deviation per Sync
+<span class="info">&#9432;<span class="tip">Packet delay variation
+(PDV): how much each Sync message wobbles around its expected arrival
+time. Smaller is better. Rules of thumb &mdash; network with boundary
+clocks everywhere: within &plusmn;100 ns; AES67: &plusmn;500 ns per
+AES11, most devices are fine up to &plusmn;5 &micro;s; Dante: anything
+under &plusmn;500 &micro;s is great. Note that software timestamps
+(no PHC) add &micro;s-level noise of their own on
+top.</span></span></div>
 <canvas class="chart" id="ch_pdv"></canvas>
-<p class="chart-desc"><span style="color:#fd0">&#9632;</span> Packet delay variation (PDV): how much each Sync message wobbles around
-its expected arrival time. Smaller is better. Rules of thumb &mdash;
-network with boundary clocks everywhere: within &plusmn;100 ns; AES67:
-&plusmn;500 ns per AES11, most devices are fine up to &plusmn;5 &micro;s;
-Dante: anything under &plusmn;500 &micro;s is great. Note that software
-timestamps (no PHC) add &micro;s-level noise of their own on top.</p>
-<div class="chart-title">Path delay</div>
-<canvas class="chart" id="ch_del"></canvas>
-<p class="chart-desc"><span style="color:#6cf">&#9632;</span> One-way network
-delay between the grandmaster and this clock, measured once per second.
-It should be a flat line &mdash; the value itself is just cable length
+<div class="chart-title">Path delay
+<span class="info">&#9432;<span class="tip">One-way network delay
+between the grandmaster and this clock, measured once per second. It
+should be a flat line &mdash; the value itself is just cable length
 plus switch count. A sudden step means the path through the network
-changed; a widening band means queueing delay from other traffic.</p>
-<div class="chart-title">Received message rates (per second, this domain)</div>
+changed; a widening band means queueing delay from other
+traffic.</span></span></div>
+<canvas class="chart" id="ch_del"></canvas>
+<div class="chart-title">Received message rates (per second, this domain)
+<span class="info">&#9432;<span class="tip">Every PTP message received
+in the active domain (all masters, before any filtering). Sync and
+Follow_Up should run at the grandmaster's rate &mdash; a gap between
+the two lines means lost Follow_Ups; Announce is the masters' heartbeat
+for the BMCA, and Delay_Resp answers our one Delay_Req per
+second.</span></span></div>
 <canvas class="chart" id="ch_rate"></canvas>
 <div class="chart-legend"><span style="color:#6c6">&#9632;</span> Sync
 &nbsp;<span style="color:#6cf">&#9632;</span> Follow_Up
 &nbsp;<span style="color:#fd0">&#9632;</span> Announce
 &nbsp;<span style="color:#f6c">&#9632;</span> Delay_Resp
 &nbsp;&nbsp;<span id="rate_now"></span></div>
-<p class="chart-desc">Every PTP message received in the active domain
-(all masters, before any filtering). Sync and Follow_Up should run at the
-grandmaster's rate &mdash; a gap between the two lines means lost
-Follow_Ups; Announce is the masters' heartbeat for the BMCA, and
-Delay_Resp answers our one Delay_Req per second.</p>
 <div id="cmp_wrap" style="display:none">
 <div class="chart-title">Network PTP vs GNSS (per Sync of the network
-master)</div>
+master)
+<span class="info">&#9432;<span class="tip">Each Sync of the network
+grandmaster measured against our GNSS reference (path delay
+subtracted): the real error of the network's time distribution as seen
+from GPS. Positive = the network master is ahead of
+GNSS.</span></span></div>
 <canvas class="chart" id="ch_cmp"></canvas>
 <div class="chart-legend"><span style="color:#f96">&#9632;</span>
 <span id="cmp_info">network master &minus; GNSS</span></div>
-<p class="chart-desc">Each Sync of the network grandmaster measured
-against our GNSS reference (path delay subtracted): the real error of
-the network's time distribution as seen from GPS. Positive = the network
-master is ahead of GNSS.</p>
 </div>
 </fieldset>
 
@@ -3335,8 +3346,14 @@ static const char *kAnalysisHtml = R"ANA(<!DOCTYPE html>
  canvas { width: 100%; height: 34vh; display: block; background: #0a0a0a;
           border: 1px solid #222; border-radius: 4px; }
  .chart-legend { color: #888; font-size: 0.9em; margin: 0.3em 0 0.6em; }
- .chart-desc { color: #777; font-size: 0.85em; margin: 0.25em 0 0.9em;
-        line-height: 1.5; max-width: 75em; }
+ .info { position: relative; display: inline-block; cursor: help;
+        color: #58a6ff; margin-left: 0.35em; }
+ .info .tip { display: none; position: absolute; left: 0; top: 1.5em;
+        z-index: 10; width: 36em; max-width: 80vw; background: #1d1d1d;
+        border: 1px solid #444; border-radius: 6px; padding: 0.6em 0.9em;
+        color: #aaa; font-size: 0.9em; line-height: 1.5;
+        text-align: left; }
+ .info:hover .tip { display: block; }
 </style>
 </head>
 <body>
@@ -3345,42 +3362,47 @@ static const char *kAnalysisHtml = R"ANA(<!DOCTYPE html>
 <div id="ts_mode">&ndash;</div>
 <div class="chart-legend">All charts show the last 5 minutes; grid lines
 mark one minute.</div>
-<div class="chart-title">Sync PDV &mdash; offset deviation per Sync</div>
+<div class="chart-title">Sync PDV &mdash; offset deviation per Sync
+<span class="info">&#9432;<span class="tip">Packet delay variation
+(PDV): how much each Sync message wobbles around its expected arrival
+time. Smaller is better. Rules of thumb &mdash; network with boundary
+clocks everywhere: within &plusmn;100 ns; AES67: &plusmn;500 ns per
+AES11, most devices are fine up to &plusmn;5 &micro;s; Dante: anything
+under &plusmn;500 &micro;s is great. Note that software timestamps
+(no PHC) add &micro;s-level noise of their own on
+top.</span></span></div>
 <canvas id="ch_pdv" style="height:26vh"></canvas>
-<p class="chart-desc"><span style="color:#fd0">&#9632;</span> Packet delay variation (PDV): how much each Sync message wobbles around
-its expected arrival time. Smaller is better. Rules of thumb &mdash;
-network with boundary clocks everywhere: within &plusmn;100 ns; AES67:
-&plusmn;500 ns per AES11, most devices are fine up to &plusmn;5 &micro;s;
-Dante: anything under &plusmn;500 &micro;s is great. Note that software
-timestamps (no PHC) add &micro;s-level noise of their own on top.</p>
-<div class="chart-title">Path delay</div>
-<canvas id="ch_del" style="height:26vh"></canvas>
-<p class="chart-desc"><span style="color:#6cf">&#9632;</span> One-way network
-delay between the grandmaster and this clock, measured once per second.
-It should be a flat line &mdash; the value itself is just cable length
+<div class="chart-title">Path delay
+<span class="info">&#9432;<span class="tip">One-way network delay
+between the grandmaster and this clock, measured once per second. It
+should be a flat line &mdash; the value itself is just cable length
 plus switch count. A sudden step means the path through the network
-changed; a widening band means queueing delay from other traffic.</p>
-<div class="chart-title">Received message rates (per second, this domain)</div>
+changed; a widening band means queueing delay from other
+traffic.</span></span></div>
+<canvas id="ch_del" style="height:26vh"></canvas>
+<div class="chart-title">Received message rates (per second, this domain)
+<span class="info">&#9432;<span class="tip">Every PTP message received
+in the active domain (all masters, before any filtering). Sync and
+Follow_Up should run at the grandmaster's rate &mdash; a gap between
+the two lines means lost Follow_Ups; Announce is the masters' heartbeat
+for the BMCA, and Delay_Resp answers our one Delay_Req per
+second.</span></span></div>
 <canvas id="ch_rate" style="height:26vh"></canvas>
 <div class="chart-legend"><span style="color:#6c6">&#9632;</span> Sync
 &nbsp;<span style="color:#6cf">&#9632;</span> Follow_Up
 &nbsp;<span style="color:#fd0">&#9632;</span> Announce
 &nbsp;<span style="color:#f6c">&#9632;</span> Delay_Resp
 &nbsp;&nbsp;<span id="rate_now"></span></div>
-<p class="chart-desc">Every PTP message received in the active domain
-(all masters, before any filtering). Sync and Follow_Up should run at the
-grandmaster's rate &mdash; a gap between the two lines means lost
-Follow_Ups; Announce is the masters' heartbeat for the BMCA, and
-Delay_Resp answers our one Delay_Req per second.</p>
 <div id="cmp_wrap" style="display:none">
-<div class="chart-title">Network PTP vs GNSS</div>
+<div class="chart-title">Network PTP vs GNSS
+<span class="info">&#9432;<span class="tip">Each Sync of the network
+grandmaster measured against our GNSS reference (path delay
+subtracted): the real error of the network's time distribution as seen
+from GPS. Positive = the network master is ahead of
+GNSS.</span></span></div>
 <canvas id="ch_cmp" style="height:26vh"></canvas>
 <div class="chart-legend"><span style="color:#f96">&#9632;</span>
 network master &minus; GNSS, per Sync &nbsp;<span id="cmp_now"></span></div>
-<p class="chart-desc">Each Sync of the network grandmaster measured
-against our GNSS reference (path delay subtracted): the real error of
-the network's time distribution as seen from GPS. Positive = the network
-master is ahead of GNSS.</p>
 </div>
 <script>
 function drawChart(id, series, fmt, includeZero) {
