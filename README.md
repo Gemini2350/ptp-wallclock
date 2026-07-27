@@ -294,15 +294,20 @@ of just displaying one. It needs two signals from the receiver:
 - **PPS** on a GPIO (tells exactly when the second starts) — default
   `/dev/pps0`
 
-Example wiring for the Waveshare MAX-M8Q GNSS HAT (whose PPS is on
-GPIO 18 out of the box; it stacks under the LED matrix HAT with a
-stacking header and conflicts with none of its pins) — in
-`/boot/firmware/config.txt`:
+Example receiver: the Waveshare MAX-M8Q GNSS HAT (PPS on GPIO 18 out of
+the box; it stacks under the LED matrix HAT with a stacking header and
+conflicts with none of its pins). The OS side is one command:
 
+```bash
+sudo ./install.sh --gnss
 ```
-enable_uart=1
-dtoverlay=pps-gpio,gpiopin=18
-```
+
+then reboot. This enables the serial port, gives it the good PL011 UART
+(`dtoverlay=disable-bt`), loads the `pps-gpio` overlay (GPIO 18 by
+default — override with `GNSS_PPS_GPIO=nn`), removes the serial login
+console that would eat the NMEA stream, and installs `pps-tools`. All
+idempotent, with `.wallclock.bak` backups of the boot files. Verify
+with `sudo ppstest /dev/pps0` and `timeout 3 cat /dev/serial0`.
 
 Then enable **PTP grandmaster (GNSS)** on the settings page. Activation
 is deliberately two-staged:

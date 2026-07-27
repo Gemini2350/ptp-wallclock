@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # One-step installer for ptp-wallclock on Raspberry Pi OS.
-# Usage: sudo ./install.sh
+# Usage: sudo ./install.sh          — build + install + service
+#        sudo ./install.sh --gnss   — additionally prepare the OS for a
+#                                     GNSS receiver (NMEA on serial0,
+#                                     PPS on GPIO 18; override with
+#                                     GNSS_PPS_GPIO=nn). Reboot after.
 set -euo pipefail
+
+GNSS_SETUP=0
+for arg in "$@"; do
+    [ "$arg" = "--gnss" ] && GNSS_SETUP=1
+done
 
 MATRIX_DIR=/opt/rpi-rgb-led-matrix
 FONT_DIR=/usr/share/fonts/rpi-rgb-led-matrix
@@ -60,9 +69,68 @@ systemctl enable ptp-wallclock.service
 # restart (not just start) so re-running install.sh picks up the new binary
 systemctl restart ptp-wallclock.service
 
+NEED_REBOOT=0
+if [ "$GNSS_SETUP" = 1 ]; then
+    echo "==> GNSS setup: serial port + PPS overlay"
+    BOOTDIR=/boot/firmware
+    [ -f "$BOOTDIR/config.txt" ] || BOOTDIR=/boot
+    CFG="$BOOTDIR/config.txt"
+    CMD="$BOOTDIR/cmdline.txt"
+    PPS_GPIO="${GNSS_PPS_GPIO:-18}"
+
+    if [ -f "$CFG" ]; then
+        need_any=0
+        grep -q "^enable_uart=1" "$CFG" || need_any=1
+        grep -q "^dtoverlay=disable-bt" "$CFG" || need_any=1
+        grep -q "^dtoverlay=pps-gpio" "$CFG" || need_any=1
+        if [ "$need_any" = 1 ]; then
+            [ -f "$CFG.wallclock.bak" ] || cp "$CFG" "$CFG.wallclock.bak"
+            {
+                echo ""
+                echo "# ptp-wallclock: GNSS receiver (NMEA + PPS)"
+            } >> "$CFG"
+            # enable_uart: the serial port itself; disable-bt: give the
+            # good PL011 UART to serial0 instead of Bluetooth (the mini
+            # UART's baud rate floats with the core clock)
+            grep -q "^enable_uart=1" "$CFG" || \
+                { echo "enable_uart=1" >> "$CFG"; echo "    + enable_uart=1"; }
+            grep -q "^dtoverlay=disable-bt" "$CFG" || \
+                { echo "dtoverlay=disable-bt" >> "$CFG"; \
+                  echo "    + dtoverlay=disable-bt"; }
+            grep -q "^dtoverlay=pps-gpio" "$CFG" || \
+                { echo "dtoverlay=pps-gpio,gpiopin=$PPS_GPIO" >> "$CFG"; \
+                  echo "    + dtoverlay=pps-gpio,gpiopin=$PPS_GPIO"; }
+            NEED_REBOOT=1
+        else
+            echo "    boot config already in place"
+        fi
+    else
+        echo "    WARNING: $CFG not found — not Raspberry Pi OS?" >&2
+    fi
+
+    # A login console on the serial port would eat the NMEA stream
+    if [ -f "$CMD" ] && grep -Eq 'console=(serial0|ttyAMA0|ttyS0),[0-9]+' "$CMD"; then
+        [ -f "$CMD.wallclock.bak" ] || cp "$CMD" "$CMD.wallclock.bak"
+        sed -Ei 's/console=(serial0|ttyAMA0|ttyS0),[0-9]+ ?//g' "$CMD"
+        echo "    - removed the serial login console from cmdline.txt"
+        NEED_REBOOT=1
+    fi
+    systemctl disable --now serial-getty@ttyAMA0.service >/dev/null 2>&1 || true
+    systemctl disable --now serial-getty@ttyS0.service >/dev/null 2>&1 || true
+    systemctl disable hciuart >/dev/null 2>&1 || true
+
+    # handy for debugging: sudo ppstest /dev/pps0
+    apt-get install -y pps-tools >/dev/null 2>&1 || true
+fi
+
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 echo
 echo "Done. The clock starts automatically on boot."
 echo "  Status:   systemctl status ptp-wallclock"
 echo "  Logs:     journalctl -u ptp-wallclock -f"
 echo "  Settings: http://${IP:-<pi-address>}:8319"
+if [ "$NEED_REBOOT" = 1 ]; then
+    echo
+    echo "  GNSS boot configuration written — PLEASE REBOOT, then enable"
+    echo "  'Use a GNSS receiver' on the settings page."
+fi
