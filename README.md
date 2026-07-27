@@ -316,6 +316,14 @@ console that would eat the NMEA stream, and installs `pps-tools`. All
 idempotent, with `.wallclock.bak` backups of the boot files. Verify
 with `sudo ppstest /dev/pps0` and `timeout 3 cat /dev/serial0`.
 
+For the last microsecond, `sudo ./install.sh --gnss-tune` installs a
+small boot-time service that sets the `performance` CPU governor and
+pins the PPS interrupt to CPU 2 (the matrix refresh claims CPU 3) —
+idle-state wakeups and frequency scaling otherwise add variable
+interrupt latency. Measured on a Pi 5, this visibly tightens the
+time-error band. Remember to re-check the **GNSS PPS offset**
+calibration after changing tuning: the latency floor moves with it.
+
 Then enable **PTP grandmaster (GNSS)** on the settings page. Activation
 is deliberately two-staged:
 

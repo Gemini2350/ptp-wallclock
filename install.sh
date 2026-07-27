@@ -5,11 +5,20 @@
 #                                     GNSS receiver (NMEA on serial0,
 #                                     PPS on GPIO 18; override with
 #                                     GNSS_PPS_GPIO=nn). Reboot after.
+#        sudo ./install.sh --gnss-tune
+#                                   — install a boot-time tuning service
+#                                     that pins the PPS interrupt to a
+#                                     quiet CPU and sets the performance
+#                                     governor (reduces PPS interrupt
+#                                     latency jitter; combine with
+#                                     --gnss)
 set -euo pipefail
 
 GNSS_SETUP=0
+GNSS_TUNE=0
 for arg in "$@"; do
     [ "$arg" = "--gnss" ] && GNSS_SETUP=1
+    [ "$arg" = "--gnss-tune" ] && GNSS_TUNE=1
 done
 
 MATRIX_DIR=/opt/rpi-rgb-led-matrix
@@ -121,6 +130,42 @@ if [ "$GNSS_SETUP" = 1 ]; then
 
     # handy for debugging: sudo ppstest /dev/pps0
     apt-get install -y pps-tools >/dev/null 2>&1 || true
+fi
+
+if [ "$GNSS_TUNE" = 1 ]; then
+    echo "==> GNSS tuning: performance governor + PPS IRQ affinity"
+    cat > /usr/local/lib/ptp-wallclock-tune.sh <<'EOF'
+#!/bin/sh
+# ptp-wallclock: reduce PPS interrupt latency jitter.
+# Lock the CPU clocks (idle-state wakeups and DVFS transitions add
+# microsecond-scale, variable interrupt latency) and pin the PPS
+# interrupt to CPU 2 — the LED matrix refresh thread claims CPU 3.
+for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance > "$g" 2>/dev/null || true
+done
+irq=$(awk -F: '/pps/ {gsub(/ /, "", $1); print $1; exit}' /proc/interrupts)
+if [ -n "$irq" ]; then
+    echo 4 > "/proc/irq/$irq/smp_affinity" 2>/dev/null || true
+fi
+exit 0
+EOF
+    chmod 755 /usr/local/lib/ptp-wallclock-tune.sh
+    cat > /etc/systemd/system/ptp-wallclock-tune.service <<'EOF'
+[Unit]
+Description=PTP Wallclock latency tuning (governor + PPS IRQ affinity)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/ptp-wallclock-tune.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable ptp-wallclock-tune.service >/dev/null
+    systemctl restart ptp-wallclock-tune.service
+    echo "    applied now and re-applied on every boot"
 fi
 
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')

@@ -288,6 +288,11 @@ static int64_t g_last_t1 = 0;             // master send time (TAI ns, corrected
 static int64_t g_last_t2 = 0;             // local arrival time (mono ns)
 static bool g_last_pair_wire = true;      // false: GNSS pair (no path)
 
+// Sync-PDV state: previous wire pair for the successive-difference
+// computation (main thread)
+static bool g_pdv_have = false;
+static int64_t g_pdv_t1 = 0, g_pdv_t2 = 0;
+
 struct PendingDelayReq {
     bool valid = false;
     uint16_t seq = 0;
@@ -855,6 +860,7 @@ static void reset_ptp_state() {
     g_path_delay_ns = 0;
     g_last_sync_mono_ns = 0;
     g_last_sync_age_ns = 0;
+    g_pdv_have = false;
     g_cmp_target_valid = false;
     g_cmp_have = false;
     g_cmp_count = 0;
@@ -1074,6 +1080,28 @@ static void format_signed_offset(char *out, size_t n, long long ns) {
 // runs frequency-corrected between samples.
 static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true,
                                bool freq_update = true) {
+    // Sync PDV, independent of the local clock: the change of the raw
+    // (t2 - t1) between consecutive Syncs, corrected only by the
+    // learned oscillator frequency — the servo's PHASE never enters, so
+    // the chart shows the network's jitter in every mode.
+    if (wire) {
+        if (g_pdv_have) {
+            int64_t dt2 = t2 - g_pdv_t2;
+            if (dt2 > 0 && dt2 < 5000000000LL) {
+                int64_t d =
+                    ((t2 - t1) - (g_pdv_t2 - g_pdv_t1)) -
+                    (int64_t)(g_srv_freq.load(std::memory_order_relaxed) *
+                              (double)dt2);
+                std::lock_guard<std::mutex> lock(g_mutex);
+                hist_push(g_hist_off, kHistFast, g_hist_off_n,
+                          g_hist_off_i, d);
+            }
+        }
+        g_pdv_t1 = t1;
+        g_pdv_t2 = t2;
+        g_pdv_have = true;
+    }
+
     g_last_t1 = t1;
     g_last_t2 = t2;
     g_last_pair_wire = wire;
@@ -1106,13 +1134,6 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true,
 
     if (g_have_offset)
         offset_warn_check(e);
-    {
-        // Analysis history: how far this sync was off the prediction
-        std::lock_guard<std::mutex> lock(g_mutex);
-        hist_push(g_hist_off, kHistFast, g_hist_off_n, g_hist_off_i,
-                  g_have_offset ? e : 0);
-    }
-
     if (!g_have_offset || llabs(e) > 100000000LL || dt <= 0 ||
         dt > 60000000000LL) {
         // First sample, step, or stale reference: jump the phase, keep
@@ -2899,8 +2920,10 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
 last 5 minutes; grid lines mark one minute.</div>
 <div class="chart-title">Sync PDV &mdash; offset deviation per Sync
 <span class="info">&#9432;<span class="tip">Packet delay variation
-(PDV): how much each Sync message wobbles around its expected arrival
-time. Smaller is better. Rules of thumb &mdash; network with boundary
+(PDV): the arrival jitter between consecutive Sync messages of the
+network master, corrected only by the learned oscillator rate &mdash;
+measured directly on the wire timestamps, independent of this clock's
+servo. Smaller is better. Rules of thumb &mdash; network with boundary
 clocks everywhere: within &plusmn;100 ns; AES67: &plusmn;500 ns per
 AES11, most devices are fine up to &plusmn;5 &micro;s; Dante: anything
 under &plusmn;500 &micro;s is great. Note that software timestamps
@@ -3664,8 +3687,10 @@ static const char *kAnalysisHtml = R"ANA(<!DOCTYPE html>
 mark one minute.</div>
 <div class="chart-title">Sync PDV &mdash; offset deviation per Sync
 <span class="info">&#9432;<span class="tip">Packet delay variation
-(PDV): how much each Sync message wobbles around its expected arrival
-time. Smaller is better. Rules of thumb &mdash; network with boundary
+(PDV): the arrival jitter between consecutive Sync messages of the
+network master, corrected only by the learned oscillator rate &mdash;
+measured directly on the wire timestamps, independent of this clock's
+servo. Smaller is better. Rules of thumb &mdash; network with boundary
 clocks everywhere: within &plusmn;100 ns; AES67: &plusmn;500 ns per
 AES11, most devices are fine up to &plusmn;5 &micro;s; Dante: anything
 under &plusmn;500 &micro;s is great. Note that software timestamps
