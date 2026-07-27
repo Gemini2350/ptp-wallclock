@@ -309,8 +309,11 @@ static int64_t g_offset_ns = 0;           // legacy mirror: servo offset at
 static std::atomic<long long> g_srv_off{0};          // offset at t_ref, ns
 static std::atomic<unsigned long long> g_srv_tref{0};  // local ref time
 static std::atomic<double> g_srv_freq{0.0};   // local freq error, fraction
-static const double kServoKp = 0.12;          // phase gain per sample
-static const double kServoKi = 0.02;          // frequency gain per sample
+// Servo gains scale with the sample interval so the loop keeps its
+// bandwidth whether it is fed 8 wire Syncs per second or one
+// lower-envelope GNSS sample every 8 s (fixed per-sample gains starved
+// the loop at low rates: the drift outran the correction)
+static const double kServoTauNs = 8e9;        // target time constant
 
 static uint8_t g_clock_id[8] = {0};       // our clockIdentity (EUI-64 from MAC)
 
@@ -1116,12 +1119,16 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
         g_srv_tref = (uint64_t)t2;
         g_have_offset = true;
     } else {
+        double a = (double)dt / kServoTauNs;   // phase gain
+        if (a > 0.6) a = 0.6;
+        if (a < 0.12) a = 0.12;
+        double b = a * a / 2.0;                // frequency gain
         double freq = g_srv_freq.load(std::memory_order_relaxed);
-        freq += kServoKi * (double)e / (double)dt;
+        freq += b * (double)e / (double)dt;
         if (freq > 500e-6) freq = 500e-6;
         if (freq < -500e-6) freq = -500e-6;
         g_srv_freq = freq;
-        g_srv_off = pred + (int64_t)(kServoKp * (double)e);
+        g_srv_off = pred + (int64_t)(a * (double)e);
         g_srv_tref = (uint64_t)t2;
     }
     g_offset_ns = g_srv_off.load();       // legacy mirrors (offset at the
@@ -1775,6 +1782,13 @@ static void gnss_thread() {
                                            drop_run < 2) {
                                     drop_run++;
                                     g_gnss_spikes++;
+                                } else if (llabs(e) > 25000) {
+                                    // The servo is far off (start-up or
+                                    // after an outage): feed it NOW —
+                                    // the lower-envelope refinement only
+                                    // matters at the microsecond level
+                                    drop_run = 0;
+                                    forward = true;
                                 } else {
                                     drop_run = 0;
                                     if (!win_have || e < win_best_e) {
