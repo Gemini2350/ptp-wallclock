@@ -1563,8 +1563,8 @@ static void gnss_thread() {
     uint64_t next_reopen = 0;
     std::string ser_dev, pps_dev;
     bool extts_on = false;                // PHC extts currently armed
-    int64_t off_hist[5];                  // GPIO-PPS spike gate
-    int off_n = 0, off_i = 0;
+    int drop_run = 0;                     // consecutive spike drops
+    bool xlate_warned = false;
 
     for (;;) {
         bool enabled;
@@ -1683,19 +1683,28 @@ static void gnss_thread() {
                         fdata.info.assert_tu.nsec;
                     // The kernel stamps the pulse with CLOCK_REALTIME.
                     // Preferred translation into the timing clock: the
-                    // kernel-measured PHC-vs-REALTIME offset; fallback:
-                    // two adjacent user-space reads.
+                    // kernel-measured PHC-vs-REALTIME offset — but only
+                    // while it agrees with the plain two-read fallback;
+                    // a driver quirk here must never poison the clock.
+                    timespec rt;
+                    clock_gettime(CLOCK_REALTIME, &rt);
+                    uint64_t loc = local_clock_ns();
+                    int64_t rt_now = (int64_t)rt.tv_sec *
+                                     1000000000LL + rt.tv_nsec;
+                    uint64_t p_sw = (uint64_t)((int64_t)loc -
+                                               (rt_now - pulse_rt));
+                    pulse_local = p_sw;
                     int64_t diff;
                     if (phc_minus_realtime(&diff)) {
-                        pulse_local = (uint64_t)(pulse_rt + diff);
-                    } else {
-                        timespec rt;
-                        clock_gettime(CLOCK_REALTIME, &rt);
-                        uint64_t loc = local_clock_ns();
-                        int64_t rt_now = (int64_t)rt.tv_sec *
-                                         1000000000LL + rt.tv_nsec;
-                        pulse_local = (uint64_t)((int64_t)loc -
-                                                 (rt_now - pulse_rt));
+                        uint64_t p_ext = (uint64_t)(pulse_rt + diff);
+                        if (llabs((int64_t)(p_ext - p_sw)) < 50000) {
+                            pulse_local = p_ext;
+                        } else if (!xlate_warned) {
+                            xlate_warned = true;
+                            std::cout << "GNSS: PTP_SYS_OFFSET_EXTENDED "
+                                         "disagrees with clock reads, "
+                                         "using plain translation\n";
+                        }
                     }
                     pulse_mono = mono_ns();
                     g_gnss_last_pps = pulse_mono;
@@ -1738,26 +1747,24 @@ static void gnss_thread() {
                                 // late by the configured offset
                                 int64_t t2v =
                                     (int64_t)pulse_local - pps_off;
-                                // GPIO-PPS spike gate: interrupt-latency
-                                // outliers more than 10 us off the
-                                // rolling median are dropped (the PHC
-                                // extts source is clean, no gate there)
+                                // GPIO-PPS spike gate: compare against
+                                // the SERVO PREDICTION (which knows the
+                                // oscillator drift — the raw offset
+                                // itself ramps with it and must not be
+                                // gated on). Interrupt-latency outliers
+                                // more than 10 us off are dropped, but
+                                // never more than two in a row, so the
+                                // gate can never starve the clock.
                                 bool sample_ok = true;
-                                if (!use_extts) {
-                                    int64_t o = t2v - t1v;
-                                    off_hist[off_i] = o;
-                                    off_i = (off_i + 1) % 5;
-                                    if (off_n < 5)
-                                        off_n++;
-                                    if (off_n == 5) {
-                                        int64_t s5[5];
-                                        memcpy(s5, off_hist, sizeof(s5));
-                                        std::sort(s5, s5 + 5);
-                                        if (llabs(o - s5[2]) > 10000)
-                                            sample_ok = false;
-                                    }
+                                if (!use_extts && g_have_offset &&
+                                    drop_run < 2) {
+                                    int64_t e = (t2v - t1v) -
+                                                offset_at((uint64_t)t2v);
+                                    if (llabs(e) > 10000)
+                                        sample_ok = false;
                                 }
                                 if (sample_ok) {
+                                    drop_run = 0;
                                     std::lock_guard<std::mutex> lk(
                                         g_gnss_mutex);
                                     g_gnss_t1 = t1v;
@@ -1766,8 +1773,8 @@ static void gnss_thread() {
                                     g_gnss_last_sample = n2;
                                     g_gnss_sample_count++;
                                 } else {
+                                    drop_run++;
                                     g_gnss_spikes++;
-                                    g_gnss_last_sample = n2;  // still locked
                                 }
                             }
                         }
@@ -4672,7 +4679,9 @@ int main(int argc, char **argv) {
                 current_utc_offset = (int16_t)g_settings.gm_utc_offset;
 
                 // Comparison target: the best FOREIGN master still
-                // sending — its Syncs are measured against GNSS
+                // sending — its Syncs are measured against GNSS. Only
+                // while genuinely locked: in holdover the coasting local
+                // clock would masquerade as the master's time error.
                 int best = -1;
                 for (size_t i = 0; i < g_masters.size(); ++i) {
                     if (memcmp(g_masters[i].sender + 0, g_clock_id, 8) == 0)
@@ -4682,7 +4691,7 @@ int main(int argc, char **argv) {
                                          g_masters[best].gm) < 0)
                         best = (int)i;
                 }
-                if (best >= 0) {
+                if (best >= 0 && gnss_ok) {
                     if (!g_cmp_target_valid.load() ||
                         memcmp(g_cmp_target, g_masters[best].sender,
                                10) != 0) {
