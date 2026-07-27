@@ -1565,6 +1565,12 @@ static void gnss_thread() {
     bool extts_on = false;                // PHC extts currently armed
     int drop_run = 0;                     // consecutive spike drops
     bool xlate_warned = false;
+    // Lower-envelope selection for GPIO PPS: interrupt latency is
+    // strictly additive, so the sample with the smallest
+    // prediction-relative offset in each window is the most truthful
+    int64_t win_t1 = 0, win_t2 = 0, win_best_e = 0;
+    int win_cnt = 0;
+    bool win_have = false;
 
     for (;;) {
         bool enabled;
@@ -1747,34 +1753,59 @@ static void gnss_thread() {
                                 // late by the configured offset
                                 int64_t t2v =
                                     (int64_t)pulse_local - pps_off;
-                                // GPIO-PPS spike gate: compare against
-                                // the SERVO PREDICTION (which knows the
-                                // oscillator drift — the raw offset
-                                // itself ramps with it and must not be
-                                // gated on). Interrupt-latency outliers
-                                // more than 10 us off are dropped, but
-                                // never more than two in a row, so the
-                                // gate can never starve the clock.
-                                bool sample_ok = true;
-                                if (!use_extts && g_have_offset &&
-                                    drop_run < 2) {
-                                    int64_t e = (t2v - t1v) -
-                                                offset_at((uint64_t)t2v);
-                                    if (llabs(e) > 10000)
-                                        sample_ok = false;
-                                }
-                                if (sample_ok) {
+                                // GPIO PPS pipeline (all deviations are
+                                // measured against the servo PREDICTION
+                                // — the raw offset ramps with the
+                                // oscillator drift and must never be
+                                // judged on its level):
+                                // 1. coarse 50-us sanity gate (max two
+                                //    drops in a row — can't starve),
+                                // 2. lower-envelope pick: forward only
+                                //    the least-latency sample of each
+                                //    8-s window; GPIO interrupt latency
+                                //    is strictly additive, so the
+                                //    smallest offset is the truest.
+                                // The PHC extts source skips all this.
+                                bool have_pred = g_have_offset;
+                                int64_t e = 0;
+                                if (have_pred)
+                                    e = (t2v - t1v) -
+                                        offset_at((uint64_t)t2v);
+                                bool forward = false;
+                                int64_t f_t1 = t1v, f_t2 = t2v;
+                                if (use_extts || !have_pred) {
+                                    forward = true;   // clean / bootstrap
+                                } else if (llabs(e) > 50000 &&
+                                           drop_run < 2) {
+                                    drop_run++;
+                                    g_gnss_spikes++;
+                                } else {
                                     drop_run = 0;
+                                    if (!win_have || e < win_best_e) {
+                                        win_best_e = e;
+                                        win_t1 = t1v;
+                                        win_t2 = t2v;
+                                        win_have = true;
+                                    }
+                                    // receiver is healthy: keep the
+                                    // lock fresh while accumulating
+                                    g_gnss_last_sample = n2;
+                                    if (++win_cnt >= 8) {
+                                        forward = true;
+                                        f_t1 = win_t1;
+                                        f_t2 = win_t2;
+                                        win_cnt = 0;
+                                        win_have = false;
+                                    }
+                                }
+                                if (forward) {
                                     std::lock_guard<std::mutex> lk(
                                         g_gnss_mutex);
-                                    g_gnss_t1 = t1v;
-                                    g_gnss_t2 = t2v;
+                                    g_gnss_t1 = f_t1;
+                                    g_gnss_t2 = f_t2;
                                     g_gnss_sample_valid = true;
                                     g_gnss_last_sample = n2;
                                     g_gnss_sample_count++;
-                                } else {
-                                    drop_run++;
-                                    g_gnss_spikes++;
                                 }
                             }
                         }
