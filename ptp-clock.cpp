@@ -1262,23 +1262,19 @@ static void process_general_packet(const uint8_t *buf, ssize_t len,
         int64_t t3 = (int64_t)g_pending_dreq.t3_mono;
         g_pending_dreq.valid = false;
 
-        // Drift-corrected mean path delay: each leg is evaluated with
-        // the servo's offset model at its own instant, so oscillator
-        // drift between the last Sync and this exchange cancels instead
-        // of leaking a few us into the measurement. A servo bias common
-        // to both instants cancels between the legs. A GNSS reference
-        // pair has no network path — then the return leg alone (whose
-        // offset IS the GNSS truth) carries the delay.
-        int64_t d_back = t4 - (t3 - offset_at((uint64_t)t3))
-                         - corr_to_ns(buf + 8);
-        int64_t sample;
-        if (g_last_pair_wire) {
-            int64_t d_fwd =
-                (g_last_t2 - offset_at((uint64_t)g_last_t2)) - g_last_t1;
-            sample = (d_fwd + d_back) / 2;
-        } else {
-            sample = d_back;
-        }
+        // Phase-independent mean path delay: wire quantities only, with
+        // the oscillator drift over the Sync->Delay_Req gap corrected
+        // from the servo's FREQUENCY estimate alone. Referencing the
+        // servo's phase per leg would leak every wobble of the (GNSS)
+        // reference into the delay — the symptom was a noisy delay
+        // chart in GNSS mode although the physical path is constant.
+        if (!g_last_pair_wire)
+            return;                       // no wire Sync pair available
+        int64_t gap = t3 - g_last_t2;
+        int64_t sample =
+            ((g_last_t2 - g_last_t1) + (t4 - t3) -
+             corr_to_ns(buf + 8)) / 2 +
+            (int64_t)(g_srv_freq.load() * (double)gap / 2.0);
         if (sample < 0)
             sample = 0;
         if (sample > 1000000000LL)        // > 1 s: bogus, discard
@@ -2229,16 +2225,13 @@ static void process_v1_general(const uint8_t *buf, ssize_t len,
             (int64_t)current_utc_offset.load() * 1000000000LL;
         int64_t t3 = (int64_t)g_pending_dreq.t3_mono;
         g_pending_dreq.valid = false;
-        // Same drift-corrected leg-by-leg computation as the v2 handler
-        int64_t d_back = t4 - (t3 - offset_at((uint64_t)t3));
-        int64_t sample;
-        if (g_last_pair_wire) {
-            int64_t d_fwd =
-                (g_last_t2 - offset_at((uint64_t)g_last_t2)) - g_last_t1;
-            sample = (d_fwd + d_back) / 2;
-        } else {
-            sample = d_back;
-        }
+        // Same phase-independent computation as the v2 handler
+        if (!g_last_pair_wire)
+            return;                       // no wire Sync pair available
+        int64_t gap = t3 - g_last_t2;
+        int64_t sample =
+            ((g_last_t2 - g_last_t1) + (t4 - t3)) / 2 +
+            (int64_t)(g_srv_freq.load() * (double)gap / 2.0);
         if (sample < 0)
             sample = 0;
         if (sample > 1000000000LL)
