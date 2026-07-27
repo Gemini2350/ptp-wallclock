@@ -292,7 +292,14 @@ of just displaying one. It needs two signals from the receiver:
 - **NMEA** on a serial port (tells which second it is) — default
   `/dev/serial0`, 9600 baud
 - **PPS** on a GPIO (tells exactly when the second starts) — default
-  `/dev/pps0`
+  `/dev/pps0`. GPIO PPS timestamps carry the kernel's interrupt latency
+  (µs-class); the clock reduces that with a kernel-measured
+  PHC↔REALTIME translation (`PTP_SYS_OFFSET_EXTENDED`) and a rolling
+  median gate that drops interrupt-latency spikes. On boards whose NIC
+  exposes the SYNC_IN pin (CM4/CM5 on an IO board — the Pi 5 Model B
+  does not), set the PPS device to `phc`: the pulse is then
+  hardware-timestamped by the PHC itself (extts, à la `ts2phc`) with no
+  interrupt in the path at all
 
 Example receiver: the Waveshare MAX-M8Q GNSS HAT (PPS on GPIO 18 out of
 the box; it stacks under the LED matrix HAT with a stacking header and

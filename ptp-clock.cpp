@@ -19,6 +19,7 @@
 #include <termios.h>
 #ifdef __linux__
 #include <linux/pps.h>
+#include <linux/ptp_clock.h>
 #endif
 #ifdef __linux__
 #include <linux/net_tstamp.h>
@@ -386,6 +387,8 @@ static std::atomic<unsigned long long> g_gnss_last_sample{0};  // mono
 static std::atomic<uint32_t> g_gnss_sample_count{0};
 static std::atomic<bool> g_gnss_serial_ok{false};
 static std::atomic<bool> g_gnss_pps_ok{false};
+static std::atomic<bool> g_gnss_extts{false};   // PPS stamped by the PHC
+static std::atomic<uint32_t> g_gnss_spikes{0};  // dropped GPIO-PPS outliers
 static std::atomic<int> g_gnss_serial_fd{-1};       // opened while root
 static std::atomic<int> g_gnss_pps_fd{-1};
 
@@ -443,6 +446,43 @@ static uint64_t local_clock_ns() {
     }
 #endif
     return mono_ns();
+}
+
+// Kernel-measured offset PHC minus CLOCK_REALTIME, taken with
+// PTP_SYS_OFFSET_EXTENDED (each sample is a sys/phc/sys triple captured
+// in a tight in-kernel window; we keep the tightest of five). Used to
+// translate kernel PPS timestamps into the PHC timebase far more
+// precisely than two separate user-space clock reads with scheduling
+// jitter in between.
+static bool phc_minus_realtime(int64_t *diff_out) {
+#ifdef __linux__
+    if (!g_hwts || g_phc_fd < 0)
+        return false;
+    struct ptp_sys_offset_extended sox;
+    memset(&sox, 0, sizeof(sox));
+    sox.n_samples = 5;
+    if (ioctl(g_phc_fd, PTP_SYS_OFFSET_EXTENDED, &sox) != 0)
+        return false;
+    auto ns = [](const struct ptp_clock_time &t) {
+        return (int64_t)t.sec * 1000000000LL + (int64_t)t.nsec;
+    };
+    int64_t best_w = -1, best_d = 0;
+    for (unsigned i = 0; i < sox.n_samples && i < PTP_MAX_SAMPLES; ++i) {
+        int64_t t0 = ns(sox.ts[i][0]);
+        int64_t tp = ns(sox.ts[i][1]);
+        int64_t t1 = ns(sox.ts[i][2]);
+        int64_t w = t1 - t0;
+        if (best_w < 0 || w < best_w) {
+            best_w = w;
+            best_d = tp - (t0 + t1) / 2;
+        }
+    }
+    *diff_out = best_d;
+    return true;
+#else
+    (void)diff_out;
+    return false;
+#endif
 }
 
 // Forward declaration (defined right below)
@@ -1522,6 +1562,9 @@ static void gnss_thread() {
     uint64_t pulse_local = 0, pulse_mono = 0;
     uint64_t next_reopen = 0;
     std::string ser_dev, pps_dev;
+    bool extts_on = false;                // PHC extts currently armed
+    int64_t off_hist[5];                  // GPIO-PPS spike gate
+    int off_n = 0, off_i = 0;
 
     for (;;) {
         bool enabled;
@@ -1560,25 +1603,73 @@ static void gnss_thread() {
             pps_dev = cfg_pps;
         }
         uint64_t now = mono_ns();
-        if ((sfd < 0 || pfd < 0) && now >= next_reopen) {
+        bool use_extts = (cfg_pps == "phc");
+        if ((sfd < 0 || (pfd < 0 && !use_extts)) && now >= next_reopen) {
             next_reopen = now + 5000000000ULL;
             if (sfd < 0) {
                 sfd = gnss_open_serial(ser_dev.c_str());
                 g_gnss_serial_fd = sfd;
             }
 #ifdef __linux__
-            if (pfd < 0) {
+            if (pfd < 0 && !use_extts) {
                 pfd = gnss_open_pps(pps_dev.c_str());
                 g_gnss_pps_fd = pfd;
             }
 #endif
         }
         g_gnss_serial_ok = sfd >= 0;
-        g_gnss_pps_ok = pfd >= 0;
+        if (!use_extts)
+            g_gnss_pps_ok = pfd >= 0;
 
         // --- PPS pulse (blocks up to 200 ms) ---
 #ifdef __linux__
-        if (pfd >= 0) {
+        if (extts_on && !use_extts) {     // mode switched away: disarm
+            struct ptp_extts_request req;
+            memset(&req, 0, sizeof(req));
+            ioctl(g_phc_fd, PTP_EXTTS_REQUEST, &req);
+            extts_on = false;
+        }
+        if (use_extts) {
+            // gm_pps = "phc": the NIC hardware stamps the pulse on the
+            // SYNC_IN pin directly in the PHC timebase (CM4/CM5) — no
+            // GPIO interrupt latency, no clock translation
+            if (!g_hwts || g_phc_fd < 0) {
+                g_gnss_pps_ok = false;
+                g_gnss_extts = false;
+                usleep(500000);
+            } else {
+                if (!extts_on) {
+                    struct ptp_extts_request req;
+                    memset(&req, 0, sizeof(req));
+                    req.index = 0;
+                    req.flags = PTP_ENABLE_FEATURE | PTP_RISING_EDGE;
+                    if (ioctl(g_phc_fd, PTP_EXTTS_REQUEST, &req) == 0) {
+                        extts_on = true;
+                        std::cout << "GNSS: PPS via PHC extts enabled\n";
+                    } else {
+                        g_gnss_pps_ok = false;
+                        g_gnss_extts = false;
+                        usleep(1000000);
+                    }
+                }
+                if (extts_on) {
+                    g_gnss_pps_ok = true;
+                    g_gnss_extts = true;
+                    struct pollfd pf{g_phc_fd, POLLIN, 0};
+                    if (poll(&pf, 1, 200) > 0 && (pf.revents & POLLIN)) {
+                        struct ptp_extts_event ev;
+                        if (read(g_phc_fd, &ev, sizeof(ev)) ==
+                            (ssize_t)sizeof(ev)) {
+                            pulse_local = (uint64_t)ev.t.sec *
+                                          1000000000ULL + ev.t.nsec;
+                            pulse_mono = mono_ns();
+                            g_gnss_last_pps = pulse_mono;
+                        }
+                    }
+                }
+            }
+        } else if (pfd >= 0) {
+            g_gnss_extts = false;
             struct pps_fdata fdata{};
             fdata.timeout.sec = 0;
             fdata.timeout.nsec = 200000000;
@@ -1587,18 +1678,25 @@ static void gnss_thread() {
                 if (!have_seq || fdata.info.assert_sequence != last_seq) {
                     have_seq = true;
                     last_seq = fdata.info.assert_sequence;
-                    // The pulse is stamped with CLOCK_REALTIME; translate
-                    // it into the local timing clock
-                    timespec rt;
-                    clock_gettime(CLOCK_REALTIME, &rt);
-                    uint64_t loc = local_clock_ns();
-                    int64_t rt_now =
-                        (int64_t)rt.tv_sec * 1000000000LL + rt.tv_nsec;
                     int64_t pulse_rt =
                         (int64_t)fdata.info.assert_tu.sec * 1000000000LL +
                         fdata.info.assert_tu.nsec;
-                    pulse_local =
-                        (uint64_t)((int64_t)loc - (rt_now - pulse_rt));
+                    // The kernel stamps the pulse with CLOCK_REALTIME.
+                    // Preferred translation into the timing clock: the
+                    // kernel-measured PHC-vs-REALTIME offset; fallback:
+                    // two adjacent user-space reads.
+                    int64_t diff;
+                    if (phc_minus_realtime(&diff)) {
+                        pulse_local = (uint64_t)(pulse_rt + diff);
+                    } else {
+                        timespec rt;
+                        clock_gettime(CLOCK_REALTIME, &rt);
+                        uint64_t loc = local_clock_ns();
+                        int64_t rt_now = (int64_t)rt.tv_sec *
+                                         1000000000LL + rt.tv_nsec;
+                        pulse_local = (uint64_t)((int64_t)loc -
+                                                 (rt_now - pulse_rt));
+                    }
                     pulse_mono = mono_ns();
                     g_gnss_last_pps = pulse_mono;
                 }
@@ -1634,15 +1732,43 @@ static void gnss_thread() {
                             // just preceded it
                             if (pulse_mono &&
                                 n2 - pulse_mono < 900000000ULL) {
-                                std::lock_guard<std::mutex> lk(g_gnss_mutex);
-                                g_gnss_t1 =
+                                int64_t t1v =
                                     ((int64_t)utc + utc_off) * 1000000000LL;
                                 // antenna/cable delay: the pulse arrives
                                 // late by the configured offset
-                                g_gnss_t2 = (int64_t)pulse_local - pps_off;
-                                g_gnss_sample_valid = true;
-                                g_gnss_last_sample = n2;
-                                g_gnss_sample_count++;
+                                int64_t t2v =
+                                    (int64_t)pulse_local - pps_off;
+                                // GPIO-PPS spike gate: interrupt-latency
+                                // outliers more than 10 us off the
+                                // rolling median are dropped (the PHC
+                                // extts source is clean, no gate there)
+                                bool sample_ok = true;
+                                if (!use_extts) {
+                                    int64_t o = t2v - t1v;
+                                    off_hist[off_i] = o;
+                                    off_i = (off_i + 1) % 5;
+                                    if (off_n < 5)
+                                        off_n++;
+                                    if (off_n == 5) {
+                                        int64_t s5[5];
+                                        memcpy(s5, off_hist, sizeof(s5));
+                                        std::sort(s5, s5 + 5);
+                                        if (llabs(o - s5[2]) > 10000)
+                                            sample_ok = false;
+                                    }
+                                }
+                                if (sample_ok) {
+                                    std::lock_guard<std::mutex> lk(
+                                        g_gnss_mutex);
+                                    g_gnss_t1 = t1v;
+                                    g_gnss_t2 = t2v;
+                                    g_gnss_sample_valid = true;
+                                    g_gnss_last_sample = n2;
+                                    g_gnss_sample_count++;
+                                } else {
+                                    g_gnss_spikes++;
+                                    g_gnss_last_sample = n2;  // still locked
+                                }
                             }
                         }
                     }
@@ -1782,7 +1908,7 @@ static void try_enable_hw_timestamping(int sock_event) {
 
         char path[32];
         snprintf(path, sizeof(path), "/dev/ptp%d", info.phc_index);
-        int fd = open(path, O_RDONLY);
+        int fd = open(path, O_RDWR);      // r/w: extts requests need it
         if (fd < 0) {
             std::cerr << "Hardware timestamping: cannot open " << path
                       << ", staying on software timestamps\n";
@@ -2516,6 +2642,8 @@ static std::string status_json() {
               ? (double)(mono_ns() - g_gnss_last_pps.load()) / 1e9
               : -1.0) << ","
       << "\"gnss_samples\":" << g_gnss_sample_count.load() << ","
+      << "\"gnss_extts\":" << (g_gnss_extts ? "true" : "false") << ","
+      << "\"gnss_spikes\":" << g_gnss_spikes.load() << ","
       << "\"cmp_valid\":"
       << (g_cmp_target_valid.load() && g_cmp_count.load() > 0 ? "true"
                                                               : "false")
@@ -2851,6 +2979,11 @@ measurement.</p>
 <label>PPS device:
  <input type="text" id="gm_pps" value="/dev/pps0">
 </label>
+<p class="hint">Usually <code>/dev/pps0</code> (GPIO). On boards whose
+NIC exposes the SYNC_IN pin (CM4/CM5 on an IO board), enter
+<code>phc</code> instead: the pulse is then hardware-timestamped by the
+PHC itself — no GPIO interrupt latency. The Pi&nbsp;5 Model&nbsp;B does
+not expose that pin.</p>
 <label>Priority 1:
  <input type="number" id="gm_prio1" min="0" max="255" value="128">
 </label>
@@ -3312,7 +3445,11 @@ async function poll() {
           sum += s.gnss_pps_age >= 0 ? ', PPS lost!' : ', no PPS pulse yet';
         if (!s.gnss_serial_ok) sum += ' — serial closed!';
         if (!s.gnss_pps_ok) sum += ' — PPS closed!';
-        sum += ' (' + s.gnss_samples + ' samples)';
+        if (s.gnss_extts) sum += ', PPS hardware-stamped by the PHC';
+        sum += ' (' + s.gnss_samples + ' samples';
+        if (s.gnss_spikes > 0)
+          sum += ', ' + s.gnss_spikes + ' spikes dropped';
+        sum += ')';
       }
       document.getElementById('gnss_sum').textContent = sum;
       const snrCol = v => v >= 35 ? '#6c6' : v >= 20 ? '#fd0' : '#f66';
