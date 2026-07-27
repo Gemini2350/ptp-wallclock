@@ -402,6 +402,7 @@ struct SatInfo { char talker[3]; int prn; int snr; uint64_t seen; };
 static std::mutex g_gnss_mutex;
 static std::vector<SatInfo> g_gnss_sats;
 static bool g_gnss_sample_valid = false;
+static bool g_gnss_sample_freq_ok = true;   // sample may steer the freq
 static int64_t g_gnss_t1 = 0, g_gnss_t2 = 0;
 
 // Wire-PTP vs GNSS comparison (clock GNSS-driven, network Syncs measured
@@ -1071,7 +1072,8 @@ static void format_signed_offset(char *out, size_t n, long long ns) {
 // error no longer produces a standing lag (offset-only smoothing lags by
 // freq * time constant — ~160 us for 20 ppm), and the displayed time
 // runs frequency-corrected between samples.
-static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
+static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true,
+                               bool freq_update = true) {
     g_last_t1 = t1;
     g_last_t2 = t2;
     g_last_pair_wire = wire;
@@ -1127,11 +1129,17 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
         if (a > 0.6) a = 0.6;
         if (a < 0.02) a = 0.02;
         double b = a * a / 2.0;                // frequency gain
-        double freq = g_srv_freq.load(std::memory_order_relaxed);
-        freq += b * (double)e / (double)dt;
-        if (freq > 500e-6) freq = 500e-6;
-        if (freq < -500e-6) freq = -500e-6;
-        g_srv_freq = freq;
+        if (freq_update) {
+            // Below-floor GPIO samples adjust the phase only: they are
+            // latency-distribution luck, not oscillator information —
+            // integrating them biased the frequency low (visible as a
+            // slow downward creep between window corrections)
+            double freq = g_srv_freq.load(std::memory_order_relaxed);
+            freq += b * (double)e / (double)dt;
+            if (freq > 500e-6) freq = 500e-6;
+            if (freq < -500e-6) freq = -500e-6;
+            g_srv_freq = freq;
+        }
         g_srv_off = pred + (int64_t)(a * (double)e);
         g_srv_tref = (uint64_t)t2;
     }
@@ -1779,6 +1787,7 @@ static void gnss_thread() {
                                     e = (t2v - t1v) -
                                         offset_at((uint64_t)t2v);
                                 bool forward = false;
+                                bool fwd_freq_ok = true;
                                 int64_t f_t1 = t1v, f_t2 = t2v;
                                 if (use_extts || !have_pred) {
                                     forward = true;   // clean / bootstrap
@@ -1799,9 +1808,11 @@ static void gnss_thread() {
                                     // sample is strictly more truthful —
                                     // take it immediately (downward
                                     // corrections fast, upward ones via
-                                    // the slow window minimum)
+                                    // the slow window minimum). Phase
+                                    // only: it carries no rate info.
                                     drop_run = 0;
                                     forward = true;
+                                    fwd_freq_ok = false;
                                 } else {
                                     drop_run = 0;
                                     if (!win_have || e < win_best_e) {
@@ -1826,6 +1837,7 @@ static void gnss_thread() {
                                         g_gnss_mutex);
                                     g_gnss_t1 = f_t1;
                                     g_gnss_t2 = f_t2;
+                                    g_gnss_sample_freq_ok = fwd_freq_ok;
                                     g_gnss_sample_valid = true;
                                     g_gnss_last_sample = n2;
                                     g_gnss_sample_count++;
@@ -4630,6 +4642,7 @@ int main(int argc, char **argv) {
         // --- GNSS time sample (grandmaster mode): disciplines the clock ---
         {
             bool have = false;
+            bool freq_ok = true;
             int64_t t1 = 0, t2 = 0;
             {
                 std::lock_guard<std::mutex> lk(g_gnss_mutex);
@@ -4637,11 +4650,12 @@ int main(int argc, char **argv) {
                     have = true;
                     t1 = g_gnss_t1;
                     t2 = g_gnss_t2;
+                    freq_ok = g_gnss_sample_freq_ok;
                     g_gnss_sample_valid = false;
                 }
             }
             if (have)
-                complete_sync_pair(t1, t2, false);
+                complete_sync_pair(t1, t2, false, freq_ok);
         }
 
         // --- Auto domain: rescan when Announce stops for 15 s ---
