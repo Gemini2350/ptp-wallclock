@@ -147,6 +147,13 @@ irq=$(awk -F: '/pps/ {gsub(/ /, "", $1); print $1; exit}' /proc/interrupts)
 if [ -n "$irq" ]; then
     echo 4 > "/proc/irq/$irq/smp_affinity" 2>/dev/null || true
 fi
+# NIC interrupt coalescing: the default (~49 us) delays packet delivery
+# by a variable amount. Irrelevant for hardware timestamps (the MAC
+# stamps at wire time), but it directly widens software timestamps.
+for dev in /sys/class/net/eth* /sys/class/net/en*; do
+    [ -e "$dev" ] || continue
+    ethtool -C "$(basename "$dev")" tx-usecs 4 rx-usecs 4 2>/dev/null || true
+done
 exit 0
 EOF
     chmod 755 /usr/local/lib/ptp-wallclock-tune.sh
