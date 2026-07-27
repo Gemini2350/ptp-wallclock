@@ -1119,9 +1119,13 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true) {
         g_srv_tref = (uint64_t)t2;
         g_have_offset = true;
     } else {
-        double a = (double)dt / kServoTauNs;   // phase gain
+        // Adaptive stiffness: full bandwidth while chasing a real error,
+        // a 4x gentler loop once settled — the remaining sample scatter
+        // then moves the clock far less
+        double tau = llabs(e) < 3000 ? 4.0 * kServoTauNs : kServoTauNs;
+        double a = (double)dt / tau;           // phase gain
         if (a > 0.6) a = 0.6;
-        if (a < 0.12) a = 0.12;
+        if (a < 0.02) a = 0.02;
         double b = a * a / 2.0;                // frequency gain
         double freq = g_srv_freq.load(std::memory_order_relaxed);
         freq += b * (double)e / (double)dt;
@@ -1787,6 +1791,15 @@ static void gnss_thread() {
                                     // after an outage): feed it NOW —
                                     // the lower-envelope refinement only
                                     // matters at the microsecond level
+                                    drop_run = 0;
+                                    forward = true;
+                                } else if (e < -1000) {
+                                    // Below the current floor estimate:
+                                    // latency only ever ADDS, so this
+                                    // sample is strictly more truthful —
+                                    // take it immediately (downward
+                                    // corrections fast, upward ones via
+                                    // the slow window minimum)
                                     drop_run = 0;
                                     forward = true;
                                 } else {
