@@ -1462,23 +1462,51 @@ static int gnss_open_pps(const char *dev) {
 #endif
 
 // Open the GNSS devices while still privileged (called from main before
-// the matrix library drops to the daemon user)
+// the matrix library drops to the daemon user). Runs even with the GNSS
+// mode off — the fds cost nothing and let the web UI enable the
+// receiver later without a service restart. With the mode on, wait a
+// little: at boot the service can win the race against udev creating
+// /dev/serial0 and /dev/pps0.
 static void gnss_open_initial() {
-    int s = gnss_open_serial(g_settings.gm_serial.c_str());
-    g_gnss_serial_fd = s;
-    if (s >= 0)
-        std::cout << "GNSS: serial " << g_settings.gm_serial << " open\n";
-    else
-        std::cerr << "GNSS: cannot open serial " << g_settings.gm_serial
-                  << "\n";
+    int waited = 0;
+    for (;;) {
+        if (g_gnss_serial_fd.load() < 0) {
+            int s = gnss_open_serial(g_settings.gm_serial.c_str());
+            g_gnss_serial_fd = s;
+            if (s >= 0)
+                std::cout << "GNSS: serial " << g_settings.gm_serial
+                          << " open\n";
+        }
 #ifdef __linux__
-    int p = gnss_open_pps(g_settings.gm_pps.c_str());
-    g_gnss_pps_fd = p;
-    if (p >= 0)
-        std::cout << "GNSS: PPS " << g_settings.gm_pps << " open\n";
-    else
-        std::cerr << "GNSS: cannot open PPS " << g_settings.gm_pps << "\n";
+        if (g_gnss_pps_fd.load() < 0) {
+            int p = gnss_open_pps(g_settings.gm_pps.c_str());
+            g_gnss_pps_fd = p;
+            if (p >= 0)
+                std::cout << "GNSS: PPS " << g_settings.gm_pps
+                          << " open\n";
+        }
+        bool ok = g_gnss_serial_fd.load() >= 0 &&
+                  g_gnss_pps_fd.load() >= 0;
+#else
+        bool ok = g_gnss_serial_fd.load() >= 0;
 #endif
+        if (ok || !g_settings.gm_enable || waited >= 20)
+            break;
+        if (waited == 0)
+            std::cout << "GNSS: waiting for devices...\n";
+        sleep(1);
+        waited++;
+    }
+    if (g_settings.gm_enable) {
+        if (g_gnss_serial_fd.load() < 0)
+            std::cerr << "GNSS: cannot open serial "
+                      << g_settings.gm_serial << "\n";
+#ifdef __linux__
+        if (g_gnss_pps_fd.load() < 0)
+            std::cerr << "GNSS: cannot open PPS " << g_settings.gm_pps
+                      << "\n";
+#endif
+    }
 }
 
 // GNSS thread: pairs each PPS pulse (the exact top of second) with the
@@ -4130,9 +4158,9 @@ int main(int argc, char **argv) {
     fcntl(sock_sync, F_SETFL, O_NONBLOCK);
     fcntl(sock_general, F_SETFL, O_NONBLOCK);
 
-    // Grandmaster mode: open the GNSS devices while still privileged
-    if (g_settings.gm_enable)
-        gnss_open_initial();
+    // GNSS devices: open while still privileged (always — see the
+    // function comment)
+    gnss_open_initial();
     std::thread(gnss_thread).detach();
 
 #ifndef NO_MATRIX
