@@ -1418,6 +1418,47 @@ static void build_delay_resp(uint8_t *buf, const uint8_t *req,
     memcpy(buf + 44, req + 20, 10);       // requestingPortIdentity
 }
 
+// ---- gPTP (802.1AS) master TX: v2 messages with transportSpecific 1
+// and the TLVs the standard requires ----
+
+// Announce + path trace TLV (76 bytes): 802.1AS requires the path
+// trace; as grandmaster the path is just our own identity
+static void build_gptp_announce(uint8_t *buf, uint16_t seq,
+                                const GMInfo &self, int16_t utc_off,
+                                bool traceable) {
+    memset(buf, 0, 76);
+    build_announce(buf, seq, self, utc_off, traceable);
+    buf[0] |= 0x10;                       // transportSpecific 802.1AS
+    buf[2] = 0;
+    buf[3] = 76;                          // length incl. TLV
+    buf[64] = 0x00; buf[65] = 0x08;       // tlvType PATH_TRACE
+    buf[66] = 0x00; buf[67] = 0x08;       // lengthField
+    memcpy(buf + 68, g_clock_id, 8);
+}
+
+static void build_gptp_sync(uint8_t *buf, uint16_t seq,
+                            int64_t approx_tai_ns) {
+    build_sync(buf, seq, approx_tai_ns);
+    buf[0] |= 0x10;
+    buf[33] = (uint8_t)-3;                // logMessageInterval: 125 ms
+}
+
+// Follow_Up + information TLV (76 bytes): required by 802.1AS; the
+// rate-offset fields are zero (we ARE the timebase)
+static void build_gptp_follow_up(uint8_t *buf, uint16_t seq,
+                                 int64_t t1_tai_ns) {
+    memset(buf, 0, 76);
+    build_follow_up(buf, seq, t1_tai_ns);
+    buf[0] |= 0x10;
+    buf[2] = 0;
+    buf[3] = 76;
+    buf[33] = (uint8_t)-3;
+    buf[44] = 0x00; buf[45] = 0x03;       // tlvType ORGANIZATION_EXTENSION
+    buf[46] = 0x00; buf[47] = 28;         // lengthField
+    buf[48] = 0x00; buf[49] = 0x80; buf[50] = 0xC2;   // 802.1 OUI
+    buf[51] = 0x00; buf[52] = 0x00; buf[53] = 0x01;   // subtype 1
+}
+
 // ---- GNSS receiver (NMEA + PPS) for the grandmaster mode ----
 
 static bool nmea_checksum_ok(const char *line) {
@@ -2326,6 +2367,77 @@ static void build_v1_delay_req(uint8_t *buf, uint16_t seq) {
     buf[32] = 1;                          // control: Delay_Req
 }
 
+// ---- PTPv1 master TX ----
+static void put_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+// Shared v1 header (40 bytes) with our identity
+static void v1_master_header(uint8_t *buf, size_t len, uint8_t msg_type,
+                             uint8_t control, uint16_t seq) {
+    memset(buf, 0, len);
+    buf[1] = 1;                           // versionPTP
+    buf[3] = 1;                           // versionNetwork
+    memcpy(buf + 4, "_DFLT", 5);
+    buf[20] = msg_type;
+    buf[21] = 1;                          // sourceCommTech: Ethernet
+    buf[22] = g_clock_id[0]; buf[23] = g_clock_id[1];
+    buf[24] = g_clock_id[2]; buf[25] = g_clock_id[5];
+    buf[26] = g_clock_id[6]; buf[27] = g_clock_id[7];
+    buf[29] = 1;                          // sourcePortId
+    buf[30] = (uint8_t)(seq >> 8);
+    buf[31] = (uint8_t)(seq & 0xFF);
+    buf[32] = control;
+}
+
+// v1 Sync (124 bytes): carries the whole grandmaster dataset — v1 has
+// no Announce. Two-step (PTP_ASSIST set), UTC timescale.
+static void build_v1_sync(uint8_t *buf, uint16_t seq, int64_t utc_ns_est,
+                          bool locked, int utc_off) {
+    v1_master_header(buf, 124, 1, 0, seq);
+    buf[35] = 0x08;                       // flags: PTP_ASSIST (two-step)
+    put_be32(buf + 40, (uint32_t)(utc_ns_est / 1000000000LL));
+    put_be32(buf + 44, (uint32_t)(utc_ns_est % 1000000000LL));
+    buf[50] = (uint8_t)(utc_off >> 8);    // currentUTCOffset
+    buf[51] = (uint8_t)(utc_off & 0xFF);
+    buf[53] = 1;                          // gm commTech
+    memcpy(buf + 54, buf + 22, 6);        // gm uuid = our uuid
+    buf[61] = 1;                          // gm portId
+    buf[62] = (uint8_t)(seq >> 8);        // gm sequenceId
+    buf[63] = (uint8_t)(seq & 0xFF);
+    buf[67] = locked ? 1 : 2;             // stratum: GPS / holdover
+    memcpy(buf + 68, locked ? "GPS " : "DFLT", 4);
+    buf[74] = 0xF0; buf[75] = 0x60;       // variance -4000 (decent)
+    buf[77] = 0;                          // not preferred
+    buf[83] = 0;                          // syncInterval: 1 s
+    buf[95] = buf[67];                    // localClockStratum
+}
+
+// v1 Follow_Up (52 bytes) with the precise origin timestamp (UTC)
+static void build_v1_follow_up(uint8_t *buf, uint16_t aseq,
+                               int64_t utc_ns) {
+    v1_master_header(buf, 52, 2, 2, aseq);
+    buf[42] = (uint8_t)(aseq >> 8);       // associatedSequenceId
+    buf[43] = (uint8_t)(aseq & 0xFF);
+    put_be32(buf + 44, (uint32_t)(utc_ns / 1000000000LL));
+    put_be32(buf + 48, (uint32_t)(utc_ns % 1000000000LL));
+}
+
+// v1 Delay_Resp (60 bytes) for a received v1 Delay_Req
+static void build_v1_delay_resp(uint8_t *buf, const uint8_t *req,
+                                int64_t t4_utc_ns) {
+    v1_master_header(buf, 60, 2, 3, (uint16_t)((req[30] << 8) | req[31]));
+    put_be32(buf + 40, (uint32_t)(t4_utc_ns / 1000000000LL));
+    put_be32(buf + 44, (uint32_t)(t4_utc_ns % 1000000000LL));
+    buf[49] = req[21];                    // requestingSourceCommTech
+    memcpy(buf + 50, req + 22, 6);        // requestingSourceUuid
+    memcpy(buf + 56, req + 28, 2);        // requestingSourcePortId
+    memcpy(buf + 58, req + 30, 2);        // requestingSourceSequenceId
+}
+
 // ---- gPTP / IEEE 802.1AS (AVB, Milan) ----
 // v2-format messages in raw Ethernet frames (EtherType 0x88F7, multicast
 // 01:80:C2:00:00:0E, transportSpecific nibble 1). Sync/Follow_Up carry
@@ -3024,8 +3136,8 @@ matrix:</p>
 </label>
 <p class="hint">gPTP listens on raw Ethernet (EtherType 0x88F7) and uses
 the peer-delay mechanism; PTPv1 shares the UDP ports with v2 but speaks
-the 2002 message format. Domain and grandmaster mode apply to PTPv2
-only.</p>
+the 2002 message format. The domain setting applies to PTPv2 only;
+grandmaster mode transmits on whichever profile is selected.</p>
 <label>
  <input type="checkbox" id="domain_auto" checked> Detect domain automatically
 </label>
@@ -4475,6 +4587,7 @@ int main(int argc, char **argv) {
 
     uint64_t last_dreq_ns = 0;
     uint64_t last_gm_tx_ns = 0;
+    uint64_t last_gm_sync_ns = 0;         // gPTP Sync cadence (125 ms)
     uint64_t last_bmca_ns = 0;
     struct JoinedIface { std::string name; uint32_t ip; };
     std::vector<JoinedIface> joined;      // multicast memberships we hold
@@ -4615,8 +4728,27 @@ int main(int argc, char **argv) {
             ssize_t len = 0;
             uint64_t ts = recv_event_packet(sock_sync, buf, sizeof(buf), &len);
             if (mode == MODE_V1) {
-                if (len > 0)
+                if (len >= 124 && ((buf[0] << 8) | buf[1]) == 1 &&
+                    buf[32] == 1 && g_role.load() == ROLE_GM_ACTIVE &&
+                    ts != 0) {
+                    // v1 Delay_Req from a slave: answer with t4 in UTC
+                    uint8_t resp[60];
+                    int64_t t4_utc =
+                        (int64_t)ts - offset_at(ts) -
+                        (int64_t)current_utc_offset.load() * 1000000000LL;
+                    build_v1_delay_resp(resp, buf, t4_utc);
+                    for (const auto &j : joined) {
+                        in_addr mif{};
+                        mif.s_addr = j.ip;
+                        setsockopt(sock_general, IPPROTO_IP,
+                                   IP_MULTICAST_IF, &mif, sizeof(mif));
+                        sendto(sock_general, resp, sizeof(resp), 0,
+                               (struct sockaddr *)&gen_dst,
+                               sizeof(gen_dst));
+                    }
+                } else if (len > 0) {
                     process_v1_event(buf, len, ts);
+                }
             } else if (mode == MODE_V2 &&
                        len >= 44 && (buf[0] & 0x0F) == 0x01) {
                 // Delay_Req from a client: answer when we are the GM
@@ -4709,10 +4841,9 @@ int main(int argc, char **argv) {
                 role = ROLE_GM_WAIT;
                 // Slave only unless master mode is deliberately enabled:
                 // without gm_master we never enter the BMCA as a
-                // candidate, so we can never win it. Master mode itself
-                // is PTPv2-only.
-                if ((gnss_ok || holdover) && g_settings.gm_master &&
-                    g_ptp_mode.load() == MODE_V2) {
+                // candidate, so we can never win it. The transmit side
+                // follows the selected profile (v2 UDP, gPTP L2, or v1).
+                if ((gnss_ok || holdover) && g_settings.gm_master) {
                     if (g_domain.load() < 0 && g_active_domain.load() < 0) {
                         g_active_domain = 0;   // we define the domain now
                         std::cout << "Grandmaster mode: using domain 0\n";
@@ -4884,53 +5015,134 @@ int main(int argc, char **argv) {
             }
         }
 
-        // --- Grandmaster TX: Announce + two-step Sync/Follow_Up at 1 Hz
-        //     (PTPv2 only) ---
-        if (g_role.load() == ROLE_GM_ACTIVE && mode == MODE_V2 &&
-            !joined.empty() && now_ns - last_gm_tx_ns >= 1000000000ULL) {
-            last_gm_tx_ns = now_ns;
+        // --- Grandmaster TX on the selected profile ---
+        if (g_role.load() == ROLE_GM_ACTIVE && !joined.empty()) {
             GMInfo self;
-            int16_t utc_off;
-            {
+            int16_t utc_off = 37;
+            bool tx_ann = now_ns - last_gm_tx_ns >= 1000000000ULL;
+            // gPTP wants Sync every 125 ms (its receipt timeout is 3
+            // intervals); v2/v1 send at 1 Hz
+            bool tx_sync = mode == MODE_GPTP
+                ? now_ns - last_gm_sync_ns >= 125000000ULL
+                : tx_ann;
+            if (tx_ann || tx_sync) {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 self = g_gm;              // our own dataset — we are elected
                 utc_off = (int16_t)g_settings.gm_utc_offset;
             }
-            uint8_t ann[64], sync[44], fup[44];
-            build_announce(ann, ++g_ann_seq, self, utc_off,
-                           self.clock_class == 6);
-            ++g_sync_seq;
-            for (const auto &j : joined) {
-                in_addr mif{};
-                mif.s_addr = j.ip;
-                setsockopt(sock_sync, IPPROTO_IP, IP_MULTICAST_IF,
-                           &mif, sizeof(mif));
-                setsockopt(sock_general, IPPROTO_IP, IP_MULTICAST_IF,
-                           &mif, sizeof(mif));
-                sendto(sock_general, ann, sizeof(ann), 0,
-                       (struct sockaddr *)&gen_dst, sizeof(gen_dst));
+            if (mode == MODE_V2 && tx_ann) {
+                last_gm_tx_ns = now_ns;
+                uint8_t ann[64], sync[44], fup[44];
+                build_announce(ann, ++g_ann_seq, self, utc_off,
+                               self.clock_class == 6);
+                ++g_sync_seq;
+                for (const auto &j : joined) {
+                    in_addr mif{};
+                    mif.s_addr = j.ip;
+                    setsockopt(sock_sync, IPPROTO_IP, IP_MULTICAST_IF,
+                               &mif, sizeof(mif));
+                    setsockopt(sock_general, IPPROTO_IP, IP_MULTICAST_IF,
+                               &mif, sizeof(mif));
+                    sendto(sock_general, ann, sizeof(ann), 0,
+                           (struct sockaddr *)&gen_dst, sizeof(gen_dst));
 #ifdef __linux__
-                if (g_hwts)
-                    drain_errqueue(sock_sync);
+                    if (g_hwts)
+                        drain_errqueue(sock_sync);
 #endif
-                uint64_t ta = local_clock_ns();
-                build_sync(sync, g_sync_seq, (int64_t)ta - offset_at(ta));
-                if (sendto(sock_sync, sync, sizeof(sync), 0,
-                           (struct sockaddr *)&dreq_dst,
-                           sizeof(dreq_dst)) != (ssize_t)sizeof(sync))
-                    continue;
-                uint64_t tb = local_clock_ns();
-                uint64_t t1 = 0;
+                    uint64_t ta = local_clock_ns();
+                    build_sync(sync, g_sync_seq,
+                               (int64_t)ta - offset_at(ta));
+                    if (sendto(sock_sync, sync, sizeof(sync), 0,
+                               (struct sockaddr *)&dreq_dst,
+                               sizeof(dreq_dst)) != (ssize_t)sizeof(sync))
+                        continue;
+                    uint64_t tb = local_clock_ns();
+                    uint64_t t1 = 0;
 #ifdef __linux__
-                if (g_hwts)
-                    t1 = fetch_tx_timestamp(sock_sync);
+                    if (g_hwts)
+                        t1 = fetch_tx_timestamp(sock_sync);
 #endif
-                if (!t1)
-                    t1 = ta + (tb - ta) / 2;
-                build_follow_up(fup, g_sync_seq, (int64_t)t1 - offset_at(t1));
-                sendto(sock_general, fup, sizeof(fup), 0,
-                       (struct sockaddr *)&gen_dst, sizeof(gen_dst));
+                    if (!t1)
+                        t1 = ta + (tb - ta) / 2;
+                    build_follow_up(fup, g_sync_seq,
+                                    (int64_t)t1 - offset_at(t1));
+                    sendto(sock_general, fup, sizeof(fup), 0,
+                           (struct sockaddr *)&gen_dst, sizeof(gen_dst));
+                }
+            } else if (mode == MODE_V1 && tx_ann) {
+                // v1: the Sync carries the dataset (no Announce exists);
+                // two-step with a Follow_Up on the general port, UTC
+                // timescale
+                last_gm_tx_ns = now_ns;
+                int64_t utc_shift = (int64_t)utc_off * 1000000000LL;
+                uint8_t sync[124], fup[52];
+                ++g_sync_seq;
+                for (const auto &j : joined) {
+                    in_addr mif{};
+                    mif.s_addr = j.ip;
+                    setsockopt(sock_sync, IPPROTO_IP, IP_MULTICAST_IF,
+                               &mif, sizeof(mif));
+                    setsockopt(sock_general, IPPROTO_IP, IP_MULTICAST_IF,
+                               &mif, sizeof(mif));
+#ifdef __linux__
+                    if (g_hwts)
+                        drain_errqueue(sock_sync);
+#endif
+                    uint64_t ta = local_clock_ns();
+                    build_v1_sync(sync, g_sync_seq,
+                                  (int64_t)ta - offset_at(ta) - utc_shift,
+                                  self.clock_class == 6, utc_off);
+                    if (sendto(sock_sync, sync, sizeof(sync), 0,
+                               (struct sockaddr *)&dreq_dst,
+                               sizeof(dreq_dst)) != (ssize_t)sizeof(sync))
+                        continue;
+                    uint64_t tb = local_clock_ns();
+                    uint64_t t1 = 0;
+#ifdef __linux__
+                    if (g_hwts)
+                        t1 = fetch_tx_timestamp(sock_sync);
+#endif
+                    if (!t1)
+                        t1 = ta + (tb - ta) / 2;
+                    build_v1_follow_up(fup, g_sync_seq,
+                                       (int64_t)t1 - offset_at(t1) -
+                                           utc_shift);
+                    sendto(sock_general, fup, sizeof(fup), 0,
+                           (struct sockaddr *)&gen_dst, sizeof(gen_dst));
+                }
             }
+#ifdef __linux__
+            else if (mode == MODE_GPTP && g_l2_sock >= 0 &&
+                     g_l2_ifindex) {
+                if (tx_ann) {
+                    last_gm_tx_ns = now_ns;
+                    uint8_t ann[76];
+                    build_gptp_announce(ann, ++g_ann_seq, self, utc_off,
+                                        self.clock_class == 6);
+                    l2_send(g_l2_ifindex, ann, sizeof(ann));
+                }
+                if (tx_sync) {
+                    last_gm_sync_ns = now_ns;
+                    uint8_t sync[44], fup[76];
+                    ++g_sync_seq;
+                    if (g_hwts)
+                        drain_errqueue(g_l2_sock);
+                    uint64_t ta = local_clock_ns();
+                    build_gptp_sync(sync, g_sync_seq,
+                                    (int64_t)ta - offset_at(ta));
+                    l2_send(g_l2_ifindex, sync, sizeof(sync));
+                    uint64_t tb = local_clock_ns();
+                    uint64_t t1 = 0;
+                    if (g_hwts)
+                        t1 = fetch_tx_timestamp(g_l2_sock);
+                    if (!t1)
+                        t1 = ta + (tb - ta) / 2;
+                    build_gptp_follow_up(fup, g_sync_seq,
+                                         (int64_t)t1 - offset_at(t1));
+                    l2_send(g_l2_ifindex, fup, sizeof(fup));
+                }
+            }
+#endif
         }
 
 #ifndef NO_MATRIX

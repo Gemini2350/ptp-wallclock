@@ -439,10 +439,20 @@ The **Protocol profile** setting selects what the clock listens to:
 
 Switching profiles applies immediately (fresh election, no restart).
 
+With master mode enabled, the grandmaster transmits on whichever
+profile is selected:
+
+- **PTPv2**: Announce + two-step Sync/Follow_Up at 1 Hz over UDP,
+  Delay_Req answered.
+- **gPTP**: Announce (1 Hz, with the required path trace TLV) and
+  two-step Sync/Follow_Up every 125 ms (the 802.1AS default — AVB
+  endpoints time out on slower Syncs) with the Follow_Up information
+  TLV, on raw Ethernet. Peer-delay requests are answered as always.
+- **PTPv1**: the Sync itself carries the dataset (stratum 1 with GNSS
+  lock, `GPS` identifier, UTC timescale) as two-step Sync/Follow_Up at
+  1 Hz; v1 Delay_Req is answered.
+
 ## Open Issues
 
 - Hardware timestamping is probed once at startup; after changing the
   interface setting, restart the service to re-probe.
-
-- gPTP and PTPv1 are receive/measure profiles; grandmaster mode
-  transmits PTPv2 only.
