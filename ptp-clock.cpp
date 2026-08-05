@@ -5381,6 +5381,58 @@ int main(int argc, char **argv) {
             DrawText(cv, f, x, ybase, col, nullptr, txt, 1);
         };
 
+        auto draw_text_fraction = [&](Font &f, int x, int ybase,
+                                      const char *txt, Color c_main,
+                                      Color c_ms, Color c_us,
+                                      Color c_ns) {
+            const char *dot = strchr(txt, '.');
+            int cw = f.CharacterWidth('0') + 1;
+            if (!dot) {
+                DrawText(cv, f, x, ybase, c_main, nullptr, txt, 1);
+                return;
+            }
+            int prefix_len = (int)(dot - txt + 1);
+            char prefix[32];
+            memcpy(prefix, txt, prefix_len);
+            prefix[prefix_len] = 0;
+            DrawText(cv, f, x, ybase, c_main, nullptr, prefix, 1);
+            int xoff = x + prefix_len * cw;
+            int frac_len = (int)strlen(txt) - prefix_len;
+            int group1 = std::min(3, frac_len);
+            if (group1 > 0) {
+                char ms_buf[4] = {0};
+                memcpy(ms_buf, dot + 1, group1);
+                DrawText(cv, f, xoff, ybase, c_ms, nullptr, ms_buf, 1);
+                xoff += group1 * cw;
+            }
+            int group2 = std::min(3, frac_len - group1);
+            if (group2 > 0) {
+                char us_buf[4] = {0};
+                memcpy(us_buf, dot + 1 + group1, group2);
+                DrawText(cv, f, xoff, ybase, c_us, nullptr, us_buf, 1);
+                xoff += group2 * cw;
+            }
+            int group3 = std::min(3, frac_len - group1 - group2);
+            if (group3 > 0) {
+                char ns_buf[4] = {0};
+                memcpy(ns_buf, dot + 1 + group1 + group2, group3);
+                DrawText(cv, f, xoff, ybase, c_ns, nullptr, ns_buf, 1);
+            }
+        };
+
+        auto draw_center_fraction = [&](Font &f, const char *txt, int ybase,
+                                       Color c_main, Color c_ms,
+                                       Color c_us, Color c_ns) {
+            int n = (int)strlen(txt);
+            int x = (matrix_options.cols -
+                     ((f.CharacterWidth('0') + 1) * n - 1)) / 2;
+            draw_text_fraction(f, x, ybase, txt, c_main, c_ms, c_us, c_ns);
+        };
+
+        Color c_ms(255, 165, 0);   // milliseconds in orange
+        Color c_us(0, 255, 0);     // microseconds in green
+        Color c_ns(0, 128, 255);   // nanoseconds in blue
+
         const std::string &style = entry.style;
         if (style == "unix") {
             // Seconds since the epoch. With room for two big lines the
@@ -5404,8 +5456,8 @@ int main(int argc, char **argv) {
                           (int)strlen(bfrac) - 1;
                 int x0 = (matrix_options.cols - (wbig + 2 + wsm)) / 2;
                 DrawText(cv, font, x0, text_base, c_main, nullptr, bsec, 1);
-                DrawText(cv, small_font, x0 + wbig + 2, text_base, c_main,
-                         nullptr, bfrac, 1);
+                draw_text_fraction(small_font, x0 + wbig + 2, text_base,
+                                   bfrac, c_main, c_ms, c_us, c_ns);
             } else {
                 draw_center(font, bsec, text_base, c_main);
             }
@@ -5475,8 +5527,8 @@ int main(int argc, char **argv) {
                 }
             }
             // ".nnnnnnnnn" — drawn plainly, no roll
-            DrawText(cv, font, x0 + 8 * cw, text_base, c_main,
-                     nullptr, cur + 8, 1);
+            draw_text_fraction(font, x0 + 8 * cw, text_base, cur + 8,
+                               c_main, c_ms, c_us, c_ns);
         } else if (style == "dcf77") {
             // The current minute as a DCF77 telegram: 59 second marks
             // (short = 0, long = 1), second 59 is the sync gap. DCF77
@@ -5608,7 +5660,8 @@ int main(int argc, char **argv) {
             snprintf(time_buffer, sizeof(time_buffer),
                      "%02d:%02d:%02d.%s",
                      hh, tm_disp.tm_min, tm_disp.tm_sec, fracbuf);
-            draw_center(font, time_buffer, text_base, c_main);
+            draw_center_fraction(font, time_buffer, text_base,
+                                 c_main, c_ms, c_us, c_ns);
         }
 
         if (!line2.empty()) {
