@@ -404,6 +404,7 @@ static std::atomic<bool> g_gnss_pps_ok{false};
 static std::atomic<bool> g_gnss_extts{false};   // PPS stamped by the PHC
 static std::atomic<uint32_t> g_gnss_spikes{0};  // dropped GPIO-PPS outliers
 static std::atomic<long long> g_gnss_resid_ns{-1};  // servo residual, RMS
+static std::atomic<uint32_t> g_gnss_qerr_cnt{0};    // UBX-TIM-TP received
 static std::atomic<int> g_gnss_serial_fd{-1};       // opened while root
 static std::atomic<int> g_gnss_pps_fd{-1};
 
@@ -1208,8 +1209,8 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true,
         // has no scatter worth hiding from: keep full bandwidth there,
         // which follows the oscillator's thermal wander 4x tighter.
         bool clean_src = !wire && g_gnss_extts.load();
-        double tau = (llabs(e) < 3000 && !clean_src) ? 4.0 * kServoTauNs
-                                                     : kServoTauNs;
+        double tau = clean_src ? kServoTauNs / 2.0
+                   : llabs(e) < 3000 ? 4.0 * kServoTauNs : kServoTauNs;
         double a = (double)dt / tau;           // phase gain
         if (a > 0.6) a = 0.6;
         if (a < 0.02) a = 0.02;
@@ -1613,8 +1614,26 @@ static bool nmea_parse_line(const char *line, time_t *utc_out) {
     return false;
 }
 
+// Ask the receiver to emit UBX-TIM-TP alongside NMEA (UBX-CFG-MSG,
+// rate 1): it announces the coming time pulse's placement error on the
+// receiver's internal clock grid (qErr, picoseconds).
+static void gnss_enable_timtp(int fd) {
+    uint8_t f[11] = {0xB5, 0x62, 0x06, 0x01, 0x03, 0x00,
+                     0x0D, 0x01, 0x01, 0, 0};
+    uint8_t a = 0, b = 0;
+    for (int i = 2; i < 9; ++i) {
+        a = (uint8_t)(a + f[i]);
+        b = (uint8_t)(b + a);
+    }
+    f[9] = a;
+    f[10] = b;
+    ssize_t w = write(fd, f, sizeof(f));
+    (void)w;
+}
+
 static int gnss_open_serial(const char *dev) {
-    int fd = open(dev, O_RDONLY | O_NOCTTY | O_NONBLOCK);
+    // read-write: we send one UBX-CFG-MSG to enable UBX-TIM-TP
+    int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0)
         return -1;
     struct termios tio{};
@@ -1705,6 +1724,15 @@ static void gnss_thread() {
     uint64_t rmc_mono = 0;                // ...its arrival time...
     bool rmc_fresh = false;               // ...not yet paired
     double resid_sq = 0;                  // EMA of e^2 (servo residual)
+    // UBX-TIM-TP parser state (qErr of the coming pulse)
+    int ubx_st = 0;
+    uint16_t ubx_len = 0, ubx_pos = 0, ubx_skip = 0;
+    uint8_t ubx_cls = 0, ubx_id = 0, ubx_cka = 0, ubx_ckb = 0;
+    uint8_t ubx_pay[32];
+    int64_t qerr_ps = 0;
+    uint64_t qerr_mono = 0;
+    bool qerr_fresh = false;
+    int ubx_cfg_fd = -1;                  // fd we already configured
     int relabel_run = 0;                  // consecutive 1-s relabels
     int64_t relabel_k = 0;                // ...and their direction
     uint64_t next_reopen = 0;
@@ -1778,6 +1806,15 @@ static void gnss_thread() {
             // late by the configured offset
             int64_t t2v =
                 (int64_t)p_local - pps_off;
+            // Quantization error: the receiver places the pulse on its
+            // internal clock grid and announces the residual (qErr) in
+            // the preceding UBX-TIM-TP. Ideal edge = actual + qErr per
+            // the integration manual - a free ~+/-25 ns.
+            if (qerr_fresh && pulse_mono > qerr_mono &&
+                pulse_mono - qerr_mono < 1200000000ULL) {
+                t2v += qerr_ps / 1000;
+                qerr_fresh = false;
+            }
             // GPIO PPS pipeline (all deviations are
             // measured against the servo PREDICTION
             // — the raw offset ramps with the
@@ -1896,6 +1933,47 @@ static void gnss_thread() {
                 g_gnss_sample_count++;
             }
         };
+
+        auto ubx_ck = [&](uint8_t c) {
+            ubx_cka = (uint8_t)(ubx_cka + c);
+            ubx_ckb = (uint8_t)(ubx_ckb + ubx_cka);
+        };
+        auto ubx_feed = [&](uint8_t c) {
+            switch (ubx_st) {
+            case 0: if (c == 0xB5) ubx_st = 1; break;
+            case 1: ubx_st = (c == 0x62) ? 2 : (c == 0xB5 ? 1 : 0); break;
+            case 2: ubx_cls = c; ubx_cka = ubx_ckb = 0; ubx_ck(c);
+                    ubx_st = 3; break;
+            case 3: ubx_id = c; ubx_ck(c); ubx_st = 4; break;
+            case 4: ubx_len = c; ubx_ck(c); ubx_st = 5; break;
+            case 5: ubx_len |= (uint16_t)((uint16_t)c << 8); ubx_ck(c);
+                    ubx_pos = 0;
+                    if (ubx_len > sizeof(ubx_pay)) {
+                        ubx_skip = ubx_len + 2;  // payload + checksum
+                        ubx_st = 8;
+                    } else {
+                        ubx_st = ubx_len ? 6 : 7;
+                    }
+                    break;
+            case 6: ubx_pay[ubx_pos++] = c; ubx_ck(c);
+                    if (ubx_pos == ubx_len) ubx_st = 7;
+                    break;
+            case 7: ubx_st = (c == ubx_cka) ? 9 : 0; break;
+            case 8: if (--ubx_skip == 0) ubx_st = 0; break;
+            case 9:
+                if (c == ubx_ckb && ubx_cls == 0x0D && ubx_id == 0x01 &&
+                    ubx_len >= 12) {
+                    int32_t q;                 // little-endian host (Pi)
+                    memcpy(&q, ubx_pay + 8, 4);
+                    qerr_ps = q;
+                    qerr_mono = mono_ns();
+                    qerr_fresh = true;
+                    g_gnss_qerr_cnt++;
+                }
+                ubx_st = 0;
+                break;
+            }
+        };
         if ((sfd < 0 || (pfd < 0 && !use_extts)) && now >= next_reopen) {
             next_reopen = now + 5000000000ULL;
             if (sfd < 0) {
@@ -1910,6 +1988,10 @@ static void gnss_thread() {
 #endif
         }
         g_gnss_serial_ok = sfd >= 0;
+        if (sfd >= 0 && sfd != ubx_cfg_fd) {
+            gnss_enable_timtp(sfd);
+            ubx_cfg_fd = sfd;
+        }
         if (!use_extts)
             g_gnss_pps_ok = pfd >= 0;
 
@@ -2081,6 +2163,7 @@ static void gnss_thread() {
             while ((r = read(sfd, rb, sizeof(rb))) > 0) {
                 for (ssize_t i = 0; i < r; ++i) {
                     char c = rb[i];
+                    ubx_feed((uint8_t)c);
                     if (c != '\n' && fill < sizeof(acc) - 1) {
                         acc[fill++] = c;
                         continue;
@@ -2113,10 +2196,12 @@ static void gnss_thread() {
             if (r == 0) {                 // EOF: USB receiver unplugged
                 close(sfd);
                 g_gnss_serial_fd = -1;
+                ubx_cfg_fd = -1;
             } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
                        errno != EINTR) {
                 close(sfd);
                 g_gnss_serial_fd = -1;
+                ubx_cfg_fd = -1;
             }
         }
         g_gnss_lock = g_gnss_last_sample.load() != 0 &&
@@ -3076,6 +3161,7 @@ static std::string status_json() {
       << "\"gnss_extts\":" << (g_gnss_extts ? "true" : "false") << ","
       << "\"gnss_spikes\":" << g_gnss_spikes.load() << ","
       << "\"gnss_resid_ns\":" << g_gnss_resid_ns.load() << ","
+      << "\"gnss_qerr\":" << g_gnss_qerr_cnt.load() << ","
       << "\"cmp_valid\":"
       << (g_cmp_target_valid.load() && g_cmp_count.load() > 0 ? "true"
                                                               : "false")
@@ -3742,6 +3828,28 @@ function renderClock() {
 })();
 
 // --- Analysis charts (plain canvas, no libraries) ---
+// Zero-lag smoother for the time-error trace: forward+backward EMA
+// over the [age, value] pairs, averaged — the per-Sync scatter is
+// network PDV, the smooth line is what the clocks actually do.
+function smoothSeries(d, tc = 12) {
+  if (!d || d.length < 3) return d || [];
+  const s = d.slice().sort((a, b) => b[0] - a[0]);   // oldest first
+  const n = s.length, fwd = new Array(n), bwd = new Array(n);
+  let v = s[0][1];
+  for (let i = 0; i < n; i++) {
+    const dt = i ? s[i - 1][0] - s[i][0] : 0;
+    v += (1 - Math.exp(-dt / tc)) * (s[i][1] - v);
+    fwd[i] = v;
+  }
+  v = s[n - 1][1];
+  for (let i = n - 1; i >= 0; i--) {
+    const dt = i < n - 1 ? s[i][0] - s[i + 1][0] : 0;
+    v += (1 - Math.exp(-dt / tc)) * (s[i][1] - v);
+    bwd[i] = v;
+  }
+  return s.map((p, i) => [p[0], (fwd[i] + bwd[i]) / 2]);
+}
+
 function drawChart(id, series, fmt, includeZero) {
   const cv = document.getElementById(id);
   const w = cv.width = cv.clientWidth * 2;      // 2x for crisp lines
@@ -3823,7 +3931,9 @@ async function pollHistory() {
     const cw = document.getElementById('cmp_wrap');
     if (hh.cmp && hh.cmp.length) {
       cw.style.display = '';
-      drawChart('ch_cmp', [{data: hh.cmp, color: '#f96'}], fmtNs, true);
+      drawChart('ch_cmp', [{data: hh.cmp, color: '#7e4526'},
+                           {data: smoothSeries(hh.cmp), color: '#f96'}],
+                fmtNs, true);
     } else {
       cw.style.display = 'none';
     }
@@ -3908,6 +4018,7 @@ async function poll() {
         if (s.gnss_extts) sum += ', PPS hardware-stamped by the PHC';
         if (s.gnss_resid_ns >= 0 && s.gnss_lock)
           sum += ', servo residual \u00b1' + s.gnss_resid_ns + ' ns RMS';
+        if (s.gnss_qerr > 0) sum += ', qErr-corrected';
         sum += ' (' + s.gnss_samples + ' samples';
         if (s.gnss_spikes > 0)
           sum += ', ' + s.gnss_spikes + ' spikes dropped';
@@ -4100,6 +4211,28 @@ calibrate out the antenna cable delay.</span></span></div>
 network master &minus; GNSS, per Sync &nbsp;<span id="cmp_now"></span></div>
 </div>
 <script>
+// Zero-lag smoother for the time-error trace: forward+backward EMA
+// over the [age, value] pairs, averaged — the per-Sync scatter is
+// network PDV, the smooth line is what the clocks actually do.
+function smoothSeries(d, tc = 12) {
+  if (!d || d.length < 3) return d || [];
+  const s = d.slice().sort((a, b) => b[0] - a[0]);   // oldest first
+  const n = s.length, fwd = new Array(n), bwd = new Array(n);
+  let v = s[0][1];
+  for (let i = 0; i < n; i++) {
+    const dt = i ? s[i - 1][0] - s[i][0] : 0;
+    v += (1 - Math.exp(-dt / tc)) * (s[i][1] - v);
+    fwd[i] = v;
+  }
+  v = s[n - 1][1];
+  for (let i = n - 1; i >= 0; i--) {
+    const dt = i < n - 1 ? s[i][0] - s[i + 1][0] : 0;
+    v += (1 - Math.exp(-dt / tc)) * (s[i][1] - v);
+    bwd[i] = v;
+  }
+  return s.map((p, i) => [p[0], (fwd[i] + bwd[i]) / 2]);
+}
+
 function drawChart(id, series, fmt, includeZero) {
   const cv = document.getElementById(id);
   const w = cv.width = cv.clientWidth * 2;      // 2x for crisp lines
@@ -4179,7 +4312,9 @@ async function poll() {
     const cw = document.getElementById('cmp_wrap');
     if (hh.cmp && hh.cmp.length) {
       cw.style.display = '';
-      drawChart('ch_cmp', [{data: hh.cmp, color: '#f96'}], fmtNs, true);
+      drawChart('ch_cmp', [{data: hh.cmp, color: '#7e4526'},
+                           {data: smoothSeries(hh.cmp), color: '#f96'}],
+                fmtNs, true);
       document.getElementById('cmp_now').textContent = s.cmp_valid
           ? 'mean: ' + (s.cmp_ns >= 0 ? '+' : '') + fmtNs(s.cmp_ns) +
             ' vs ' + s.cmp_gm
