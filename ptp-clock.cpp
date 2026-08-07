@@ -445,11 +445,62 @@ static void hist_push(HistPoint *buf, int cap, int &n, int &i, int64_t v) {
     if (n < cap) n++;
 }
 
+// PHC read extrapolation for extts mode. On PHY-based PHCs (CM5:
+// BCM54210PE) every clock_gettime runs a framesync capture over slow
+// MDIO — and consumes the same clear-on-read FSYNC status bit and HB
+// capture registers the extts pin events use, so frequent reads starve
+// the PPS events entirely. While extts is armed, the GNSS thread
+// refreshes this mono->PHC mapping once per pulse (right after the
+// event, when no capture can be pending) and everyone else
+// extrapolates; a stale mapping (pulses gone) falls back to raw reads.
+static std::mutex g_pmap_mutex;
+static bool     g_pmap_valid = false;
+static int64_t  g_pmap_off = 0;        // phc - mono at last refresh
+static double   g_pmap_drift = 0.0;    // d(phc - mono)/dt, EMA
+static uint64_t g_pmap_ref = 0;        // mono of last refresh
+static std::atomic<bool> g_phc_extrap{false};
+
+static void phc_map_refresh() {
+#ifdef __linux__
+    if (!g_hwts || g_phc_fd < 0)
+        return;
+    timespec ts;
+    clockid_t cid = (clockid_t)((~(clockid_t)g_phc_fd) << 3) | 3;
+    uint64_t m0 = mono_ns();
+    if (clock_gettime(cid, &ts) != 0)
+        return;
+    uint64_t m1 = mono_ns();
+    uint64_t m = m0 + (m1 - m0) / 2;   // MDIO read takes ~1 ms: midpoint
+    int64_t off = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec -
+                  (int64_t)m;
+    std::lock_guard<std::mutex> lock(g_pmap_mutex);
+    if (g_pmap_valid && m > g_pmap_ref + 100000000ULL) {
+        double dt = (double)(m - g_pmap_ref);
+        double d = (double)(off - g_pmap_off) / dt;
+        if (fabs(d) < 500e-6)
+            g_pmap_drift += (d - g_pmap_drift) / 4.0;
+    }
+    g_pmap_off = off;
+    g_pmap_ref = m;
+    g_pmap_valid = true;
+#endif
+}
+
 // The local timing clock: the NIC's PHC when hardware timestamping is
 // active (packet timestamps come from the same clock), else monotonic.
 static uint64_t local_clock_ns() {
 #ifdef __linux__
     if (g_hwts) {
+        if (g_phc_extrap.load()) {
+            std::lock_guard<std::mutex> lock(g_pmap_mutex);
+            if (g_pmap_valid) {
+                uint64_t m = mono_ns();
+                if (m - g_pmap_ref < 2500000000ULL)
+                    return (uint64_t)((int64_t)m + g_pmap_off +
+                        (int64_t)(g_pmap_drift *
+                                  (double)(m - g_pmap_ref)));
+            }
+        }
         timespec ts;
         clockid_t cid = (clockid_t)((~(clockid_t)g_phc_fd) << 3) | 3;
         if (clock_gettime(cid, &ts) == 0)
@@ -1642,6 +1693,8 @@ static void gnss_thread() {
     uint64_t next_reopen = 0;
     std::string ser_dev, pps_dev;
     bool extts_on = false;                // PHC extts currently armed
+    uint64_t extts_last_ev = 0;           // watchdog: last event (mono)
+    bool extts_saw_event = false;         // gates the watchdog log line
     int drop_run = 0;                     // consecutive spike drops
     bool xlate_warned = false;
     // Lower-envelope selection for GPIO PPS: interrupt latency is
@@ -1718,6 +1771,7 @@ static void gnss_thread() {
             memset(&req, 0, sizeof(req));
             ioctl(g_phc_fd, PTP_EXTTS_REQUEST, &req);
             extts_on = false;
+            g_phc_extrap = false;         // honest raw reads again
         }
         if (use_extts) {
             // gm_pps = "phc": the NIC hardware stamps the pulse on the
@@ -1735,6 +1789,7 @@ static void gnss_thread() {
                     req.flags = PTP_ENABLE_FEATURE | PTP_RISING_EDGE;
                     if (ioctl(g_phc_fd, PTP_EXTTS_REQUEST, &req) == 0) {
                         extts_on = true;
+                        extts_last_ev = mono_ns();
                         std::cout << "GNSS: PPS via PHC extts enabled\n";
                     } else {
                         g_gnss_pps_ok = false;
@@ -1754,6 +1809,33 @@ static void gnss_thread() {
                                           1000000000ULL + ev.t.nsec;
                             pulse_mono = mono_ns();
                             g_gnss_last_pps = pulse_mono;
+                            extts_last_ev = pulse_mono;
+                            extts_saw_event = true;
+                            // Safe window for a raw PHC read: this
+                            // pulse's capture was just consumed, the
+                            // next is ~1 s away. Refresh the mapping
+                            // everyone else extrapolates from.
+                            phc_map_refresh();
+                            g_phc_extrap = true;
+                        }
+                    }
+                    if (extts_last_ev &&
+                        mono_ns() - extts_last_ev > 10000000000ULL) {
+                        // Watchdog: an armed request that stops
+                        // delivering would stay silent forever —
+                        // kick it with a disarm/re-arm cycle
+                        struct ptp_extts_request req;
+                        memset(&req, 0, sizeof(req));
+                        req.index = 0;
+                        ioctl(g_phc_fd, PTP_EXTTS_REQUEST, &req);
+                        req.flags = PTP_ENABLE_FEATURE | PTP_RISING_EDGE;
+                        if (ioctl(g_phc_fd, PTP_EXTTS_REQUEST, &req) != 0)
+                            extts_on = false;  // full re-init next loop
+                        extts_last_ev = mono_ns();
+                        if (extts_saw_event) {
+                            extts_saw_event = false;
+                            std::cout << "GNSS: extts silent for 10 s, "
+                                         "re-armed\n";
                         }
                     }
                 }
