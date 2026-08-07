@@ -1690,6 +1690,8 @@ static void gnss_thread() {
     uint32_t last_seq = 0;
     bool have_seq = false;
     uint64_t pulse_local = 0, pulse_mono = 0;
+    int relabel_run = 0;                  // consecutive 1-s relabels
+    int64_t relabel_k = 0;                // ...and their direction
     uint64_t next_reopen = 0;
     std::string ser_dev, pps_dev;
     bool extts_on = false;                // PHC extts currently armed
@@ -1818,9 +1820,9 @@ static void gnss_thread() {
                             (ssize_t)sizeof(ev)) {
                             pulse_local = (uint64_t)ev.t.sec *
                                           1000000000ULL + ev.t.nsec;
-                            pulse_mono = mono_ns();
-                            g_gnss_last_pps = pulse_mono;
-                            extts_last_ev = pulse_mono;
+                            uint64_t rd = mono_ns();
+                            g_gnss_last_pps = rd;
+                            extts_last_ev = rd;
                             extts_saw_event = true;
                             // Safe window for a raw PHC read: this
                             // pulse's capture was just consumed, the
@@ -1828,6 +1830,22 @@ static void gnss_thread() {
                             // everyone else extrapolates from.
                             phc_map_refresh();
                             g_phc_extrap = true;
+                            // The driver polls its capture only every
+                            // 250 ms, so we learn about the pulse LATE
+                            // — late enough that the NMEA burst naming
+                            // it may already have passed. Reconstruct
+                            // the physical pulse time from the fresh
+                            // map so the RMC pairing window is judged
+                            // against reality, not our readout time.
+                            pulse_mono = rd;
+                            {
+                                std::lock_guard<std::mutex>
+                                    lk(g_pmap_mutex);
+                                if (g_pmap_valid)
+                                    pulse_mono = (uint64_t)
+                                        ((int64_t)pulse_local -
+                                         g_pmap_off);
+                            }
                         }
                     }
                     if (extts_last_ev &&
@@ -1948,10 +1966,45 @@ static void gnss_thread() {
                                 if (have_pred)
                                     e = (t2v - t1v) -
                                         offset_at((uint64_t)t2v);
+                                // A whole-second disagreement while
+                                // locked is a mislabeled pulse (late
+                                // NMEA burst, delayed extts readout),
+                                // not a clock excursion: relabel to the
+                                // predicted second instead of letting
+                                // the servo step a full second. If it
+                                // persists, believe the receiver after
+                                // all (leap second, receiver reset).
+                                bool label_ok = true;
+                                if (have_pred &&
+                                    llabs(e) > 400000000LL) {
+                                    int64_t k = (int64_t)llround(
+                                        (double)e / 1e9);
+                                    if (k != 0 && relabel_run < 10 &&
+                                        llabs(e - k * 1000000000LL) <
+                                            100000000LL) {
+                                        t1v += k * 1000000000LL;
+                                        e -= k * 1000000000LL;
+                                        if (k == relabel_k)
+                                            relabel_run++;
+                                        else {
+                                            relabel_k = k;
+                                            relabel_run = 1;
+                                        }
+                                    } else if (relabel_run >= 10) {
+                                        relabel_run = 0; // accept step
+                                    } else {
+                                        label_ok = false;
+                                        g_gnss_spikes++;
+                                    }
+                                } else {
+                                    relabel_run = 0;
+                                }
                                 bool forward = false;
                                 bool fwd_freq_ok = true;
                                 int64_t f_t1 = t1v, f_t2 = t2v;
-                                if (use_extts || !have_pred) {
+                                if (!label_ok) {
+                                    // uncorrectable label: drop sample
+                                } else if (use_extts || !have_pred) {
                                     forward = true;   // clean / bootstrap
                                 } else if (llabs(e) > 50000 &&
                                            drop_run < 2) {
