@@ -1783,6 +1783,17 @@ static void gnss_thread() {
                 usleep(500000);
             } else {
                 if (!extts_on) {
+                    // Pin functions reset on every reboot and nothing
+                    // else assigns them for us (the early tests only
+                    // worked because a manual testptp -L had set the
+                    // pin): claim pin 0 as the extts input first.
+                    // Harmless if the PHC has no programmable pins.
+                    struct ptp_pin_desc pin;
+                    memset(&pin, 0, sizeof(pin));
+                    pin.index = 0;
+                    pin.func = PTP_PF_EXTTS;
+                    pin.chan = 0;
+                    ioctl(g_phc_fd, PTP_PIN_SETFUNC, &pin);
                     struct ptp_extts_request req;
                     memset(&req, 0, sizeof(req));
                     req.index = 0;
