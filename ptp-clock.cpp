@@ -43,6 +43,12 @@
 #include <vector>
 #include <cmath>
 
+// Stamped by the build (install.sh/Makefile pass the git revision) so
+// the running binary is identifiable in the journal and the web UI
+#ifndef PTP_WALLCLOCK_REV
+#define PTP_WALLCLOCK_REV "dev"
+#endif
+
 #ifndef NO_MATRIX
 using namespace rgb_matrix;
 
@@ -1690,6 +1696,9 @@ static void gnss_thread() {
     uint32_t last_seq = 0;
     bool have_seq = false;
     uint64_t pulse_local = 0, pulse_mono = 0;
+    time_t rmc_utc = 0;                   // last parsed RMC second...
+    uint64_t rmc_mono = 0;                // ...its arrival time...
+    bool rmc_fresh = false;               // ...not yet paired
     int relabel_run = 0;                  // consecutive 1-s relabels
     int64_t relabel_k = 0;                // ...and their direction
     uint64_t next_reopen = 0;
@@ -1749,6 +1758,130 @@ static void gnss_thread() {
         for (char &c : pps_norm) c = (char)tolower((unsigned char)c);
         if (pps_norm.rfind("/dev/", 0) == 0) pps_norm = pps_norm.substr(5);
         bool use_extts = (pps_norm == "phc");
+        // Feed one (RMC second, pulse timestamp) pair through the
+        // spike gates into the servo hand-off. Callable from both
+        // directions: normally the RMC arrives after the pulse was
+        // read, but with the extts driver's 250 ms readout grid the
+        // sentence can beat the event - then the pulse pairs
+        // retroactively when it is finally read.
+        auto feed_pair = [&](time_t utc, uint64_t p_local,
+                             uint64_t n2) {
+            int64_t t1v =
+                ((int64_t)utc + utc_off) * 1000000000LL;
+            // antenna/cable delay: the pulse arrives
+            // late by the configured offset
+            int64_t t2v =
+                (int64_t)p_local - pps_off;
+            // GPIO PPS pipeline (all deviations are
+            // measured against the servo PREDICTION
+            // — the raw offset ramps with the
+            // oscillator drift and must never be
+            // judged on its level):
+            // 1. coarse 50-us sanity gate (max two
+            //    drops in a row — can't starve),
+            // 2. lower-envelope pick: forward only
+            //    the least-latency sample of each
+            //    8-s window; GPIO interrupt latency
+            //    is strictly additive, so the
+            //    smallest offset is the truest.
+            // The PHC extts source skips all this.
+            bool have_pred = g_have_offset;
+            int64_t e = 0;
+            if (have_pred)
+                e = (t2v - t1v) -
+                    offset_at((uint64_t)t2v);
+            // A whole-second disagreement while
+            // locked is a mislabeled pulse (late
+            // NMEA burst, delayed extts readout),
+            // not a clock excursion: relabel to the
+            // predicted second instead of letting
+            // the servo step a full second. If it
+            // persists, believe the receiver after
+            // all (leap second, receiver reset).
+            bool label_ok = true;
+            if (have_pred &&
+                llabs(e) > 400000000LL) {
+                int64_t k = (int64_t)llround(
+                    (double)e / 1e9);
+                if (k != 0 && relabel_run < 10 &&
+                    llabs(e - k * 1000000000LL) <
+                        100000000LL) {
+                    t1v += k * 1000000000LL;
+                    e -= k * 1000000000LL;
+                    if (k == relabel_k)
+                        relabel_run++;
+                    else {
+                        relabel_k = k;
+                        relabel_run = 1;
+                    }
+                } else if (relabel_run >= 10) {
+                    relabel_run = 0; // accept step
+                } else {
+                    label_ok = false;
+                    g_gnss_spikes++;
+                }
+            } else {
+                relabel_run = 0;
+            }
+            bool forward = false;
+            bool fwd_freq_ok = true;
+            int64_t f_t1 = t1v, f_t2 = t2v;
+            if (!label_ok) {
+                // uncorrectable label: drop sample
+            } else if (use_extts || !have_pred) {
+                forward = true;   // clean / bootstrap
+            } else if (llabs(e) > 50000 &&
+                       drop_run < 2) {
+                drop_run++;
+                g_gnss_spikes++;
+            } else if (llabs(e) > 25000) {
+                // The servo is far off (start-up or
+                // after an outage): feed it NOW —
+                // the lower-envelope refinement only
+                // matters at the microsecond level
+                drop_run = 0;
+                forward = true;
+            } else if (e < -1000) {
+                // Below the current floor estimate:
+                // latency only ever ADDS, so this
+                // sample is strictly more truthful —
+                // take it immediately (downward
+                // corrections fast, upward ones via
+                // the slow window minimum). Phase
+                // only: it carries no rate info.
+                drop_run = 0;
+                forward = true;
+                fwd_freq_ok = false;
+            } else {
+                drop_run = 0;
+                if (!win_have || e < win_best_e) {
+                    win_best_e = e;
+                    win_t1 = t1v;
+                    win_t2 = t2v;
+                    win_have = true;
+                }
+                // receiver is healthy: keep the
+                // lock fresh while accumulating
+                g_gnss_last_sample = n2;
+                if (++win_cnt >= 8) {
+                    forward = true;
+                    f_t1 = win_t1;
+                    f_t2 = win_t2;
+                    win_cnt = 0;
+                    win_have = false;
+                }
+            }
+            if (forward) {
+                std::lock_guard<std::mutex> lk(
+                    g_gnss_mutex);
+                g_gnss_t1 = f_t1;
+                g_gnss_t2 = f_t2;
+                g_gnss_sample_freq_ok = fwd_freq_ok;
+                g_gnss_sample_valid = true;
+                g_gnss_last_sample = n2;
+                g_gnss_sample_count++;
+            }
+        };
         if ((sfd < 0 || (pfd < 0 && !use_extts)) && now >= next_reopen) {
             next_reopen = now + 5000000000ULL;
             if (sfd < 0) {
@@ -1846,6 +1979,13 @@ static void gnss_thread() {
                                         ((int64_t)pulse_local -
                                          g_pmap_off);
                             }
+                            if (rmc_fresh && rmc_mono > pulse_mono &&
+                                rmc_mono - pulse_mono < 950000000ULL) {
+                                feed_pair(rmc_utc, pulse_local,
+                                          rmc_mono);
+                                pulse_mono = 0;
+                                rmc_fresh = false;
+                            }
                         }
                     }
                     if (extts_last_ev &&
@@ -1938,125 +2078,18 @@ static void gnss_thread() {
                         time_t utc = 0;
                         if (nmea_parse_line(acc, &utc)) {
                             uint64_t n2 = mono_ns();
-                            // The RMC names the second of the pulse that
-                            // just preceded it
+                            // The RMC names the second of the pulse
+                            // that just preceded it - or of one the
+                            // extts readout has not delivered yet:
+                            // keep the sentence for retro-pairing
+                            rmc_utc = utc;
+                            rmc_mono = n2;
+                            rmc_fresh = true;
                             if (pulse_mono &&
-                                n2 - pulse_mono < 900000000ULL) {
-                                int64_t t1v =
-                                    ((int64_t)utc + utc_off) * 1000000000LL;
-                                // antenna/cable delay: the pulse arrives
-                                // late by the configured offset
-                                int64_t t2v =
-                                    (int64_t)pulse_local - pps_off;
-                                // GPIO PPS pipeline (all deviations are
-                                // measured against the servo PREDICTION
-                                // — the raw offset ramps with the
-                                // oscillator drift and must never be
-                                // judged on its level):
-                                // 1. coarse 50-us sanity gate (max two
-                                //    drops in a row — can't starve),
-                                // 2. lower-envelope pick: forward only
-                                //    the least-latency sample of each
-                                //    8-s window; GPIO interrupt latency
-                                //    is strictly additive, so the
-                                //    smallest offset is the truest.
-                                // The PHC extts source skips all this.
-                                bool have_pred = g_have_offset;
-                                int64_t e = 0;
-                                if (have_pred)
-                                    e = (t2v - t1v) -
-                                        offset_at((uint64_t)t2v);
-                                // A whole-second disagreement while
-                                // locked is a mislabeled pulse (late
-                                // NMEA burst, delayed extts readout),
-                                // not a clock excursion: relabel to the
-                                // predicted second instead of letting
-                                // the servo step a full second. If it
-                                // persists, believe the receiver after
-                                // all (leap second, receiver reset).
-                                bool label_ok = true;
-                                if (have_pred &&
-                                    llabs(e) > 400000000LL) {
-                                    int64_t k = (int64_t)llround(
-                                        (double)e / 1e9);
-                                    if (k != 0 && relabel_run < 10 &&
-                                        llabs(e - k * 1000000000LL) <
-                                            100000000LL) {
-                                        t1v += k * 1000000000LL;
-                                        e -= k * 1000000000LL;
-                                        if (k == relabel_k)
-                                            relabel_run++;
-                                        else {
-                                            relabel_k = k;
-                                            relabel_run = 1;
-                                        }
-                                    } else if (relabel_run >= 10) {
-                                        relabel_run = 0; // accept step
-                                    } else {
-                                        label_ok = false;
-                                        g_gnss_spikes++;
-                                    }
-                                } else {
-                                    relabel_run = 0;
-                                }
-                                bool forward = false;
-                                bool fwd_freq_ok = true;
-                                int64_t f_t1 = t1v, f_t2 = t2v;
-                                if (!label_ok) {
-                                    // uncorrectable label: drop sample
-                                } else if (use_extts || !have_pred) {
-                                    forward = true;   // clean / bootstrap
-                                } else if (llabs(e) > 50000 &&
-                                           drop_run < 2) {
-                                    drop_run++;
-                                    g_gnss_spikes++;
-                                } else if (llabs(e) > 25000) {
-                                    // The servo is far off (start-up or
-                                    // after an outage): feed it NOW —
-                                    // the lower-envelope refinement only
-                                    // matters at the microsecond level
-                                    drop_run = 0;
-                                    forward = true;
-                                } else if (e < -1000) {
-                                    // Below the current floor estimate:
-                                    // latency only ever ADDS, so this
-                                    // sample is strictly more truthful —
-                                    // take it immediately (downward
-                                    // corrections fast, upward ones via
-                                    // the slow window minimum). Phase
-                                    // only: it carries no rate info.
-                                    drop_run = 0;
-                                    forward = true;
-                                    fwd_freq_ok = false;
-                                } else {
-                                    drop_run = 0;
-                                    if (!win_have || e < win_best_e) {
-                                        win_best_e = e;
-                                        win_t1 = t1v;
-                                        win_t2 = t2v;
-                                        win_have = true;
-                                    }
-                                    // receiver is healthy: keep the
-                                    // lock fresh while accumulating
-                                    g_gnss_last_sample = n2;
-                                    if (++win_cnt >= 8) {
-                                        forward = true;
-                                        f_t1 = win_t1;
-                                        f_t2 = win_t2;
-                                        win_cnt = 0;
-                                        win_have = false;
-                                    }
-                                }
-                                if (forward) {
-                                    std::lock_guard<std::mutex> lk(
-                                        g_gnss_mutex);
-                                    g_gnss_t1 = f_t1;
-                                    g_gnss_t2 = f_t2;
-                                    g_gnss_sample_freq_ok = fwd_freq_ok;
-                                    g_gnss_sample_valid = true;
-                                    g_gnss_last_sample = n2;
-                                    g_gnss_sample_count++;
-                                }
+                                n2 - pulse_mono < 950000000ULL) {
+                                feed_pair(utc, pulse_local, n2);
+                                pulse_mono = 0;
+                                rmc_fresh = false;
                             }
                         }
                     }
@@ -3009,6 +3042,7 @@ static std::string status_json() {
       << "\"iface_up\":" << (g_iface_up ? "true" : "false") << ","
       << "\"hwts\":" << (g_hwts ? "true" : "false") << ","
       << "\"hwts_desc\":\"" << json_escape(g_hwts_desc) << "\","
+      << "\"rev\":\"" << PTP_WALLCLOCK_REV << "\","
       << "\"role\":" << g_role.load() << ","
       << "\"ptp_mode\":\"" << g_settings.ptp_mode << "\","
       << "\"gm_enable\":" << (g_settings.gm_enable ? "true" : "false") << ","
@@ -3182,6 +3216,7 @@ static const char *kIndexHtml = R"HTML(<!DOCTYPE html>
  <tr><td>Role</td><td id="s_role">&ndash;</td></tr>
  <tr><td>Interface</td><td id="s_iface">&ndash;</td></tr>
  <tr><td>Timestamping</td><td id="s_hwts">&ndash;</td></tr>
+ <tr><td>Build</td><td id="s_rev">&ndash;</td></tr>
  <tr><td>Domain</td><td id="s_domain">&ndash;</td></tr>
  <tr><td>Grandmaster</td><td id="s_gm">&ndash;</td></tr>
  <tr><td>Vendor</td><td id="s_vendor">&ndash;</td></tr>
@@ -3823,6 +3858,7 @@ async function poll() {
                           : 'auto (searching...)')
         : s.iface + (s.iface_up ? '' : ' (not connected)'));
     set('s_hwts', s.hwts ? 'hardware (' + s.hwts_desc + ')' : 'software');
+    set('s_rev', s.rev);
     set('s_profile', s.ptp_mode === 'gptp'
         ? 'gPTP / 802.1AS (AVB, Milan) — layer 2'
         : s.ptp_mode === 'v1' ? 'PTPv1 (IEEE 1588-2002)'
@@ -4649,6 +4685,7 @@ int main(int argc, char **argv) {
     // Under systemd stdout is a block-buffered pipe — without this the
     // startup messages only reach journald when the process exits
     std::cout << std::unitbuf;
+    std::cout << "ptp-wallclock build " << PTP_WALLCLOCK_REV << "\n";
     resolve_config_path();
     // Container/first-run convenience: PTP_WALLCLOCK_IFACE sets the default
     // interface; a saved setting from the web UI still wins.

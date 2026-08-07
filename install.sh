@@ -55,7 +55,9 @@ echo "==> Building rpi-rgb-led-matrix library"
 make -C "$MATRIX_DIR/lib"
 
 echo "==> Building ptp-clock"
-g++ -O2 -std=c++17 "$SCRIPT_DIR/ptp-clock.cpp" -o "$SCRIPT_DIR/ptp-clock" \
+REV=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
+g++ -O2 -std=c++17 -DPTP_WALLCLOCK_REV="\"$REV\"" \
+    "$SCRIPT_DIR/ptp-clock.cpp" -o "$SCRIPT_DIR/ptp-clock" \
     -I"$MATRIX_DIR/include" -L"$MATRIX_DIR/lib" -lrgbmatrix -lpthread
 
 echo "==> Installing binary, fonts, state directory"
