@@ -419,6 +419,8 @@ static int64_t g_cmp_ns = 0;
 static std::atomic<long long> g_cmp_atomic{0};
 static std::atomic<long long> g_cmp_last{0};
 static std::atomic<uint32_t> g_cmp_count{0};
+static std::atomic<bool> g_cmp_reset{false};   // restart the statistics
+                                               // (set after calibration)
 static char g_cmp_gm_str[32] = "";        // guarded by g_mutex
 
 static uint16_t g_ann_seq = 0, g_sync_seq = 0;      // main thread
@@ -2666,6 +2668,33 @@ static std::string json_escape(const std::string &in) {
     return out;
 }
 
+// One-click PPS calibration: fold the measured PTP-vs-GNSS time error
+// into the PPS offset so the comparison re-centers on zero. Returns the
+// JSON reply; on success the statistics restart via g_cmp_reset.
+static std::string calibrate_pps_apply(bool *ok_out) {
+    *ok_out = false;
+    if (!g_gnss_lock.load() || !g_cmp_target_valid.load() ||
+        g_cmp_count.load() < 30) {
+        return "{\"ok\":false,\"error\":\"needs GNSS lock and a comparison "
+               "master with at least 30 Syncs\"}";
+    }
+    long long mean = g_cmp_atomic.load();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    long long v = g_settings.gm_pps_offset_ns + mean;
+    if (v < -1000000 || v > 1000000) {
+        return "{\"ok\":false,\"error\":\"result outside +/-1 ms - that "
+               "is not a cable delay, check the setup\"}";
+    }
+    g_settings.gm_pps_offset_ns = v;
+    save_settings_locked();
+    g_cmp_reset = true;                   // main loop restarts mean/count
+    *ok_out = true;
+    std::ostringstream o;
+    o << "{\"ok\":true,\"applied_ns\":" << mean << ",\"offset_ns\":" << v
+      << "}";
+    return o.str();
+}
+
 static std::string settings_json() {
     std::lock_guard<std::mutex> lock(g_mutex);
     char color[8];
@@ -3202,10 +3231,14 @@ not expose that pin.</p>
  <input type="number" id="gm_pps_off" min="-1000000" max="1000000"
         value="0">
 </label>
+<button type="button" id="pps_cal">Set from current time error</button>
+<span class="hint" id="pps_cal_msg" style="display:none"></span>
 <p class="hint">Compensates the antenna cable delay (&asymp;5 ns per
 meter of coax) and receiver bias: the entered value is subtracted from
 every PPS timestamp. Calibrate against a trusted reference until the
-time-error chart centers on zero.</p>
+time-error chart centers on zero &mdash; or click the button to fold the
+currently measured mean time error into the offset in one step (needs
+GNSS lock and a comparison master).</p>
 <div id="gnss_box" style="display:none">
  <div class="chart-title">GNSS receiver</div>
  <div class="chart-legend" id="gnss_sum">&ndash;</div>
@@ -3393,6 +3426,26 @@ document.getElementById('form').addEventListener('submit', async (e) => {
       'Notification' in window && Notification.permission === 'default') {
     Notification.requestPermission();
   }
+});
+
+document.getElementById('pps_cal').addEventListener('click', async () => {
+  const msg = document.getElementById('pps_cal_msg');
+  let j;
+  try {
+    const r = await fetch('/api/calibrate_pps', { method: 'POST' });
+    j = await r.json();
+  } catch (e) {
+    j = { ok: false, error: 'request failed' };
+  }
+  if (j.ok) {
+    document.getElementById('gm_pps_off').value = j.offset_ns;
+    msg.textContent = 'applied ' + j.applied_ns +
+        ' ns → offset is now ' + j.offset_ns + ' ns';
+  } else {
+    msg.textContent = j.error;
+  }
+  msg.style.display = 'inline';
+  setTimeout(() => msg.style.display = 'none', 6000);
 });
 
 // Live PTP clock: the server sends TAI at poll time, the browser
@@ -4269,6 +4322,11 @@ static void handle_client(int fd) {
     } else if (method == "POST" && path == "/api/reset_history") {
         g_hist_reset = true;              // main loop clears the rings
         send_response(fd, "200 OK", "application/json", "{\"ok\":true}");
+    } else if (method == "POST" && path == "/api/calibrate_pps") {
+        bool ok = false;
+        std::string reply = calibrate_pps_apply(&ok);
+        send_response(fd, ok ? "200 OK" : "409 Conflict",
+                      "application/json", reply);
     } else if (method == "POST" && path == "/api/settings") {
         auto kv = parse_form(body);
         {
@@ -4609,6 +4667,15 @@ int main(int argc, char **argv) {
             g_hist_del_n = g_hist_del_i = 0;
             g_hist_cmp_n = g_hist_cmp_i = 0;
             g_hist_rate_n = g_hist_rate_i = 0;
+            g_cmp_have = false;
+            g_cmp_count = 0;
+        }
+
+        if (g_cmp_reset.exchange(false)) {
+            // PPS calibration applied: restart the PTP-vs-GNSS mean and
+            // count so they rebuild around the new zero. The chart keeps
+            // its old points - the step documents the calibration.
+            std::lock_guard<std::mutex> lock(g_mutex);
             g_cmp_have = false;
             g_cmp_count = 0;
         }

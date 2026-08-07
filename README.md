@@ -323,6 +323,11 @@ idle-state wakeups and frequency scaling otherwise add variable
 interrupt latency. Measured on a Pi 5, this visibly tightens the
 time-error band. Remember to re-check the **GNSS PPS offset**
 calibration after changing tuning: the latency floor moves with it.
+Calibration is one click: **Set from current time error** next to the
+offset field folds the currently measured mean PTP-vs-GNSS time error
+into the offset and restarts the statistics, so the time-error chart
+re-centers on zero (needs GNSS lock and a comparison master with at
+least 30 Syncs).
 
 Then enable **PTP grandmaster (GNSS)** on the settings page. Activation
 is deliberately two-staged:
