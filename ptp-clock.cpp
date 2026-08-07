@@ -1938,10 +1938,16 @@ static void gnss_thread() {
             ubx_cka = (uint8_t)(ubx_cka + c);
             ubx_ckb = (uint8_t)(ubx_ckb + ubx_cka);
         };
-        auto ubx_feed = [&](uint8_t c) {
+        auto ubx_feed = [&](uint8_t c) -> bool {
             switch (ubx_st) {
-            case 0: if (c == 0xB5) ubx_st = 1; break;
-            case 1: ubx_st = (c == 0x62) ? 2 : (c == 0xB5 ? 1 : 0); break;
+            case 0:
+                if (c == 0xB5) { ubx_st = 1; return true; }
+                return false;
+            case 1:
+                if (c == 0x62) { ubx_st = 2; return true; }
+                ubx_st = (c == 0xB5) ? 1 : 0;
+                // a lone 0xB5 was line noise; this byte may be NMEA
+                return c == 0xB5;
             case 2: ubx_cls = c; ubx_cka = ubx_ckb = 0; ubx_ck(c);
                     ubx_st = 3; break;
             case 3: ubx_id = c; ubx_ck(c); ubx_st = 4; break;
@@ -1973,6 +1979,7 @@ static void gnss_thread() {
                 ubx_st = 0;
                 break;
             }
+            return true;                       // inside a UBX frame
         };
         if ((sfd < 0 || (pfd < 0 && !use_extts)) && now >= next_reopen) {
             next_reopen = now + 5000000000ULL;
@@ -2163,7 +2170,11 @@ static void gnss_thread() {
             while ((r = read(sfd, rb, sizeof(rb))) > 0) {
                 for (ssize_t i = 0; i < r; ++i) {
                     char c = rb[i];
-                    ubx_feed((uint8_t)c);
+                    // Binary UBX bytes must never reach the NMEA line
+                    // accumulator - they would glue onto the next
+                    // sentence and break its parsing
+                    if (ubx_feed((uint8_t)c))
+                        continue;
                     if (c != '\n' && fill < sizeof(acc) - 1) {
                         acc[fill++] = c;
                         continue;
