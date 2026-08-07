@@ -4,7 +4,9 @@
 #        sudo ./install.sh --gnss   — additionally prepare the OS for a
 #                                     GNSS receiver (NMEA on serial0,
 #                                     PPS on GPIO 18; override with
-#                                     GNSS_PPS_GPIO=nn). Reboot after.
+#                                     GNSS_PPS_GPIO=nn). Reboots
+#                                     automatically when the boot config
+#                                     changed; --no-reboot skips that.
 #        sudo ./install.sh --gnss-tune
 #                                   — install a boot-time tuning service
 #                                     that pins the PPS interrupt to a
@@ -16,9 +18,11 @@ set -euo pipefail
 
 GNSS_SETUP=0
 GNSS_TUNE=0
+NO_REBOOT=0
 for arg in "$@"; do
     [ "$arg" = "--gnss" ] && GNSS_SETUP=1
     [ "$arg" = "--gnss-tune" ] && GNSS_TUNE=1
+    [ "$arg" = "--no-reboot" ] && NO_REBOOT=1
 done
 
 MATRIX_DIR=/opt/rpi-rgb-led-matrix
@@ -183,6 +187,14 @@ echo "  Logs:     journalctl -u ptp-wallclock -f"
 echo "  Settings: http://${IP:-<pi-address>}:8319"
 if [ "$NEED_REBOOT" = 1 ]; then
     echo
-    echo "  GNSS boot configuration written — PLEASE REBOOT, then enable"
-    echo "  'Use a GNSS receiver' on the settings page."
+    if [ "$NO_REBOOT" = 1 ]; then
+        echo "  GNSS boot configuration written — PLEASE REBOOT, then enable"
+        echo "  'Use a GNSS receiver' on the settings page."
+    else
+        echo "  GNSS boot configuration written. After the reboot, enable"
+        echo "  'Use a GNSS receiver' on the settings page."
+        echo "  Rebooting in 5 seconds — Ctrl-C to cancel (--no-reboot skips this)."
+        sleep 5
+        reboot
+    fi
 fi
