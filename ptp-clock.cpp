@@ -1688,7 +1688,12 @@ static void gnss_thread() {
             pps_dev = cfg_pps;
         }
         uint64_t now = mono_ns();
-        bool use_extts = (cfg_pps == "phc");
+        // Accept sloppy spellings of the keyword ("/dev/phc", "PHC"):
+        // the /dev/pps0 example right above the field invites the prefix
+        std::string pps_norm = cfg_pps;
+        for (char &c : pps_norm) c = (char)tolower((unsigned char)c);
+        if (pps_norm.rfind("/dev/", 0) == 0) pps_norm = pps_norm.substr(5);
+        bool use_extts = (pps_norm == "phc");
         if ((sfd < 0 || (pfd < 0 && !use_extts)) && now >= next_reopen) {
             next_reopen = now + 5000000000ULL;
             if (sfd < 0) {
