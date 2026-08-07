@@ -403,6 +403,7 @@ static std::atomic<bool> g_gnss_serial_ok{false};
 static std::atomic<bool> g_gnss_pps_ok{false};
 static std::atomic<bool> g_gnss_extts{false};   // PPS stamped by the PHC
 static std::atomic<uint32_t> g_gnss_spikes{0};  // dropped GPIO-PPS outliers
+static std::atomic<long long> g_gnss_resid_ns{-1};  // servo residual, RMS
 static std::atomic<int> g_gnss_serial_fd{-1};       // opened while root
 static std::atomic<int> g_gnss_pps_fd{-1};
 
@@ -1203,8 +1204,12 @@ static void complete_sync_pair(int64_t t1, int64_t t2, bool wire = true,
     } else {
         // Adaptive stiffness: full bandwidth while chasing a real error,
         // a 4x gentler loop once settled — the remaining sample scatter
-        // then moves the clock far less
-        double tau = llabs(e) < 3000 ? 4.0 * kServoTauNs : kServoTauNs;
+        // then moves the clock far less. Hardware-captured PPS (extts)
+        // has no scatter worth hiding from: keep full bandwidth there,
+        // which follows the oscillator's thermal wander 4x tighter.
+        bool clean_src = !wire && g_gnss_extts.load();
+        double tau = (llabs(e) < 3000 && !clean_src) ? 4.0 * kServoTauNs
+                                                     : kServoTauNs;
         double a = (double)dt / tau;           // phase gain
         if (a > 0.6) a = 0.6;
         if (a < 0.02) a = 0.02;
@@ -1699,6 +1704,7 @@ static void gnss_thread() {
     time_t rmc_utc = 0;                   // last parsed RMC second...
     uint64_t rmc_mono = 0;                // ...its arrival time...
     bool rmc_fresh = false;               // ...not yet paired
+    double resid_sq = 0;                  // EMA of e^2 (servo residual)
     int relabel_run = 0;                  // consecutive 1-s relabels
     int64_t relabel_k = 0;                // ...and their direction
     uint64_t next_reopen = 0;
@@ -1822,6 +1828,14 @@ static void gnss_thread() {
                 }
             } else {
                 relabel_run = 0;
+            }
+            if (have_pred && label_ok) {
+                // How tightly the clock follows GNSS, separate from
+                // the network comparison: if this is tens of ns while
+                // the time-error chart wanders, the wander is the
+                // network master's, not ours
+                resid_sq += ((double)e * (double)e - resid_sq) / 16.0;
+                g_gnss_resid_ns = (long long)sqrt(resid_sq);
             }
             bool forward = false;
             bool fwd_freq_ok = true;
@@ -3061,6 +3075,7 @@ static std::string status_json() {
       << "\"gnss_samples\":" << g_gnss_sample_count.load() << ","
       << "\"gnss_extts\":" << (g_gnss_extts ? "true" : "false") << ","
       << "\"gnss_spikes\":" << g_gnss_spikes.load() << ","
+      << "\"gnss_resid_ns\":" << g_gnss_resid_ns.load() << ","
       << "\"cmp_valid\":"
       << (g_cmp_target_valid.load() && g_cmp_count.load() > 0 ? "true"
                                                               : "false")
@@ -3891,6 +3906,8 @@ async function poll() {
         if (!s.gnss_serial_ok) sum += ' — serial closed!';
         if (!s.gnss_pps_ok) sum += ' — PPS closed!';
         if (s.gnss_extts) sum += ', PPS hardware-stamped by the PHC';
+        if (s.gnss_resid_ns >= 0 && s.gnss_lock)
+          sum += ', servo residual \u00b1' + s.gnss_resid_ns + ' ns RMS';
         sum += ' (' + s.gnss_samples + ' samples';
         if (s.gnss_spikes > 0)
           sum += ', ' + s.gnss_spikes + ' spikes dropped';
