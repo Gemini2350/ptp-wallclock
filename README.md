@@ -369,6 +369,85 @@ while the service still runs as root; `install.sh` also installs a udev
 rule + group so reopening after the privilege drop works (e.g. USB
 receivers being replugged).
 
+### The precision build: hardware PPS capture on a CM5
+
+The GPIO PPS path is limited by interrupt latency (µs-class, and on a
+CM5 additionally by slow MDIO clock translation). This build removes
+all of it: the GNSS pulse goes into the Ethernet PHY's SYNC pin and is
+captured by the **same hardware clock that timestamps the PTP
+packets** — no interrupt, no clock translation. Measured on the
+reference build: servo residual ≈ ±200 ns RMS, time-error band
+≈ ±250 ns against a commercial grandmaster.
+
+**Parts**
+
+| Part | Note |
+|---|---|
+| Raspberry Pi Compute Module 5 | any variant (Lite boots from microSD). The CM5's BCM54210PE PHY carries the IEEE-1588 engine with the SYNC pin — the Pi 5 Model B does **not** expose that pin; no soldering helps there |
+| Waveshare CM5-IO-BASE-B | carrier with NIC; exposes the CM5's `Ethernet_SYNC_OUT` (edge pin 18) on solder pad row H3. Alternatives: CM5-NANO-A (pad H1-1), CM5-NANO-B (H5-1), official CM5IO board (J2 pin 6 — its silkscreen wrongly says 9) |
+| Waveshare MAX-M8Q GNSS HAT | NMEA on serial0, PPS on GPIO 18, stacking header, backup battery |
+| Active GPS antenna (SMA) | powered by the HAT through the coax; a window sill is usually enough |
+| ~10 cm thin wire | one signal wire; ground is shared through the 40-pin stack |
+| optional: the LED matrix HAT | the measurement variant also works headless via the web UI |
+
+**The solder bridge (on the GNSS HAT)**
+
+The HAT's edge header P1 (`3V3 VCC 5V 5V GND RXD TXD INT SDA SCL PPS`)
+carries the timepulse on its **PPS** pin — but behind a TXS0108 level
+shifter powered from the **VCC** pin, which expects an external host
+to supply its logic voltage. Stacked on a Pi, nothing does. So:
+
+- bridge **3V3 ↔ VCC** (the two adjacent pins at the end of P1)
+- careful: VCC's *other* neighbour is 5V — bridging that one instead
+  pushes 5 V pulses toward the PHY. Verify with a meter afterwards:
+  VCC against GND must read 3.3 V, and the PPS pin must hop 0↔3.3 V
+  once a second (only with a GNSS fix — no fix, no pulse, no PPS LED)
+
+**The wire**
+
+- from P1 **PPS** on the GNSS HAT
+- to the **left pad of the H3 row** on the underside of the
+  CM5-IO-BASE-B: the three-pad row inside the "IO-VREF" silkscreen
+  box, labelled `RUN … GL-EN`. Left pad (next to "RUN") = SYNC input,
+  middle pad = GND
+- **stay away from the right pad (GL-EN)** — shorting it to ground
+  powers the whole module off
+- keep the wire short (<15 cm); no extra ground wire needed
+
+**Verify before soldering** that the pad really is the PHY's 1588 pin.
+The CM5 has *two* PTP clocks (RP1 MAC + PHY); the PHY is the one named
+`bcm_phy_ptp` (usually `/dev/ptp0`, and `ethtool -T eth0` should
+already name its index as the timestamp provider). `testptp` comes
+from the kernel tree:
+
+```bash
+curl -sL https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.12.y/tools/testing/selftests/ptp/testptp.c -o testptp.c && gcc -O2 -o testptp testptp.c
+```
+
+```bash
+grep . /sys/class/ptp/ptp*/clock_name
+sudo ./testptp -d /dev/ptp0 -L 0,2 && sudo ./testptp -d /dev/ptp0 -p 1000000000
+```
+
+The pad now toggles once per second (multimeter against the middle GND
+pad). Stop with `sudo ./testptp -d /dev/ptp0 -p 0`.
+
+**Verify after soldering** that pulses arrive in the PHC (stop the
+wallclock service first — it holds the pin):
+
+```bash
+sudo systemctl stop ptp-wallclock
+sudo ./testptp -d /dev/ptp0 -L 0,1 && sudo ./testptp -d /dev/ptp0 -e 5
+sudo systemctl start ptp-wallclock
+```
+
+Five events, exactly one second apart. Then pick `phc` as the **PPS
+device** on the settings page and restart the service: the GNSS status
+line shows "PPS hardware-stamped by the PHC" plus the live servo
+residual, and the u-blox qErr sawtooth correction engages
+automatically. Finally set the **GNSS PPS offset** to 0 and, once the
+time-error chart has settled, click **Set from current time error**.
+
 ## Privileged ports (why sudo?)
 
 PTP uses UDP ports 319 and 320, which are privileged ports on Linux. The
