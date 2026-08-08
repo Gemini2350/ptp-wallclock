@@ -16,6 +16,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <algorithm>
+#include <dirent.h>
 #include <termios.h>
 #ifdef __linux__
 #include <linux/pps.h>
@@ -2989,6 +2990,34 @@ static std::string calibrate_pps_apply(bool *ok_out) {
     return o.str();
 }
 
+// Existing device nodes for the GNSS dropdowns: serial candidates or
+// PPS sources ("phc" = hardware capture in the NIC is always offered)
+static std::vector<std::string> list_dev_nodes(bool pps) {
+    std::vector<std::string> out;
+    if (pps)
+        out.push_back("phc");
+    DIR *d = opendir("/dev");
+    if (!d)
+        return out;
+    static const char *ser_pfx[] = {"serial", "ttyAMA", "ttyACM",
+                                    "ttyUSB", "ttyS"};
+    while (struct dirent *e = readdir(d)) {
+        std::string n = e->d_name;
+        bool hit = false;
+        if (pps) {
+            hit = n.rfind("pps", 0) == 0;
+        } else {
+            for (const char *p : ser_pfx)
+                if (n.rfind(p, 0) == 0) { hit = true; break; }
+        }
+        if (hit)
+            out.push_back("/dev/" + n);
+    }
+    closedir(d);
+    std::sort(out.begin() + (pps ? 1 : 0), out.end());
+    return out;
+}
+
 static std::string settings_json() {
     std::lock_guard<std::mutex> lock(g_mutex);
     char color[8];
@@ -3040,6 +3069,14 @@ static std::string settings_json() {
     std::vector<std::string> ifs = list_ifaces();
     for (size_t i = 0; i < ifs.size(); ++i)
         j << (i ? "," : "") << "\"" << json_escape(ifs[i]) << "\"";
+    j << "],\"ser_devs\":[";
+    std::vector<std::string> sd = list_dev_nodes(false);
+    for (size_t i = 0; i < sd.size(); ++i)
+        j << (i ? "," : "") << "\"" << json_escape(sd[i]) << "\"";
+    j << "],\"pps_devs\":[";
+    std::vector<std::string> pd = list_dev_nodes(true);
+    for (size_t i = 0; i < pd.size(); ++i)
+        j << (i ? "," : "") << "\"" << json_escape(pd[i]) << "\"";
     j << "]}";
     return j.str();
 }
@@ -3503,16 +3540,14 @@ election — actively sends Announce and Sync into the network:
 grandmaster still wins. Leave this off (default) for pure display and
 measurement.</p>
 <label>NMEA serial device:
- <input type="text" id="gm_serial" list="serlist" value="/dev/serial0">
- <datalist id="serlist"><option value="/dev/serial0">
- <option value="/dev/ttyAMA0"><option value="/dev/ttyS0">
- <option value="/dev/ttyACM0"><option value="/dev/ttyUSB0"></datalist>
+ <select id="gm_serial"></select>
 </label>
 <label>PPS device:
- <input type="text" id="gm_pps" value="/dev/pps0">
+ <select id="gm_pps"></select>
 </label>
-<p class="hint">Usually <code>/dev/pps0</code> (GPIO). On boards whose
-NIC exposes the SYNC_IN pin (CM4/CM5 on an IO board), enter
+<p class="hint">Both lists show the device nodes present on this
+system. PPS is usually <code>/dev/pps0</code> (GPIO). On boards whose
+NIC exposes the SYNC_IN pin (CM4/CM5 on an IO board), pick
 <code>phc</code> instead: the pulse is then hardware-timestamped by the
 PHC itself — no GPIO interrupt latency. The Pi&nbsp;5 Model&nbsp;B does
 not expose that pin.</p>
@@ -3676,8 +3711,17 @@ async function loadSettings() {
   document.getElementById('ptp_mode').value = s.ptp_mode;
   document.getElementById('gm_enable').checked = s.gm_enable;
   document.getElementById('gm_master').checked = s.gm_master;
-  document.getElementById('gm_serial').value = s.gm_serial;
-  document.getElementById('gm_pps').value = s.gm_pps;
+  const devOpts = (id, list, cur, labels) => {
+    const el = document.getElementById(id);
+    const items = (list || []).slice();
+    if (cur && !items.includes(cur)) items.push(cur);
+    el.innerHTML = items.map(d => '<option value="' + d + '">' +
+        ((labels && labels[d]) || d) + '</option>').join('');
+    el.value = cur;
+  };
+  devOpts('gm_serial', s.ser_devs, s.gm_serial);
+  devOpts('gm_pps', s.pps_devs, s.gm_pps,
+          { phc: 'phc — hardware capture in the NIC' });
   document.getElementById('gm_prio1').value = s.gm_prio1;
   document.getElementById('gm_prio2').value = s.gm_prio2;
   document.getElementById('gm_utc').value = s.gm_utc_offset;
