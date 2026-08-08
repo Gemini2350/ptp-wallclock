@@ -27,7 +27,7 @@ The same binary, three ways to run it — each step adds hardware:
 |---|---|---|
 | **Docker / headless** | none — any Linux box on the PTP network | fullscreen browser clock (`/clock`), full PTP analysis web UI: visible masters, offset/delay/PDV charts, protocol profiles. See [Docker](#docker--no-led-hardware-needed) |
 | **LED wallclock** | Raspberry Pi + RGB LED matrix (see [Hardware Requirements](#hardware-requirements)) | the wall clock itself: multi-timezone lines, display styles, GM alerts — plus everything above |
-| **Measurement instrument** | CM5 on an IO board + GNSS HAT, one wire and one solder bridge | a GNSS-disciplined reference that measures your grandmaster against GPS truth to ~±¼ µs, and can itself be the grandmaster on all three profiles. See [GNSS grandmaster mode](#gnss-grandmaster-mode) and [The precision build](#the-precision-build-hardware-pps-capture-on-a-cm5) |
+| **Measurement instrument** | CM5 on an IO board + GNSS HAT, one wire and one solder bridge | a GNSS-disciplined reference that measures your grandmaster against GPS truth to ±200 ns, and can itself be the grandmaster on all three profiles. See [GNSS grandmaster mode](#gnss-grandmaster-mode) and [The precision build](#the-precision-build-hardware-pps-capture-on-a-cm5) |
 
 The measurement build also works in stages: a GNSS HAT on any Pi gives
 the grandmaster + time-error measurement at few-µs accuracy over GPIO
@@ -391,8 +391,8 @@ CM5 additionally by slow MDIO clock translation). This build removes
 all of it: the GNSS pulse goes into the Ethernet PHY's SYNC pin and is
 captured by the **same hardware clock that timestamps the PTP
 packets** — no interrupt, no clock translation. Measured on the
-reference build: servo residual ≈ ±200 ns RMS, time-error band
-≈ ±250 ns against a commercial grandmaster.
+reference build: time-error band ≈ ±200 ns against a commercial
+grandmaster (servo residual ≈ ±200 ns RMS, qErr-corrected).
 
 **Parts**
 
