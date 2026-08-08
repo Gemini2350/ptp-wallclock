@@ -429,6 +429,22 @@ to supply its logic voltage. Stacked on a Pi, nothing does. So:
   powers the whole module off
 - keep the wire short (<15 cm); no extra ground wire needed
 
+**Solder-free variant** — with the official Raspberry Pi CM5 IO Board
+instead of the Waveshare carrier, nothing needs soldering:
+
+- the SYNC signal sits on the **populated J2 header, pin 6** (count the
+  pins — the numbers printed on the silkscreen next to J2 are
+  misleading; the perout test below confirms the right pin before you
+  connect anything): a female-female Dupont wire from the GNSS HAT's
+  P1 **PPS** pin is all the wiring
+- the HAT-side bridge is still required — it powers the HAT's level
+  shifter and is independent of the carrier board. If your HAT's P1
+  header is populated, a standard 2.54 mm **jumper cap across
+  3V3↔VCC** replaces the solder bridge; if P1 is bare pads, it is the
+  one solder joint of the build
+- the official board is larger and pricier; electrically the result is
+  identical (same CM5 PHY, same pin)
+
 **Verify before soldering** that the pad really is the PHY's 1588 pin.
 The CM5 has *two* PTP clocks (RP1 MAC + PHY); the PHY is the one named
 `bcm_phy_ptp` (usually `/dev/ptp0`, and `ethtool -T eth0` should
