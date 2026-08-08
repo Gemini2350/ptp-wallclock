@@ -19,6 +19,21 @@ I've used it to demonstrate that PTP is really distributing the Time at my Speec
 
 ---
 
+## The three builds
+
+The same binary, three ways to run it — each step adds hardware:
+
+| Build | Hardware | What you get |
+|---|---|---|
+| **Docker / headless** | none — any Linux box on the PTP network | fullscreen browser clock (`/clock`), full PTP analysis web UI: visible masters, offset/delay/PDV charts, protocol profiles. See [Docker](#docker--no-led-hardware-needed) |
+| **LED wallclock** | Raspberry Pi + RGB LED matrix (see [Hardware Requirements](#hardware-requirements)) | the wall clock itself: multi-timezone lines, display styles, GM alerts — plus everything above |
+| **Measurement instrument** | CM5 on an IO board + GNSS HAT, one wire and one solder bridge | a GNSS-disciplined reference that measures your grandmaster against GPS truth to ~±¼ µs, and can itself be the grandmaster on all three profiles. See [GNSS grandmaster mode](#gnss-grandmaster-mode) and [The precision build](#the-precision-build-hardware-pps-capture-on-a-cm5) |
+
+The measurement build also works in stages: a GNSS HAT on any Pi gives
+the grandmaster + time-error measurement at few-µs accuracy over GPIO
+(on a Pi 5 with hardware timestamps: ~±1–3 µs); the CM5 hardware
+capture removes the last microseconds.
+
 ## Features
 
 - Three protocol profiles, selectable in the web UI: **PTPv2**
