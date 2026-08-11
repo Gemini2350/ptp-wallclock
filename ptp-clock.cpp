@@ -212,6 +212,10 @@ static std::vector<ClockEntry> clocks_parse(const std::string &in,
 
 struct Settings {
     uint8_t r = 255, g = 255, b = 0;      // display color
+    bool frac_colors = false;             // tint ms/us/ns digit groups
+    uint8_t fc[3][3] = {{255, 165, 0},    // ms
+                        {0, 255, 0},      // us
+                        {0, 128, 255}};   // ns
     int brightness = 100;                 // display brightness in percent
     bool blackout = false;                // display temporarily off
     bool rotate180 = false;               // LED matrix mounted upside down
@@ -725,6 +729,12 @@ static void save_settings_locked() {
     }
     f << "color=" << (int)g_settings.r << "," << (int)g_settings.g << ","
       << (int)g_settings.b << "\n";
+    static const char *kFcKeys[3] = {"color_ms", "color_us", "color_ns"};
+    f << "frac_colors=" << (g_settings.frac_colors ? 1 : 0) << "\n";
+    for (int i = 0; i < 3; ++i)
+        f << kFcKeys[i] << "=" << (int)g_settings.fc[i][0] << ","
+          << (int)g_settings.fc[i][1] << ","
+          << (int)g_settings.fc[i][2] << "\n";
     f << "brightness=" << g_settings.brightness << "\n";
     f << "blackout=" << (g_settings.blackout ? 1 : 0) << "\n";
     f << "rotate180=" << (g_settings.rotate180 ? 1 : 0) << "\n";
@@ -776,6 +786,17 @@ static void load_settings() {
             int r, g, b;
             if (sscanf(val.c_str(), "%d,%d,%d", &r, &g, &b) == 3) {
                 g_settings.r = r; g_settings.g = g; g_settings.b = b;
+            }
+        } else if (key == "frac_colors") {
+            g_settings.frac_colors = (val == "1");
+        } else if (key == "color_ms" || key == "color_us" ||
+                   key == "color_ns") {
+            int r, g, b;
+            int i = key == "color_ms" ? 0 : key == "color_us" ? 1 : 2;
+            if (sscanf(val.c_str(), "%d,%d,%d", &r, &g, &b) == 3) {
+                g_settings.fc[i][0] = r;
+                g_settings.fc[i][1] = g;
+                g_settings.fc[i][2] = b;
             }
         } else if (key == "brightness") {
             int v = atoi(val.c_str());
@@ -3024,7 +3045,16 @@ static std::string settings_json() {
     snprintf(color, sizeof(color), "#%02x%02x%02x",
              g_settings.r, g_settings.g, g_settings.b);
     std::ostringstream j;
+    char fcbuf[3][8];
+    for (int i = 0; i < 3; ++i)
+        snprintf(fcbuf[i], sizeof(fcbuf[i]), "#%02x%02x%02x",
+                 g_settings.fc[i][0], g_settings.fc[i][1],
+                 g_settings.fc[i][2]);
     j << "{\"color\":\"" << color << "\","
+      << "\"frac_colors\":" << (g_settings.frac_colors ? "true" : "false")
+      << ",\"color_ms\":\"" << fcbuf[0] << "\","
+      << "\"color_us\":\"" << fcbuf[1] << "\","
+      << "\"color_ns\":\"" << fcbuf[2] << "\","
       << "\"brightness\":" << g_settings.brightness << ","
       << "\"blackout\":" << (g_settings.blackout ? "true" : "false") << ","
       << "\"rotate180\":" << (g_settings.rotate180 ? "true" : "false") << ","
@@ -3451,6 +3481,17 @@ calibrate out the antenna cable delay.</span></span></div>
 <label>Display color:
  <input type="color" id="color" value="#ffff00">
 </label>
+<label>
+ <input type="checkbox" id="frac_colors"> Precision colors:
+ <span id="fc_row">
+  ms <input type="color" id="color_ms" value="#ffa500">
+  µs <input type="color" id="color_us" value="#00ff00">
+  ns <input type="color" id="color_ns" value="#0080ff">
+ </span>
+</label>
+<p class="hint">Tints the millisecond, microsecond and nanosecond digit
+groups of the fraction separately — on the LED matrix and in the
+browser clocks.</p>
 <label>Brightness: <span id="bval">100</span> %
  <input type="range" id="brightness" min="1" max="100" value="100">
 </label>
@@ -3694,6 +3735,11 @@ document.getElementById('brightness').addEventListener('change', async (e) => {
 async function loadSettings() {
   const s = await fetch('/api/settings').then(r => r.json());
   document.getElementById('color').value = s.color;
+  document.getElementById('frac_colors').checked = s.frac_colors;
+  document.getElementById('color_ms').value = s.color_ms;
+  document.getElementById('color_us').value = s.color_us;
+  document.getElementById('color_ns').value = s.color_ns;
+  syncFracRow();
   document.getElementById('brightness').value = s.brightness;
   document.getElementById('bval').textContent = s.brightness;
   document.getElementById('rotate180').checked = s.rotate180;
@@ -3737,6 +3783,10 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const body = new URLSearchParams({
     color: document.getElementById('color').value,
+    frac_colors: document.getElementById('frac_colors').checked ? 1 : 0,
+    color_ms: document.getElementById('color_ms').value,
+    color_us: document.getElementById('color_us').value,
+    color_ns: document.getElementById('color_ns').value,
     brightness: document.getElementById('brightness').value,
     rotate180: document.getElementById('rotate180').checked ? 1 : 0,
     clocks: clocksSerialized(),
@@ -3808,6 +3858,24 @@ function fracDigits(tNs) {
   return s;
 }
 
+function syncFracRow() {
+  document.getElementById('fc_row').style.opacity =
+      document.getElementById('frac_colors').checked ? 1 : 0.35;
+}
+document.getElementById('frac_colors').addEventListener('change',
+    syncFracRow);
+
+// Colored ms/us/ns spans for the fraction — live from the (possibly
+// unsaved) pickers, so toggling previews instantly
+function fracHtml(fr9) {
+  if (!document.getElementById('frac_colors').checked) return fr9;
+  const c = i => document.getElementById(i).value;
+  return '<span style="color:' + c('color_ms') + '">' + fr9.slice(0, 3) +
+      '</span><span style="color:' + c('color_us') + '">' +
+      fr9.slice(3, 6) + '</span><span style="color:' + c('color_ns') +
+      '">' + fr9.slice(6) + '</span>';
+}
+
 let clockBase = null;   // {sec, nsec, perf, off}
 function renderClock() {
   const el = document.getElementById('clock');
@@ -3855,19 +3923,20 @@ function renderClock() {
     return;
   }
   // Body text per style (pixel styles fall back to digital 24h)
+  const fh = fracHtml(fr9);
   let body;
   if (style === 'unix') {
-    body = sec + '.' + fr9;
+    body = sec + '.' + fh;
   } else if (style === '12h') {
     let h = parseInt(p.hour, 10);
     const am = h >= 12 ? ' PM' : ' AM';
     h = h % 12 || 12;
     body = String(h).padStart(2, '0') + ':' + p.minute + ':' +
-        p.second + '.' + fr9 + am;
+        p.second + '.' + fh + am;
   } else {
-    body = p.hour + ':' + p.minute + ':' + p.second + '.' + fr9;
+    body = p.hour + ':' + p.minute + ':' + p.second + '.' + fh;
   }
-  el.textContent = body;
+  el.innerHTML = body;
   ez.textContent = name === '%Z'
       ? (zone === 'TAI' ? 'TAI' : (p.timeZoneName || '')) : name;
   const wd = p.weekday.toUpperCase();
@@ -4598,17 +4667,23 @@ function render() {
     return;
   }
   // Body per style (pixel styles fall back to digital 24h)
+  const fh = (S && S.frac_colors)
+      ? '<span style="color:' + S.color_ms + '">' + fr9.slice(0, 3) +
+        '</span><span style="color:' + S.color_us + '">' +
+        fr9.slice(3, 6) + '</span><span style="color:' + S.color_ns +
+        '">' + fr9.slice(6) + '</span>'
+      : fr9;
   let sup = '', body;
   if (cl.style === 'unix') {
-    body = sec + '.' + fr9;
+    body = sec + '.' + fh;
   } else if (cl.style === '12h') {
     let h = parseInt(p.hour, 10);
     sup = h >= 12 ? 'PM' : 'AM';
     h = h % 12 || 12;
     body = String(h).padStart(2, '0') + ':' + p.minute + ':' +
-        p.second + '.' + fr9;
+        p.second + '.' + fh;
   } else {
-    body = p.hour + ':' + p.minute + ':' + p.second + '.' + fr9;
+    body = p.hour + ':' + p.minute + ':' + p.second + '.' + fh;
   }
   el.innerHTML = body +
       (sup ? '<span class="sup">' + sup + '</span>' : '');
@@ -4729,6 +4804,21 @@ static void handle_client(int fd) {
                 unsigned r, g, b;
                 if (sscanf(kv["color"].c_str(), "#%02x%02x%02x", &r, &g, &b) == 3) {
                     g_settings.r = r; g_settings.g = g; g_settings.b = b;
+                }
+            }
+            if (kv.count("frac_colors"))
+                g_settings.frac_colors = (kv["frac_colors"] == "1");
+            static const char *kFcPost[3] = {"color_ms", "color_us",
+                                             "color_ns"};
+            for (int i = 0; i < 3; ++i) {
+                if (!kv.count(kFcPost[i]))
+                    continue;
+                unsigned r, g, b;
+                if (sscanf(kv[kFcPost[i]].c_str(), "#%02x%02x%02x",
+                           &r, &g, &b) == 3) {
+                    g_settings.fc[i][0] = r;
+                    g_settings.fc[i][1] = g;
+                    g_settings.fc[i][2] = b;
                 }
             }
             if (kv.count("brightness")) {
@@ -5891,9 +5981,16 @@ int main(int argc, char **argv) {
             draw_text_fraction(f, x, ybase, txt, c_main, c_ms, c_us, c_ns);
         };
 
-        Color c_ms(255, 165, 0);   // milliseconds in orange
-        Color c_us(0, 255, 0);     // microseconds in green
-        Color c_ns(0, 128, 255);   // nanoseconds in blue
+        // Precision colors (PR #15 by sonicepk): tint the ms/us/ns
+        // digit groups — only when enabled, and a red alert time stays
+        // fully red
+        bool fc_on = s.frac_colors && !time_alert;
+        Color c_ms = fc_on ? Color(s.fc[0][0], s.fc[0][1], s.fc[0][2])
+                           : c_main;
+        Color c_us = fc_on ? Color(s.fc[1][0], s.fc[1][1], s.fc[1][2])
+                           : c_main;
+        Color c_ns = fc_on ? Color(s.fc[2][0], s.fc[2][1], s.fc[2][2])
+                           : c_main;
 
         const std::string &style = entry.style;
         if (style == "unix") {
