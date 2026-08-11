@@ -150,7 +150,10 @@ one-click blackout (PTP keeps running), 180° rotation (live), and the
 a world clock like `New York / Zurich / Tokyo` is just three lines), a
 style (digital 24h/12h, Unix timestamp, binary BCD, flip clock, DCF77
 telegram, live PTP stats) and an optional label (`%Z` = zone
-abbreviation). One line is static, several alternate every 4 seconds,
+abbreviation). Optional **precision colors** tint the millisecond,
+microsecond and nanosecond digit groups separately (three own color
+pickers; contributed by @sonicepk) — on the LED matrix and in the
+browser clocks. One line is static, several alternate every 4 seconds,
 PTP-second aligned. Optional second line: date (`DD.MM.YYYY`, ISO 8601
 or `MM/DD/YYYY`), grandmaster ID, priorities & clock quality. The
 browser clock follows the same list (pixel styles fall back to
