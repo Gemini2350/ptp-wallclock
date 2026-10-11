@@ -74,7 +74,9 @@ docker compose up -d
   Unix timestamp, binary BCD and flip clock to a DCF77 telegram and a
   live PTP-stats view, all with nine fractional digits; a second line
   shows date, grandmaster or clock quality; red alerts for GM changes,
-  unaccepted GMs and offset violations
+  unaccepted GMs and offset violations; before the first sync the panel
+  shows `--:--:--` plus the current startup stage (link / listening /
+  syncing, GNSS state) instead of staying blank
 - **Web interface** on port 8319 — live ticking PTP clock, all
   settings, decoded grandmaster data, a table of all visible masters,
   and 5-minute analysis charts (sync PDV, path delay, message rates,

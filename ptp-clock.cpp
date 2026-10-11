@@ -5778,9 +5778,71 @@ int main(int argc, char **argv) {
         flip_canvas.inner = offscreen;
         flip_canvas.flip = s.rotate180;
 
-        // Blackout, or no PTP reference (yet): show a black display
-        if (s.blackout || !have_ptp_ref) {
+        // Blackout: a black display (the clock keeps running)
+        if (s.blackout) {
             offscreen->Fill(0, 0, 0);
+            offscreen = matrix->SwapOnVSync(offscreen);
+            continue;
+        }
+
+        // No PTP reference (yet): instead of a black panel, show the
+        // web UI's dashes plus which startup stage we are in — enough
+        // to diagnose a dead link or a missing grandmaster without a
+        // browser (issue #16)
+        if (!have_ptp_ref) {
+            offscreen->Fill(0, 0, 0);
+            Canvas *scv = &flip_canvas;
+            Color c_half(s.r / 2, s.g / 2, s.b / 2);
+            int cw = font.CharacterWidth('0') + 1;
+            int x0 = (matrix_options.cols - (cw * 8 - 1)) / 2;
+            DrawText(scv, font, x0, font.baseline() + 1, c_half,
+                     nullptr, "--:--:--", 1);
+            if (have_small_font) {
+                char rowa[32], rowb[32];
+                bool announce = g_last_announce_mono_ns.load() != 0;
+                if (!g_iface_up.load())
+                    snprintf(rowa, sizeof(rowa), "NO NETWORK LINK");
+                else if (!announce)
+                    snprintf(rowa, sizeof(rowa), "LISTENING FOR PTP");
+                else
+                    snprintf(rowa, sizeof(rowa), "PTP SYNCING...");
+                if (s.gm_enable) {
+                    // GNSS can become the reference without any network
+                    // master — its startup stage is the second row
+                    if (!g_gnss_serial_ok.load()) {
+                        snprintf(rowb, sizeof(rowb), "GNSS: NO RECEIVER");
+                    } else if (g_gnss_fixq.load() <= 0) {
+                        int v = g_gnss_sats_view.load();
+                        snprintf(rowb, sizeof(rowb),
+                                 "GNSS: %d SATS, NO FIX", v < 0 ? 0 : v);
+                    } else if (!g_gnss_pps_ok.load()) {
+                        snprintf(rowb, sizeof(rowb), "GNSS: PPS CLOSED");
+                    } else {
+                        snprintf(rowb, sizeof(rowb), "GNSS: FIX, SYNCING");
+                    }
+                } else if (announce && !id_line.empty()) {
+                    snprintf(rowb, sizeof(rowb), "%s", id_line.c_str());
+                } else {
+                    const char *prof = s.ptp_mode == "gptp" ? "gPTP"
+                                     : s.ptp_mode == "v1" ? "PTPv1"
+                                                          : "PTPv2";
+                    if (s.domain >= 0)
+                        snprintf(rowb, sizeof(rowb), "%s  DOMAIN %d",
+                                 prof, s.domain);
+                    else
+                        snprintf(rowb, sizeof(rowb), "%s  ANY DOMAIN",
+                                 prof);
+                }
+                int scw = small_font.CharacterWidth('0') + 1;
+                auto center_small = [&](const char *t, int ybase) {
+                    int w = (int)strlen(t) * scw - 1;
+                    DrawText(scv, small_font,
+                             (matrix_options.cols - w) / 2, ybase,
+                             c_half, nullptr, t, 1);
+                };
+                center_small(rowa, 22);
+                center_small(rowb, 30);
+            }
             offscreen = matrix->SwapOnVSync(offscreen);
             continue;
         }
